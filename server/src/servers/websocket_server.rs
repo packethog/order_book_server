@@ -2,6 +2,7 @@ use crate::{
     listeners::order_book::{
         InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
     },
+    multicast::{config::MulticastConfig, publisher::MulticastPublisher},
     order_book::{Coin, Snapshot},
     prelude::*,
     types::{
@@ -29,7 +30,17 @@ use tokio::{
 };
 use yawc::{FrameView, OpCode, WebSocket};
 
-pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_level: u32) -> Result<()> {
+/// Starts the WebSocket server and, optionally, a UDP multicast publisher.
+///
+/// When `multicast_config` is `Some`, a background task is spawned that
+/// subscribes to the internal broadcast channel and re-publishes selected
+/// market data as UDP multicast datagrams.
+pub async fn run_websocket_server(
+    address: &str,
+    ignore_spot: bool,
+    compression_level: u32,
+    multicast_config: Option<MulticastConfig>,
+) -> Result<()> {
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(100);
 
     // Central task: listen to messages and forward them for distribution
@@ -45,6 +56,26 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
             if let Err(err) = hl_listen(listener, home_dir).await {
                 error!("Listener fatal error: {err}");
                 std::process::exit(1);
+            }
+        });
+    }
+
+    if let Some(mcast_config) = multicast_config {
+        let mcast_rx = internal_message_tx.subscribe();
+        tokio::spawn(async move {
+            let bind_addr = std::net::SocketAddr::new(
+                std::net::IpAddr::V4(mcast_config.bind_addr),
+                0,
+            );
+            match tokio::net::UdpSocket::bind(bind_addr).await {
+                Ok(socket) => {
+                    let publisher = MulticastPublisher::new(socket, mcast_config);
+                    publisher.run(mcast_rx).await;
+                }
+                Err(err) => {
+                    log::error!("failed to bind multicast UDP socket to {bind_addr}: {err}");
+                    std::process::exit(3);
+                }
             }
         });
     }
