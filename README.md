@@ -41,6 +41,69 @@ If you want logging, prepend the command with `RUST_LOG=info`.
 
 The WebSocket server comes with compression built-in. The compression ratio can be tuned using the `--websocket-compression-level` flag.
 
+## Multicast
+
+The server can optionally publish market data as UDP multicast datagrams alongside the WebSocket feed. This is useful for distributing L2 book updates and trades over a multicast-capable network such as [DoubleZero](https://docs.doublezero.io/).
+
+### Enabling multicast
+
+Pass `--multicast-group` to enable multicast publishing:
+
+```bash
+cargo run --release --bin websocket_server -- \
+  --address 0.0.0.0 --port 8000 \
+  --multicast-group 239.0.0.1 \
+  --multicast-bind-addr 0.0.0.0
+```
+
+### CLI arguments
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--multicast-group` | *(none — multicast disabled)* | Multicast group address (e.g. `239.0.0.1`). Enables multicast when set. |
+| `--multicast-port` | `5000` | UDP port for multicast traffic. |
+| `--multicast-bind-addr` | *(required when group is set)* | Local address to bind the multicast UDP socket. |
+| `--multicast-channels` | `l2,trades` | Comma-separated list of channels to publish. Valid values: `l2`, `trades`. |
+| `--multicast-l2-levels` | `5` | Number of price levels to include in L2 snapshots. |
+| `--multicast-snapshot-interval` | `5` | Interval in seconds between periodic full book snapshots. |
+
+### Wire format
+
+Every UDP datagram is a JSON object with this envelope:
+
+```json
+{
+  "session": "<uuid-v4>",
+  "seq": 0,
+  "channel": "l2Book",
+  "data": { ... }
+}
+```
+
+- **`session`** — a random UUID generated on server startup. A new session ID indicates the server restarted and sequence numbers have reset.
+- **`seq`** — monotonically increasing sequence number (starting at 0). Gaps indicate missed datagrams.
+- **`channel`** — one of `l2Book`, `l2Snapshot`, or `trades`.
+- **`data`** — the channel-specific payload.
+
+Channels:
+
+- **`l2Book`** — incremental L2 book update, sent whenever the book changes.
+- **`l2Snapshot`** — periodic full L2 book snapshot (same format as `l2Book`), sent on the `--multicast-snapshot-interval` timer. Subscribers can use these to recover from gaps without reconnecting.
+- **`trades`** — an array of trades for a single coin. The `users` field is omitted from multicast trades.
+
+Datagrams that exceed 1400 bytes are dropped to stay within typical MTU limits.
+
+### Example subscriber
+
+An example subscriber binary is included for testing:
+
+```bash
+cargo run --release --bin example_multicast_subscriber -- \
+  --group 239.0.0.1 --port 5000
+```
+
+This joins the multicast group and prints received datagrams to stdout.
+
 ## Caveats
 
 - This server does **not** show untriggered trigger orders.
