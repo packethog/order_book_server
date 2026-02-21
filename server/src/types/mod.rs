@@ -14,14 +14,14 @@ pub(crate) mod subscription;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Trade {
-    pub coin: String,
-    side: Side,
-    px: String,
-    sz: String,
-    hash: String,
-    time: u64,
-    tid: u64,
-    users: [Address; 2],
+    pub(crate) coin: String,
+    pub(crate) side: Side,
+    pub(crate) px: String,
+    pub(crate) sz: String,
+    pub(crate) hash: String,
+    pub(crate) time: u64,
+    pub(crate) tid: u64,
+    pub(crate) users: [Address; 2],
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]

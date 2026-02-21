@@ -275,7 +275,7 @@ async fn send_ws_data_from_snapshot(
     }
 }
 
-fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
+pub(crate) fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
     let mut fills = batch.clone().events();
     let mut trades = HashMap::new();
     while fills.len() >= 2 {
