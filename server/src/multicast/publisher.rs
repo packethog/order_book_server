@@ -72,8 +72,12 @@ impl MulticastPublisher {
     /// Serializes the envelope to JSON, checks the size, and sends it as a UDP datagram.
     /// Logs a warning and returns without panicking on any error.
     async fn send_envelope<T: Serialize>(&self, channel: &str, data: T) {
-        let envelope =
-            MulticastEnvelope { session: self.session_id.clone(), seq: self.next_seq(), channel: channel.to_owned(), data };
+        let envelope = MulticastEnvelope {
+            session: self.session_id.clone(),
+            seq: self.next_seq(),
+            channel: channel.to_owned(),
+            data,
+        };
         let json = match serde_json::to_vec(&envelope) {
             Ok(json) => json,
             Err(err) => {

@@ -1,10 +1,10 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod listeners;
+pub mod multicast;
 mod order_book;
 mod prelude;
 mod servers;
 mod types;
-pub mod multicast;
 
 pub use multicast::config::{Channel, MulticastConfig, parse_channels};
 pub use prelude::Result;

@@ -63,10 +63,7 @@ pub async fn run_websocket_server(
     if let Some(mcast_config) = multicast_config {
         let mcast_rx = internal_message_tx.subscribe();
         tokio::spawn(async move {
-            let bind_addr = std::net::SocketAddr::new(
-                std::net::IpAddr::V4(mcast_config.bind_addr),
-                0,
-            );
+            let bind_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(mcast_config.bind_addr), 0);
             match tokio::net::UdpSocket::bind(bind_addr).await {
                 Ok(socket) => {
                     let publisher = MulticastPublisher::new(socket, mcast_config);

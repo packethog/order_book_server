@@ -45,10 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn recv_loop(std_socket: std::net::UdpSocket) -> Result<(), Box<dyn std::error::Error>> {
     let socket = UdpSocket::from_std(std_socket)?;
 
-    println!(
-        "listening for multicast datagrams on port {} ...",
-        socket.local_addr()?.port(),
-    );
+    println!("listening for multicast datagrams on port {} ...", socket.local_addr()?.port(),);
 
     let mut buf = [0u8; 2048];
     let mut count: u64 = 0;
