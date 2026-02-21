@@ -66,6 +66,10 @@ pub async fn run_websocket_server(
             let bind_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(mcast_config.bind_addr), 0);
             match tokio::net::UdpSocket::bind(bind_addr).await {
                 Ok(socket) => {
+                    if let Err(err) = socket.set_multicast_ttl_v4(64) {
+                        log::error!("failed to set multicast TTL: {err}");
+                        std::process::exit(3);
+                    }
                     let publisher = MulticastPublisher::new(socket, mcast_config);
                     publisher.run(mcast_rx).await;
                 }
