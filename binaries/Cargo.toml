@@ -11,6 +11,7 @@ tokio = { version = "1", features = ["full"] }
 futures-util = "0.3.31"
 tokio-tungstenite = "0.27.0"
 clap = { version = "4.5.42", features = ["derive"] }
+socket2 = "0.5"
 
 [lints]
 workspace = true
