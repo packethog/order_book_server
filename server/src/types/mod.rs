@@ -24,7 +24,7 @@ pub(crate) struct Trade {
     pub(crate) users: [Address; 2],
 }
 
-#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Level {
     px: String,
     sz: String,
@@ -37,7 +37,7 @@ impl Level {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct L2Book {
     coin: String,
     time: u64,

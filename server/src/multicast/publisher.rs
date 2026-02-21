@@ -1,11 +1,13 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use log::warn;
+use log::{info, warn};
 use serde::Serialize;
 use tokio::net::UdpSocket;
 use uuid::Uuid;
 
 use crate::multicast::config::MulticastConfig;
+use crate::types::L2Book;
 
 /// Maximum UDP datagram payload size. Messages exceeding this are dropped.
 const MAX_DATAGRAM_SIZE: usize = 1400;
@@ -101,11 +103,18 @@ impl MulticastPublisher {
     ) {
         use crate::listeners::order_book::{InternalMessage, L2SnapshotParams};
         use crate::multicast::config::Channel;
-        use crate::types::L2Book;
+
+        info!(
+            "multicast publisher started: group={} port={} session={}",
+            self.config.group_addr, self.config.port, self.session_id
+        );
 
         let mut snapshot_interval = tokio::time::interval(self.config.snapshot_interval);
         // The first tick completes immediately; consume it so we don't send a spurious snapshot.
         snapshot_interval.tick().await;
+
+        // Cache the most recent L2 book per coin for periodic snapshot re-sends.
+        let mut cached_snapshots: HashMap<String, L2Book> = HashMap::new();
 
         loop {
             tokio::select! {
@@ -123,6 +132,7 @@ impl MulticastPublisher {
                                         let truncated = snapshot.truncate(self.config.l2_levels);
                                         let levels = truncated.export_inner_snapshot();
                                         let book = L2Book::from_l2_snapshot(coin.value(), levels, *time);
+                                        cached_snapshots.insert(coin.value(), book.clone());
                                         self.send_envelope("l2Book", book).await;
                                     }
                                 }
@@ -133,10 +143,9 @@ impl MulticastPublisher {
                                 }
                                 let trades_by_coin = crate::servers::websocket_server::coin_to_trades(batch);
                                 for trades in trades_by_coin.values() {
-                                    for trade in trades {
-                                        let mc_trade = MulticastTrade::from_trade(trade);
-                                        self.send_envelope("trades", mc_trade).await;
-                                    }
+                                    let mcast_trades: Vec<MulticastTrade> =
+                                        trades.iter().map(MulticastTrade::from_trade).collect();
+                                    self.send_envelope("trades", &mcast_trades).await;
                                 }
                             }
                             InternalMessage::L4BookUpdates { .. } => {
@@ -153,9 +162,12 @@ impl MulticastPublisher {
                     }
                 }
                 _ = snapshot_interval.tick() => {
-                    // Periodic snapshot timer tick.
-                    // L2Snapshots is not Clone, so we cannot cache them.
-                    // Real snapshots arrive via the broadcast channel; this is a no-op.
+                    if !self.config.channels.contains(&Channel::L2) {
+                        continue;
+                    }
+                    for book in cached_snapshots.values() {
+                        self.send_envelope("l2Snapshot", book.clone()).await;
+                    }
                 }
             }
         }

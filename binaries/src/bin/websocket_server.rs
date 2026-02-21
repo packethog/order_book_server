@@ -69,9 +69,12 @@ async fn main() -> Result<()> {
             eprintln!("error: --multicast-bind-addr is required when --multicast-group is set");
             std::process::exit(1);
         };
-        let Ok(channels) = parse_channels(&args.multicast_channels) else {
-            eprintln!("error: invalid --multicast-channels value: {}", args.multicast_channels);
-            std::process::exit(1);
+        let channels = match parse_channels(&args.multicast_channels) {
+            Ok(c) => c,
+            Err(err) => {
+                eprintln!("error: invalid --multicast-channels: {err}");
+                std::process::exit(1);
+            }
         };
         Some(MulticastConfig {
             group_addr,
