@@ -4,7 +4,9 @@ mod order_book;
 mod prelude;
 mod servers;
 mod types;
+pub mod multicast;
 
+pub use multicast::config::{Channel, MulticastConfig, parse_channels};
 pub use prelude::Result;
 pub use servers::websocket_server::run_websocket_server;
 
