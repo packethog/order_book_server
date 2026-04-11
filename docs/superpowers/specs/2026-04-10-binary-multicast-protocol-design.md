@@ -4,7 +4,7 @@ Replace the JSON-based multicast publisher with the DoubleZero Edge Top-of-Book 
 
 ## Context
 
-The order book server reads Hyperliquid order book updates from a local non-validating node and distributes them via WebSocket and UDP multicast. The `ss/multicast-support` branch has a working JSON multicast publisher. This work replaces the JSON wire format with the DoubleZero Edge binary protocol defined in `spec/dz_topofbook.ksy` and the [Top-of-Book Feed v0.1.0 spec](https://github.com/malbeclabs/edge-feed-spec/blob/main/top-of-book/v0.1.0.md).
+The order book server reads Hyperliquid order book updates from a local non-validating node and distributes them via WebSocket and UDP multicast. The `ss/multicast-support` branch has a working JSON multicast publisher. This work replaces the JSON wire format with the DoubleZero Edge binary protocol defined in the [Top-of-Book Feed v0.1.0 spec](https://github.com/malbeclabs/edge-feed-spec/blob/main/top-of-book/v0.1.0.md).
 
 Reference data (InstrumentDefinition, ManifestSummary, second port) is deferred to a follow-up.
 
@@ -184,7 +184,7 @@ Update `example_multicast_subscriber.rs` to decode binary frames using the `prot
 
 **protocol/ unit tests:**
 - Encode each message type, verify exact byte layout against spec
-- Field offsets and sizes match Kaitai struct definition
+- Field offsets and sizes match the v0.1.0 spec tables
 - FrameBuilder: single message, multiple messages, MTU overflow
 - Price/qty string-to-fixed-point conversion edge cases
 
@@ -205,4 +205,4 @@ Update `example_multicast_subscriber.rs` to decode binary frames using the `prot
 
 ## Wire Format Reference
 
-The canonical wire format definition is `spec/dz_topofbook.ksy` (Kaitai Struct). The protocol module's encoding must match this definition exactly.
+The canonical wire format definition is the [Top-of-Book Feed v0.1.0 spec](https://github.com/malbeclabs/edge-feed-spec/blob/main/top-of-book/v0.1.0.md). The protocol module's encoding must match the byte layouts described there exactly.
