@@ -61,6 +61,27 @@ impl OrderBookState {
         self.order_book.as_ref().keys().cloned().collect()
     }
 
+    /// Replaces a single coin's book with a fresh one from the given snapshot.
+    /// Used to recover from per-coin drift without resetting all other coins.
+    /// Also clears the `snapped` flag so the next tick will emit a fresh L2 snapshot
+    /// carrying the corrected state downstream.
+    pub(super) fn replace_coin_from_snapshot(
+        &mut self,
+        coin: Coin,
+        snapshot: crate::order_book::Snapshot<InnerL4Order>,
+        ignore_triggers: bool,
+    ) {
+        self.order_book.replace_coin_from_snapshot(coin, snapshot, ignore_triggers);
+        self.snapped = false;
+    }
+
+    /// Removes a coin's book entirely. Used when a coin is in our state but missing
+    /// from the fresh snapshot. Also clears the `snapped` flag.
+    pub(super) fn remove_coin(&mut self, coin: &Coin) {
+        self.order_book.remove_coin(coin);
+        self.snapped = false;
+    }
+
     pub(super) fn apply_updates(
         &mut self,
         order_statuses: Batch<NodeDataOrderStatus>,

@@ -51,6 +51,18 @@ impl<O: InnerOrder> OrderBooks<O> {
         self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).add_order(order);
     }
 
+    /// Replaces the book for a single coin with a fresh one built from the given snapshot.
+    /// Used for surgical per-coin recovery when drift is detected on validation.
+    pub(crate) fn replace_coin_from_snapshot(&mut self, coin: Coin, snapshot: Snapshot<O>, ignore_triggers: bool) {
+        self.order_books.insert(coin, OrderBook::from_snapshot(snapshot, ignore_triggers));
+    }
+
+    /// Removes a coin's book entirely. Used when a coin exists in our state
+    /// but is missing from the fresh snapshot (likely stale data).
+    pub(crate) fn remove_coin(&mut self, coin: &Coin) -> Option<OrderBook<O>> {
+        self.order_books.remove(coin)
+    }
+
     pub(crate) fn cancel_order(&mut self, oid: Oid, coin: Coin) -> bool {
         self.order_books.get_mut(&coin).is_some_and(|book| book.cancel_order(oid))
     }

@@ -171,7 +171,21 @@ fn fetch_snapshot(
                             }
                             let stored_snapshot = state.compute_snapshot().snapshot;
                             info!("Validating snapshot");
-                            validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot)
+                            let report =
+                                validate_snapshot_consistency(&stored_snapshot, &expected_snapshot, ignore_spot);
+                            if report.is_clean() {
+                                Ok(())
+                            } else {
+                                log::warn!(
+                                    "snapshot validation found {} impacted coin(s): {} diverged, {} missing in fresh, {} extra in fresh — applying surgical recovery",
+                                    report.total_impacted(),
+                                    report.diverged.len(),
+                                    report.missing_in_fresh.len(),
+                                    report.extra_in_fresh.len(),
+                                );
+                                listener.lock().await.apply_recovery(&report, expected_snapshot);
+                                Ok(())
+                            }
                         } else {
                             listener.lock().await.init_from_snapshot(expected_snapshot, height);
                             Ok(())
@@ -309,6 +323,51 @@ impl OrderBookListener {
     // tkae the cached updates and stop collecting updates
     fn take_cache(&mut self) -> VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
         self.fetched_snapshot_cache.take().unwrap_or_default()
+    }
+
+    /// Applies surgical per-coin recovery based on a `ValidationReport`.
+    ///
+    /// Instead of exiting the process when the internal book diverges from a
+    /// fresh snapshot, we re-initialize just the affected coins in place.
+    /// The rest of the channel continues untouched — other instruments are
+    /// unaffected, and the next tick's `InternalMessage::Snapshot` will
+    /// carry the corrected BBO for the repaired coins through the normal
+    /// publish path.
+    fn apply_recovery(&mut self, report: &utils::ValidationReport, fresh_snapshot: Snapshots<InnerL4Order>) {
+        let Some(state) = self.order_book_state.as_mut() else {
+            return;
+        };
+
+        let mut fresh_map = fresh_snapshot.value();
+
+        // Repair coins that diverged: replace the internal book with the fresh one.
+        for (coin, msg) in &report.diverged {
+            log::warn!("recovery: re-initializing {} (divergence: {})", coin.value(), msg);
+            if let Some(fresh_book) = fresh_map.remove(coin) {
+                state.replace_coin_from_snapshot(coin.clone(), fresh_book, true);
+            } else {
+                log::warn!(
+                    "recovery: diverged coin {} missing from fresh snapshot — dropping from state",
+                    coin.value()
+                );
+                state.remove_coin(coin);
+            }
+        }
+
+        // Drop coins that we have but the fresh snapshot doesn't (stale data).
+        for coin in &report.missing_in_fresh {
+            log::warn!("recovery: dropping stale coin {} not in fresh snapshot", coin.value());
+            state.remove_coin(coin);
+        }
+
+        // Add coins that are in the fresh snapshot but not in our state (new listings
+        // that appeared between our bootstrap and now).
+        for coin in &report.extra_in_fresh {
+            if let Some(fresh_book) = fresh_map.remove(coin) {
+                log::warn!("recovery: adding new coin {} from fresh snapshot", coin.value());
+                state.replace_coin_from_snapshot(coin.clone(), fresh_book, true);
+            }
+        }
     }
 
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {

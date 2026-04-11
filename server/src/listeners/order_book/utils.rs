@@ -44,66 +44,111 @@ pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
     Ok(output_path)
 }
 
+/// Result of comparing our internal book to the fresh snapshot.
+///
+/// Instead of failing on the first divergence, we walk everything and report
+/// per-coin outcomes so the caller can recover surgically (re-init just the
+/// diverged coins from the fresh data).
+#[derive(Debug, Default)]
+pub(super) struct ValidationReport {
+    /// Coins whose internal book diverges from the fresh snapshot. These should
+    /// be re-initialized from `Coin -> fresh Snapshot` using the fresh snapshot
+    /// held by the caller.
+    pub diverged: Vec<(crate::order_book::Coin, String)>,
+    /// Coins present internally but absent from the fresh snapshot (with
+    /// non-empty book). Typically indicates stale data; should be dropped.
+    pub missing_in_fresh: Vec<crate::order_book::Coin>,
+    /// Coins present in the fresh snapshot but absent internally. Should be
+    /// added from the fresh snapshot.
+    pub extra_in_fresh: Vec<crate::order_book::Coin>,
+}
+
+impl ValidationReport {
+    pub(super) fn is_clean(&self) -> bool {
+        self.diverged.is_empty() && self.missing_in_fresh.is_empty() && self.extra_in_fresh.is_empty()
+    }
+
+    pub(super) fn total_impacted(&self) -> usize {
+        self.diverged.len() + self.missing_in_fresh.len() + self.extra_in_fresh.len()
+    }
+}
+
 /// Validates that our internally-reconstructed order book (`internal`) matches
 /// the fresh snapshot pulled from the node (`fresh`).
 ///
-/// The two are walked level-by-level and order-by-order. On mismatch, a rich
-/// diagnostic error is returned with enough context to characterize the
-/// divergence (length mismatch vs. order content mismatch, position within the
-/// level, and a window of surrounding orders on both sides).
+/// The two are walked level-by-level and order-by-order. Instead of bailing on
+/// the first mismatch, this function collects every diverged coin and returns
+/// a `ValidationReport`, so the caller can recover each affected coin
+/// independently rather than resetting the whole channel.
+///
+/// For each diverged coin the report includes a rich diagnostic string
+/// (length mismatch vs. order content mismatch, position within the level,
+/// and a window of surrounding orders).
 pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
     internal: &Snapshots<O>,
-    fresh: Snapshots<O>,
+    fresh: &Snapshots<O>,
     ignore_spot: bool,
-) -> Result<()> {
-    let mut fresh_map: HashMap<_, _> =
-        fresh.value().into_iter().filter(|(c, _)| !c.is_spot() || !ignore_spot).collect();
+) -> ValidationReport {
+    let mut report = ValidationReport::default();
 
-    for (coin, book) in internal.as_ref() {
+    // Index the fresh side by coin for O(1) lookup and so we can track which
+    // fresh coins we've "consumed" (anything left over is extra in fresh).
+    let mut fresh_by_coin: HashMap<&crate::order_book::Coin, &Snapshot<O>> =
+        fresh.as_ref().iter().filter(|(c, _)| !c.is_spot() || !ignore_spot).collect();
+
+    for (coin, internal_book) in internal.as_ref() {
         if ignore_spot && coin.is_spot() {
             continue;
         }
-        let internal_book = book.as_ref();
-        if let Some(fresh_book) = fresh_map.remove(coin) {
-            let internal_sides = internal_book.as_ref();
-            let fresh_sides = fresh_book.as_ref();
+        let internal_sides = internal_book.as_ref();
 
-            for (side_idx, (internal_orders, fresh_orders)) in internal_sides.iter().zip(fresh_sides.iter()).enumerate()
-            {
-                let side_name = if side_idx == 0 { "bid" } else { "ask" };
+        let Some(fresh_book) = fresh_by_coin.remove(coin) else {
+            // Coin in our state but not in fresh snapshot. Only flag if the
+            // internal book is non-empty — an empty entry is a no-op.
+            if !internal_sides[0].is_empty() || !internal_sides[1].is_empty() {
+                report.missing_in_fresh.push(coin.clone());
+            }
+            continue;
+        };
 
-                // Length divergence is usually the clearest symptom of a
-                // missed or phantom event. Report it before walking orders.
-                if internal_orders.len() != fresh_orders.len() {
-                    return Err(
-                        format_length_divergence(&coin.value(), side_name, internal_orders, fresh_orders).into()
-                    );
-                }
+        let fresh_sides = fresh_book.as_ref();
 
-                // Lengths agree — find the first position where content diverges.
-                for (pos, (internal_order, fresh_order)) in internal_orders.iter().zip(fresh_orders.iter()).enumerate()
-                {
-                    if *internal_order != *fresh_order {
-                        return Err(format_order_divergence(
-                            &coin.value(),
-                            side_name,
-                            pos,
-                            internal_orders,
-                            fresh_orders,
-                        )
-                        .into());
-                    }
+        // Walk each side (bid, ask) and find the first divergence on this coin.
+        // Stop at the first side that diverges — one diagnostic per coin is enough
+        // since the remediation (replace the whole coin) is the same.
+        let mut divergence: Option<String> = None;
+        for (side_idx, (internal_orders, fresh_orders)) in internal_sides.iter().zip(fresh_sides.iter()).enumerate() {
+            let side_name = if side_idx == 0 { "bid" } else { "ask" };
+
+            if internal_orders.len() != fresh_orders.len() {
+                divergence = Some(format_length_divergence(&coin.value(), side_name, internal_orders, fresh_orders));
+                break;
+            }
+
+            for (pos, (internal_order, fresh_order)) in internal_orders.iter().zip(fresh_orders.iter()).enumerate() {
+                if *internal_order != *fresh_order {
+                    divergence =
+                        Some(format_order_divergence(&coin.value(), side_name, pos, internal_orders, fresh_orders));
+                    break;
                 }
             }
-        } else if !internal_book[0].is_empty() || !internal_book[1].is_empty() {
-            return Err(format!("Missing {} book in fresh snapshot", coin.value()).into());
+            if divergence.is_some() {
+                break;
+            }
+        }
+
+        if let Some(msg) = divergence {
+            report.diverged.push((coin.clone(), msg));
         }
     }
-    if !fresh_map.is_empty() {
-        let extra: Vec<String> = fresh_map.keys().map(|c| c.value()).collect();
-        return Err(format!("Extra orderbooks in fresh snapshot: {extra:?}").into());
+
+    // Anything left in fresh_by_coin is present in the fresh snapshot but not
+    // in our internal state — should be added.
+    for (coin, _) in fresh_by_coin {
+        report.extra_in_fresh.push(coin.clone());
     }
-    Ok(())
+
+    report
 }
 
 /// Builds a multi-line diagnostic for a length mismatch on a single side.
