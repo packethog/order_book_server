@@ -1,4 +1,7 @@
-use crate::protocol::constants::*;
+use crate::protocol::constants::{
+    CHANNEL_RESET_SIZE, END_OF_SESSION_SIZE, HEARTBEAT_SIZE, MSG_TYPE_CHANNEL_RESET, MSG_TYPE_END_OF_SESSION,
+    MSG_TYPE_HEARTBEAT, MSG_TYPE_QUOTE, MSG_TYPE_TRADE, QUOTE_SIZE, TRADE_SIZE,
+};
 
 /// Data needed to encode a Quote message.
 pub struct QuoteData {
@@ -29,6 +32,7 @@ pub struct TradeData {
 
 /// Writes a Quote message (60 bytes) into the provided buffer.
 /// The buffer MUST be exactly `QUOTE_SIZE` bytes.
+#[allow(clippy::cast_possible_truncation)]
 pub fn encode_quote(buf: &mut [u8], data: &QuoteData, flags: u16) {
     debug_assert_eq!(buf.len(), QUOTE_SIZE);
     // App message header
@@ -52,6 +56,7 @@ pub fn encode_quote(buf: &mut [u8], data: &QuoteData, flags: u16) {
 
 /// Writes a Trade message (52 bytes) into the provided buffer.
 /// The buffer MUST be exactly `TRADE_SIZE` bytes.
+#[allow(clippy::cast_possible_truncation)]
 pub fn encode_trade(buf: &mut [u8], data: &TradeData, flags: u16) {
     debug_assert_eq!(buf.len(), TRADE_SIZE);
     // App message header
@@ -72,6 +77,7 @@ pub fn encode_trade(buf: &mut [u8], data: &TradeData, flags: u16) {
 
 /// Writes a Heartbeat message (16 bytes) into the provided buffer.
 /// The buffer MUST be exactly `HEARTBEAT_SIZE` bytes.
+#[allow(clippy::cast_possible_truncation)]
 pub fn encode_heartbeat(buf: &mut [u8], channel_id: u8, timestamp_ns: u64) {
     debug_assert_eq!(buf.len(), HEARTBEAT_SIZE);
     buf[0] = MSG_TYPE_HEARTBEAT;
@@ -84,6 +90,7 @@ pub fn encode_heartbeat(buf: &mut [u8], channel_id: u8, timestamp_ns: u64) {
 
 /// Writes a ChannelReset message (12 bytes) into the provided buffer.
 /// The buffer MUST be exactly `CHANNEL_RESET_SIZE` bytes.
+#[allow(clippy::cast_possible_truncation)]
 pub fn encode_channel_reset(buf: &mut [u8], timestamp_ns: u64) {
     debug_assert_eq!(buf.len(), CHANNEL_RESET_SIZE);
     buf[0] = MSG_TYPE_CHANNEL_RESET;
@@ -94,6 +101,7 @@ pub fn encode_channel_reset(buf: &mut [u8], timestamp_ns: u64) {
 
 /// Writes an EndOfSession message (12 bytes) into the provided buffer.
 /// The buffer MUST be exactly `END_OF_SESSION_SIZE` bytes.
+#[allow(clippy::cast_possible_truncation)]
 pub fn encode_end_of_session(buf: &mut [u8], timestamp_ns: u64) {
     debug_assert_eq!(buf.len(), END_OF_SESSION_SIZE);
     buf[0] = MSG_TYPE_END_OF_SESSION;
@@ -105,6 +113,7 @@ pub fn encode_end_of_session(buf: &mut [u8], timestamp_ns: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::constants::{AGGRESSOR_SELL, FLAG_SNAPSHOT, UPDATE_FLAG_ASK_UPDATED, UPDATE_FLAG_BID_UPDATED};
 
     #[test]
     fn quote_layout_matches_spec() {
@@ -130,10 +139,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes(buf[8..10].try_into().unwrap()), 1);
         assert_eq!(buf[10], 0x03);
         assert_eq!(buf[11], 0);
-        assert_eq!(
-            u64::from_le_bytes(buf[12..20].try_into().unwrap()),
-            1_700_000_000_000_000_000
-        );
+        assert_eq!(u64::from_le_bytes(buf[12..20].try_into().unwrap()), 1_700_000_000_000_000_000);
         assert_eq!(i64::from_le_bytes(buf[20..28].try_into().unwrap()), 1_062_170);
         assert_eq!(u64::from_le_bytes(buf[28..36].try_into().unwrap()), 100);
         assert_eq!(i64::from_le_bytes(buf[36..44].try_into().unwrap()), 1_062_330);
@@ -184,16 +190,10 @@ mod tests {
         assert_eq!(u16::from_le_bytes(buf[8..10].try_into().unwrap()), 1);
         assert_eq!(buf[10], AGGRESSOR_SELL);
         assert_eq!(buf[11], 0);
-        assert_eq!(
-            u64::from_le_bytes(buf[12..20].try_into().unwrap()),
-            1_700_000_001_000_000_000
-        );
+        assert_eq!(u64::from_le_bytes(buf[12..20].try_into().unwrap()), 1_700_000_001_000_000_000);
         assert_eq!(i64::from_le_bytes(buf[20..28].try_into().unwrap()), 1_062_960);
         assert_eq!(u64::from_le_bytes(buf[28..36].try_into().unwrap()), 17);
-        assert_eq!(
-            u64::from_le_bytes(buf[36..44].try_into().unwrap()),
-            293_353_986_402_527
-        );
+        assert_eq!(u64::from_le_bytes(buf[36..44].try_into().unwrap()), 293_353_986_402_527);
         assert_eq!(u64::from_le_bytes(buf[44..52].try_into().unwrap()), 0);
     }
 

@@ -1,6 +1,6 @@
-use crate::protocol::constants::*;
+use crate::protocol::constants::{FRAME_HEADER_SIZE, MAGIC_BYTES, SCHEMA_VERSION};
 
-/// Errors returned by FrameBuilder when a message cannot be added.
+/// Errors returned by `FrameBuilder` when a message cannot be added.
 #[derive(Debug, PartialEq)]
 pub enum FrameError {
     /// Adding this message would exceed the configured MTU.
@@ -32,23 +32,18 @@ impl FrameBuilder {
         let mut buf = Vec::with_capacity(mtu);
         // Reserve frame header space — will be written in finalize()
         buf.resize(FRAME_HEADER_SIZE, 0);
-        Self {
-            buf,
-            channel_id,
-            sequence_number,
-            send_timestamp_ns,
-            mtu,
-            msg_count: 0,
-        }
+        Self { buf, channel_id, sequence_number, send_timestamp_ns, mtu, msg_count: 0 }
     }
 
     /// Returns the number of bytes available for more messages.
+    #[must_use]
     pub fn remaining(&self) -> usize {
         self.mtu.saturating_sub(self.buf.len())
     }
 
     /// Returns true if no messages have been added yet.
-    pub fn is_empty(&self) -> bool {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.msg_count == 0
     }
 
@@ -62,10 +57,7 @@ impl FrameBuilder {
             return Err(FrameError::MaxMessages);
         }
         if size > self.remaining() {
-            return Err(FrameError::ExceedsMtu {
-                msg_size: size,
-                remaining: self.remaining(),
-            });
+            return Err(FrameError::ExceedsMtu { msg_size: size, remaining: self.remaining() });
         }
         let start = self.buf.len();
         self.buf.resize(start + size, 0);
@@ -79,7 +71,7 @@ impl FrameBuilder {
 
     /// Writes the frame header into the reserved space and returns the complete frame.
     pub fn finalize(&mut self) -> &[u8] {
-        let frame_length = self.buf.len() as u16;
+        let frame_length = u16::try_from(self.buf.len()).unwrap_or(u16::MAX);
 
         // Magic (0x445A LE → bytes [0x5A, 0x44])
         self.buf[0..2].copy_from_slice(&MAGIC_BYTES);
@@ -105,6 +97,7 @@ impl FrameBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::constants::DEFAULT_MTU;
 
     #[test]
     fn frame_header_layout() {
@@ -119,10 +112,7 @@ mod tests {
         assert_eq!(frame[2], 1);
         assert_eq!(frame[3], 3);
         assert_eq!(u64::from_le_bytes(frame[4..12].try_into().unwrap()), 42);
-        assert_eq!(
-            u64::from_le_bytes(frame[12..20].try_into().unwrap()),
-            1_700_000_000_000_000_000
-        );
+        assert_eq!(u64::from_le_bytes(frame[12..20].try_into().unwrap()), 1_700_000_000_000_000_000);
         assert_eq!(frame[20], 1);
         assert_eq!(frame[21], 0);
         assert_eq!(u16::from_le_bytes(frame[22..24].try_into().unwrap()), 32);
@@ -142,13 +132,7 @@ mod tests {
     fn exceeds_mtu_returns_error() {
         let mut fb = FrameBuilder::new(0, 0, 0, 30);
         let result = fb.message_buffer(10);
-        assert_eq!(
-            result.unwrap_err(),
-            FrameError::ExceedsMtu {
-                msg_size: 10,
-                remaining: 6,
-            }
-        );
+        assert_eq!(result.unwrap_err(), FrameError::ExceedsMtu { msg_size: 10, remaining: 6 });
     }
 
     #[test]

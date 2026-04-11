@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used)]
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,9 +8,14 @@ use tokio::net::UdpSocket;
 
 use crate::instruments::{InstrumentRegistry, price_to_fixed, qty_to_fixed};
 use crate::multicast::config::MulticastConfig;
-use crate::protocol::constants::*;
+use crate::protocol::constants::{
+    AGGRESSOR_BUY, AGGRESSOR_SELL, CHANNEL_RESET_SIZE, END_OF_SESSION_SIZE, FLAG_SNAPSHOT, HEARTBEAT_SIZE, QUOTE_SIZE,
+    TRADE_SIZE, UPDATE_FLAG_ASK_GONE, UPDATE_FLAG_ASK_UPDATED, UPDATE_FLAG_BID_GONE, UPDATE_FLAG_BID_UPDATED,
+};
 use crate::protocol::frame::{FrameBuilder, FrameError};
-use crate::protocol::messages::*;
+use crate::protocol::messages::{
+    QuoteData, TradeData, encode_channel_reset, encode_end_of_session, encode_heartbeat, encode_quote, encode_trade,
+};
 
 pub(crate) struct MulticastPublisher {
     socket: UdpSocket,
@@ -20,23 +26,16 @@ pub(crate) struct MulticastPublisher {
 
 impl MulticastPublisher {
     pub(crate) fn new(socket: UdpSocket, config: MulticastConfig, registry: InstrumentRegistry) -> Self {
-        Self {
-            socket,
-            config,
-            registry,
-            seq: AtomicU64::new(0),
-        }
+        Self { socket, config, registry, seq: AtomicU64::new(0) }
     }
 
     fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn now_ns() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
     }
 
     async fn send_frame(&self, frame: &[u8]) {
@@ -105,7 +104,7 @@ impl MulticastPublisher {
             let (bid_price, bid_qty, bid_n) = if let Some(level) = bids.first() {
                 let px = price_to_fixed(level.px(), inst.price_exponent).unwrap_or(0);
                 let qty = qty_to_fixed(level.sz(), inst.qty_exponent).unwrap_or(0);
-                (px, qty, level.n() as u16)
+                (px, qty, u16::try_from(level.n()).unwrap_or(u16::MAX))
             } else {
                 (0, 0, 0)
             };
@@ -113,7 +112,7 @@ impl MulticastPublisher {
             let (ask_price, ask_qty, ask_n) = if let Some(level) = asks.first() {
                 let px = price_to_fixed(level.px(), inst.price_exponent).unwrap_or(0);
                 let qty = qty_to_fixed(level.sz(), inst.qty_exponent).unwrap_or(0);
-                (px, qty, level.n() as u16)
+                (px, qty, u16::try_from(level.n()).unwrap_or(u16::MAX))
             } else {
                 (0, 0, 0)
             };
@@ -295,6 +294,9 @@ impl MulticastPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::constants::{
+        DEFAULT_MTU, FRAME_HEADER_SIZE, MAGIC_BYTES, MSG_TYPE_CHANNEL_RESET, MSG_TYPE_HEARTBEAT, SCHEMA_VERSION,
+    };
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
@@ -393,7 +395,7 @@ mod tests {
         let mut buf = [0u8; 2048];
         let mut seqs = Vec::new();
         for _ in 0..3 {
-            let n = tokio::time::timeout(Duration::from_secs(2), recv_socket.recv(&mut buf))
+            tokio::time::timeout(Duration::from_secs(2), recv_socket.recv(&mut buf))
                 .await
                 .expect("timed out")
                 .expect("recv failed");

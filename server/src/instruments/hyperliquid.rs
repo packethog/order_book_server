@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use super::{InstrumentInfo, make_symbol};
 
 /// Fetches perpetual and spot metadata from the Hyperliquid REST API and builds
-/// an InstrumentInfo map keyed by coin name.
+/// an `InstrumentInfo` map keyed by coin name.
 ///
-/// Perp instruments get instrument_id = array index.
-/// Spot instruments get instrument_id = 10000 + array index.
+/// Perp instruments get `instrument_id` = array index.
+/// Spot instruments get `instrument_id` = 10000 + array index.
 pub async fn bootstrap_registry(
     api_url: &str,
 ) -> Result<HashMap<String, InstrumentInfo>, Box<dyn std::error::Error + Send + Sync>> {
@@ -23,9 +23,9 @@ pub async fn bootstrap_registry(
         .json::<serde_json::Value>()
         .await?;
 
-    if let Some(universe) = perp_resp.get("universe").and_then(|v| v.as_array()) {
+    if let Some(universe) = perp_resp.get("universe").and_then(serde_json::Value::as_array) {
         for (idx, asset) in universe.iter().enumerate() {
-            if let Some(info) = parse_perp_asset(asset, idx as u32) {
+            if let Some(info) = parse_perp_asset(asset, u32::try_from(idx).unwrap_or(u32::MAX)) {
                 info!(
                     "instruments: perp {} -> id={}, price_exp={}, qty_exp={}",
                     info.0, info.1.instrument_id, info.1.price_exponent, info.1.qty_exponent
@@ -44,9 +44,9 @@ pub async fn bootstrap_registry(
         .json::<serde_json::Value>()
         .await?;
 
-    if let Some(universe) = spot_resp.get("universe").and_then(|v| v.as_array()) {
+    if let Some(universe) = spot_resp.get("universe").and_then(serde_json::Value::as_array) {
         for (idx, asset) in universe.iter().enumerate() {
-            if let Some(info) = parse_spot_asset(asset, idx as u32) {
+            if let Some(info) = parse_spot_asset(asset, u32::try_from(idx).unwrap_or(u32::MAX)) {
                 info!(
                     "instruments: spot {} -> id={}, price_exp={}, qty_exp={}",
                     info.0, info.1.instrument_id, info.1.price_exponent, info.1.qty_exponent
@@ -66,47 +66,40 @@ pub async fn bootstrap_registry(
     Ok(instruments)
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn parse_perp_asset(asset: &serde_json::Value, index: u32) -> Option<(String, InstrumentInfo)> {
     let name = asset.get("name")?.as_str()?;
-    let sz_decimals = asset.get("szDecimals")?.as_u64()? as i8;
-    let qty_exponent = -sz_decimals;
+    let sz_decimals = asset.get("szDecimals")?.as_u64()?;
+    let qty_exponent = -(sz_decimals as i8);
     let price_exponent = derive_price_exponent(asset);
 
     Some((
         name.to_string(),
-        InstrumentInfo {
-            instrument_id: index,
-            price_exponent,
-            qty_exponent,
-            symbol: make_symbol(name),
-        },
+        InstrumentInfo { instrument_id: index, price_exponent, qty_exponent, symbol: make_symbol(name) },
     ))
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn parse_spot_asset(asset: &serde_json::Value, index: u32) -> Option<(String, InstrumentInfo)> {
     let name = asset.get("name")?.as_str()?;
-    let sz_decimals = asset.get("szDecimals")?.as_u64()? as i8;
-    let qty_exponent = -sz_decimals;
+    let sz_decimals = asset.get("szDecimals")?.as_u64()?;
+    let qty_exponent = -(sz_decimals as i8);
     let price_exponent = derive_price_exponent(asset);
 
     Some((
         name.to_string(),
-        InstrumentInfo {
-            instrument_id: 10_000 + index,
-            price_exponent,
-            qty_exponent,
-            symbol: make_symbol(name),
-        },
+        InstrumentInfo { instrument_id: 10_000 + index, price_exponent, qty_exponent, symbol: make_symbol(name) },
     ))
 }
 
 /// Derives the price exponent from asset metadata.
 ///
-/// Looks for a "maxDecimals" field first; falls back to -8 (matching the
+/// Looks for a `maxDecimals` field first; falls back to -8 (matching the
 /// internal MULTIPLIER of 10^8 used throughout the order book) which
 /// accommodates all HL assets without loss of precision.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn derive_price_exponent(asset: &serde_json::Value) -> i8 {
-    if let Some(max_decimals) = asset.get("maxDecimals").and_then(|v| v.as_u64()) {
+    if let Some(max_decimals) = asset.get("maxDecimals").and_then(serde_json::Value::as_u64) {
         return -(max_decimals as i8);
     }
     -8
