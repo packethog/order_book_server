@@ -1,12 +1,12 @@
 # Binary Multicast Protocol: Design Spec
 
-Replace the JSON-based multicast publisher with the DoubleZero Edge Top-of-Book binary protocol (v0.1.0), hot-path only.
+Replace the JSON-based multicast publisher with the DoubleZero Edge Top-of-Book binary protocol (v0.1.0), marketdata only.
 
 ## Context
 
 The order book server reads Hyperliquid order book updates from a local non-validating node and distributes them via WebSocket and UDP multicast. The `ss/multicast-support` branch has a working JSON multicast publisher. This work replaces the JSON wire format with the DoubleZero Edge binary protocol defined in the [Top-of-Book Feed v0.1.0 spec](https://github.com/malbeclabs/edge-feed-spec/blob/main/top-of-book/v0.1.0.md).
 
-Reference data (InstrumentDefinition, ManifestSummary, second port) is deferred to a follow-up.
+Refdata (InstrumentDefinition, ManifestSummary, second port) is deferred to a follow-up.
 
 ## Key Decisions
 
@@ -15,7 +15,7 @@ Reference data (InstrumentDefinition, ManifestSummary, second port) is deferred 
 | Branch base | `ss/multicast-support` | Reuse publisher event loop, UDP socket, broadcast channel, CLI wiring |
 | Approach | Refactor publisher in-place | Same event loop structure, swap JSON for binary encoding |
 | Channel sharding | Single channel (channel_id=0) | ~200 instruments at ~2 Hz fits easily in one stream |
-| Port model | Single hot-path port | Reference-data port deferred; nothing to send on it yet |
+| Port model | Single marketdata port | Refdata port deferred; nothing to send on it yet |
 | Frame batching | Multiple messages per frame | HL delivers batch updates per block; pack Quotes/Trades up to MTU |
 | Max frame size | 1448 bytes default | 1500 MTU - 24 GRE - 20 IP - 8 UDP; configurable via CLI |
 | Source ID | Hardcoded to 1 | Spec allows fixed value for single-source publishers; CLI-overridable |
@@ -78,7 +78,7 @@ let bytes: &[u8] = frame.finalize();
 | 1 | Message Length | u8 |
 | 2 | Flags | u16 |
 
-**Hot-path messages and sizes:**
+**Marketdata messages and sizes:**
 
 | Message | Type ID | Total Size |
 |---------|---------|------------|
@@ -148,7 +148,7 @@ The event loop structure stays. What changes is the handling inside each arm:
 
 **Removed:**
 - `l2_levels` config field
-- `Channel` enum (L2, Trades) -- hot-path always publishes both quotes and trades
+- `Channel` enum (L2, Trades) -- marketdata always publishes both quotes and trades
 
 **New fields:**
 - `mtu: u16` -- max frame size, default 1448

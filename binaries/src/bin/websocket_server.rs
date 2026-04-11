@@ -24,13 +24,13 @@ struct Args {
     #[arg(long)]
     multicast_group: Option<Ipv4Addr>,
 
-    /// UDP port for hot-path multicast traffic (Quote/Trade/Heartbeat/EndOfSession).
+    /// UDP port for marketdata multicast traffic (Quote/Trade/Heartbeat/EndOfSession).
     #[arg(long, default_value_t = 5000)]
     multicast_port: u16,
 
-    /// UDP port for reference-data multicast traffic (InstrumentDefinition/ManifestSummary/ChannelReset).
+    /// UDP port for refdata multicast traffic (InstrumentDefinition/ManifestSummary/ChannelReset).
     #[arg(long, default_value_t = 5001)]
-    multicast_ref_data_port: u16,
+    multicast_refdata_port: u16,
 
     /// Local address to bind the multicast UDP socket.
     #[arg(long)]
@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
         Some(MulticastConfig {
             group_addr,
             port: args.multicast_port,
-            ref_data_port: args.multicast_ref_data_port,
+            refdata_port: args.multicast_refdata_port,
             bind_addr,
             snapshot_interval: Duration::from_secs(args.multicast_snapshot_interval),
             mtu: args.multicast_mtu,

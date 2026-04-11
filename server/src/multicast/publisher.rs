@@ -104,7 +104,7 @@ impl MulticastPublisher {
         self.send_frame(fb.finalize(), self.config.dest()).await;
     }
 
-    /// Sends a ManifestSummary on the reference-data port.
+    /// Sends a ManifestSummary on the refdata port.
     async fn send_manifest_summary(&self) {
         let (seq_tag, count) = {
             let guard = self.registry.read().await;
@@ -115,7 +115,7 @@ impl MulticastPublisher {
         let buf = fb.message_buffer(MANIFEST_SUMMARY_SIZE).expect("ManifestSummary fits in empty frame");
         encode_manifest_summary(buf, 0, seq_tag, count, Self::now_ns());
         fb.commit_message();
-        self.send_frame(fb.finalize(), self.config.ref_data_dest()).await;
+        self.send_frame(fb.finalize(), self.config.refdata_dest()).await;
     }
 
     /// Computes how many InstrumentDefinition messages we should emit per cycle tick.
@@ -135,7 +135,7 @@ impl MulticastPublisher {
     }
 
     /// Emits InstrumentDefinitions for up to `count` entries starting at `cycler.pos`,
-    /// packing them into MTU-sized frames on the reference-data port.
+    /// packing them into MTU-sized frames on the refdata port.
     async fn publish_definitions_batch(&self, cycler: &mut DefinitionCycler, count: usize) {
         if cycler.snapshot.is_empty() || count == 0 {
             return;
@@ -157,7 +157,7 @@ impl MulticastPublisher {
                 }
                 Err(FrameError::ExceedsMtu { .. } | FrameError::MaxMessages) => {
                     if !fb.is_empty() {
-                        self.send_frame(fb.finalize(), self.config.ref_data_dest()).await;
+                        self.send_frame(fb.finalize(), self.config.refdata_dest()).await;
                     }
                     fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
                     // Retry: a fresh frame is guaranteed to fit one message.
@@ -171,7 +171,7 @@ impl MulticastPublisher {
         }
 
         if !fb.is_empty() {
-            self.send_frame(fb.finalize(), self.config.ref_data_dest()).await;
+            self.send_frame(fb.finalize(), self.config.refdata_dest()).await;
         }
     }
 
@@ -365,22 +365,22 @@ impl MulticastPublisher {
         use crate::listeners::order_book::InternalMessage;
 
         info!(
-            "multicast publisher started: group={} hot_port={} ref_port={} mtu={} source_id={}",
-            self.config.group_addr, self.config.port, self.config.ref_data_port, self.config.mtu, self.config.source_id,
+            "multicast publisher started: group={} marketdata_port={} refdata_port={} mtu={} source_id={}",
+            self.config.group_addr, self.config.port, self.config.refdata_port, self.config.mtu, self.config.source_id,
         );
 
         // Send ChannelReset on both ports at startup.
         self.send_channel_reset(self.config.dest()).await;
-        self.send_channel_reset(self.config.ref_data_dest()).await;
+        self.send_channel_reset(self.config.refdata_dest()).await;
 
-        // Hot-path timers
+        // Marketdata timers
         let mut snapshot_interval = tokio::time::interval(self.config.snapshot_interval);
         snapshot_interval.tick().await;
 
         let mut heartbeat_interval = tokio::time::interval(self.config.heartbeat_interval);
         heartbeat_interval.tick().await;
 
-        // Reference-data timers
+        // Refdata timers
         let mut manifest_interval = tokio::time::interval(self.config.manifest_cadence);
         manifest_interval.tick().await;
 
@@ -391,7 +391,7 @@ impl MulticastPublisher {
         let mut definition_interval = tokio::time::interval(def_tick_interval);
         definition_interval.tick().await;
 
-        // Cache the most recent snapshot message for periodic hot-path resends.
+        // Cache the most recent snapshot message for periodic marketdata resends.
         let mut cached_snapshot: Option<Arc<InternalMessage>> = None;
         let mut had_activity = false;
 
@@ -532,7 +532,7 @@ mod tests {
         MulticastConfig {
             group_addr: Ipv4Addr::LOCALHOST,
             port: 0,
-            ref_data_port: 0,
+            refdata_port: 0,
             bind_addr: Ipv4Addr::LOCALHOST,
             snapshot_interval: Duration::from_secs(60),
             mtu: DEFAULT_MTU,
@@ -576,32 +576,32 @@ mod tests {
     #[tokio::test]
     async fn sends_channel_reset_on_both_ports_at_startup() {
         let send_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let hot_recv = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let ref_recv = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let marketdata_recv = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let refdata_recv = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         let mut config = test_config();
-        config.port = hot_recv.local_addr().unwrap().port();
-        config.ref_data_port = ref_recv.local_addr().unwrap().port();
+        config.port = marketdata_recv.local_addr().unwrap().port();
+        config.refdata_port = refdata_recv.local_addr().unwrap().port();
 
         let publisher = MulticastPublisher::new(send_socket, config, test_registry());
 
         publisher.send_channel_reset(publisher.config.dest()).await;
-        publisher.send_channel_reset(publisher.config.ref_data_dest()).await;
+        publisher.send_channel_reset(publisher.config.refdata_dest()).await;
 
         let mut buf = [0u8; 2048];
 
-        let n1 = tokio::time::timeout(Duration::from_secs(2), hot_recv.recv(&mut buf))
+        let n1 = tokio::time::timeout(Duration::from_secs(2), marketdata_recv.recv(&mut buf))
             .await
-            .expect("timed out on hot port")
+            .expect("timed out on marketdata port")
             .expect("hot recv failed");
         assert_eq!(&buf[0..2], &MAGIC_BYTES);
         assert_eq!(buf[2], SCHEMA_VERSION);
         assert_eq!(buf[FRAME_HEADER_SIZE], MSG_TYPE_CHANNEL_RESET);
         let _ = n1;
 
-        let n2 = tokio::time::timeout(Duration::from_secs(2), ref_recv.recv(&mut buf))
+        let n2 = tokio::time::timeout(Duration::from_secs(2), refdata_recv.recv(&mut buf))
             .await
-            .expect("timed out on ref port")
+            .expect("timed out on refdata port")
             .expect("ref recv failed");
         assert_eq!(&buf[0..2], &MAGIC_BYTES);
         assert_eq!(buf[FRAME_HEADER_SIZE], MSG_TYPE_CHANNEL_RESET);
@@ -615,7 +615,7 @@ mod tests {
         let recv_port = recv_socket.local_addr().unwrap().port();
 
         let mut config = test_config();
-        config.ref_data_port = recv_port;
+        config.refdata_port = recv_port;
 
         let publisher = MulticastPublisher::new(send_socket, config, test_registry());
         publisher.send_manifest_summary().await;
@@ -641,7 +641,7 @@ mod tests {
         let recv_port = recv_socket.local_addr().unwrap().port();
 
         let mut config = test_config();
-        config.ref_data_port = recv_port;
+        config.refdata_port = recv_port;
 
         let publisher = MulticastPublisher::new(send_socket, config, test_registry());
         let mut cycler = DefinitionCycler::empty();

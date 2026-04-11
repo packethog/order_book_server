@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the JSON multicast publisher with the DoubleZero Edge Top-of-Book binary protocol (v0.1.0), hot-path only.
+**Goal:** Replace the JSON multicast publisher with the DoubleZero Edge Top-of-Book binary protocol (v0.1.0), marketdata only.
 
 **Architecture:** Refactor the existing multicast publisher on `ss/multicast-support` in-place. Add a `protocol/` module for binary frame encoding (pure, no I/O) and an `instruments/` module for bootstrapping numeric instrument IDs from the Hyperliquid meta API. The publisher event loop structure stays; the serialization layer changes from JSON to binary frames.
 
@@ -1079,7 +1079,7 @@ use std::time::Duration;
 pub struct MulticastConfig {
     /// Multicast group address to join.
     pub group_addr: Ipv4Addr,
-    /// UDP port for hot-path multicast traffic.
+    /// UDP port for marketdata multicast traffic.
     pub port: u16,
     /// Local address to bind the socket to.
     pub bind_addr: Ipv4Addr,

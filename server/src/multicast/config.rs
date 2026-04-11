@@ -6,10 +6,10 @@ use std::time::Duration;
 pub struct MulticastConfig {
     /// Multicast group address to join.
     pub group_addr: Ipv4Addr,
-    /// UDP port for hot-path multicast traffic (Quote/Trade/Heartbeat/EndOfSession).
+    /// UDP port for marketdata multicast traffic (Quote/Trade/Heartbeat/EndOfSession).
     pub port: u16,
-    /// UDP port for reference-data traffic (InstrumentDefinition/ManifestSummary/ChannelReset).
-    pub ref_data_port: u16,
+    /// UDP port for refdata traffic (InstrumentDefinition/ManifestSummary/ChannelReset).
+    pub refdata_port: u16,
     /// Local address to bind the socket to.
     pub bind_addr: Ipv4Addr,
     /// How often to send full BBO snapshots.
@@ -18,7 +18,7 @@ pub struct MulticastConfig {
     pub mtu: u16,
     /// Source ID for Quote/Trade messages.
     pub source_id: u16,
-    /// How long to wait with no data before sending a Heartbeat on the hot-path port.
+    /// How long to wait with no data before sending a Heartbeat on the marketdata port.
     pub heartbeat_interval: Duration,
     /// Hyperliquid REST API URL for instrument metadata.
     pub hl_api_url: String,
@@ -27,21 +27,21 @@ pub struct MulticastConfig {
     /// How long a full cycle of InstrumentDefinition retransmissions takes.
     /// Definitions are spaced evenly across this period.
     pub definition_cycle: Duration,
-    /// How often to send a ManifestSummary on the reference-data port.
+    /// How often to send a ManifestSummary on the refdata port.
     pub manifest_cadence: Duration,
 }
 
 impl MulticastConfig {
-    /// Returns the destination socket address for hot-path traffic.
+    /// Returns the destination socket address for marketdata traffic.
     #[must_use]
     pub fn dest(&self) -> SocketAddr {
         SocketAddr::from((self.group_addr, self.port))
     }
 
-    /// Returns the destination socket address for reference-data traffic.
+    /// Returns the destination socket address for refdata traffic.
     #[must_use]
-    pub fn ref_data_dest(&self) -> SocketAddr {
-        SocketAddr::from((self.group_addr, self.ref_data_port))
+    pub fn refdata_dest(&self) -> SocketAddr {
+        SocketAddr::from((self.group_addr, self.refdata_port))
     }
 }
 
@@ -53,7 +53,7 @@ mod tests {
         MulticastConfig {
             group_addr: Ipv4Addr::new(239, 0, 0, 1),
             port: 5000,
-            ref_data_port: 5001,
+            refdata_port: 5001,
             bind_addr: Ipv4Addr::UNSPECIFIED,
             snapshot_interval: Duration::from_secs(5),
             mtu: 1448,
@@ -73,8 +73,8 @@ mod tests {
     }
 
     #[test]
-    fn ref_data_dest_returns_correct_socket_addr() {
+    fn refdata_dest_returns_correct_socket_addr() {
         let config = test_config();
-        assert_eq!(config.ref_data_dest(), SocketAddr::from((Ipv4Addr::new(239, 0, 0, 1), 5001)));
+        assert_eq!(config.refdata_dest(), SocketAddr::from((Ipv4Addr::new(239, 0, 0, 1), 5001)));
     }
 }

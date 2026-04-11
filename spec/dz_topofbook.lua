@@ -12,7 +12,7 @@
 -- Configure UDP ports in Wireshark via:
 --   Edit -> Preferences -> Protocols -> DZ-TOB
 -- or pass on command line:
---   tshark -o dz_tob.hot_path_port:31001 -o dz_tob.ref_data_port:31002 ...
+--   tshark -o dz_tob.marketdata_port:31001 -o dz_tob.refdata_port:31002 ...
 
 local dz = Proto("dz_tob", "DoubleZero Top-of-Book")
 
@@ -133,8 +133,8 @@ local MSG_TYPE_NAMES = {
 -- Preferences
 -- ============================================================================
 
-dz.prefs.hot_path_port = Pref.uint("Hot-path UDP port", 31001, "UDP port for Quote/Trade/Heartbeat/EndOfSession")
-dz.prefs.ref_data_port = Pref.uint("Reference-data UDP port", 31002, "UDP port for InstrumentDefinition/ManifestSummary/ChannelReset")
+dz.prefs.marketdata_port = Pref.uint("Marketdata UDP port", 31001, "UDP port for Quote/Trade/Heartbeat/EndOfSession")
+dz.prefs.refdata_port = Pref.uint("Refdata UDP port", 31002, "UDP port for InstrumentDefinition/ManifestSummary/ChannelReset")
 
 -- ============================================================================
 -- Per-message dissectors
@@ -337,13 +337,13 @@ local function register_ports()
     registered_ports = {}
 
     -- Register current preference values
-    if dz.prefs.hot_path_port > 0 then
-        udp_table:add(dz.prefs.hot_path_port, dz)
-        registered_ports[dz.prefs.hot_path_port] = true
+    if dz.prefs.marketdata_port > 0 then
+        udp_table:add(dz.prefs.marketdata_port, dz)
+        registered_ports[dz.prefs.marketdata_port] = true
     end
-    if dz.prefs.ref_data_port > 0 then
-        udp_table:add(dz.prefs.ref_data_port, dz)
-        registered_ports[dz.prefs.ref_data_port] = true
+    if dz.prefs.refdata_port > 0 then
+        udp_table:add(dz.prefs.refdata_port, dz)
+        registered_ports[dz.prefs.refdata_port] = true
     end
 end
 
