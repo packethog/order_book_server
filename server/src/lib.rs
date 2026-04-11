@@ -8,7 +8,7 @@ pub mod protocol;
 mod servers;
 mod types;
 
-pub use multicast::config::{Channel, MulticastConfig, parse_channels};
+pub use multicast::config::MulticastConfig;
 pub use prelude::Result;
 pub use servers::websocket_server::run_websocket_server;
 

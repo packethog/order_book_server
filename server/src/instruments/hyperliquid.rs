@@ -1,4 +1,4 @@
-use log::{info, warn};
+use log::info;
 use std::collections::HashMap;
 
 use super::{InstrumentInfo, make_symbol};

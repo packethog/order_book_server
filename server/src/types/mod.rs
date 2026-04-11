@@ -35,6 +35,18 @@ impl Level {
     pub(crate) const fn new(px: String, sz: String, n: usize) -> Self {
         Self { px, sz, n }
     }
+
+    pub(crate) fn px(&self) -> &str {
+        &self.px
+    }
+
+    pub(crate) fn sz(&self) -> &str {
+        &self.sz
+    }
+
+    pub(crate) fn n(&self) -> usize {
+        self.n
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,120 +1,244 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::{info, warn};
-use serde::Serialize;
 use tokio::net::UdpSocket;
-use uuid::Uuid;
 
+use crate::instruments::{InstrumentRegistry, price_to_fixed, qty_to_fixed};
 use crate::multicast::config::MulticastConfig;
-use crate::types::L2Book;
-
-/// Maximum UDP datagram payload size. Messages exceeding this are dropped.
-const MAX_DATAGRAM_SIZE: usize = 1400;
-
-/// JSON envelope wrapping all multicast messages.
-#[derive(Serialize)]
-struct MulticastEnvelope<T> {
-    session: String,
-    seq: u64,
-    channel: String,
-    data: T,
-}
-
-/// A trade without the `users` field, suitable for public multicast distribution.
-#[derive(Serialize)]
-struct MulticastTrade {
-    coin: String,
-    side: crate::order_book::types::Side,
-    px: String,
-    sz: String,
-    time: u64,
-    hash: String,
-    tid: u64,
-}
-
-impl MulticastTrade {
-    fn from_trade(trade: &crate::types::Trade) -> Self {
-        Self {
-            coin: trade.coin.clone(),
-            side: trade.side,
-            px: trade.px.clone(),
-            sz: trade.sz.clone(),
-            time: trade.time,
-            hash: trade.hash.clone(),
-            tid: trade.tid,
-        }
-    }
-}
+use crate::protocol::constants::*;
+use crate::protocol::frame::{FrameBuilder, FrameError};
+use crate::protocol::messages::*;
 
 pub(crate) struct MulticastPublisher {
     socket: UdpSocket,
     config: MulticastConfig,
-    session_id: String,
+    registry: InstrumentRegistry,
     seq: AtomicU64,
 }
 
 impl MulticastPublisher {
-    /// Creates a new publisher with a random UUID v4 session ID.
-    pub(crate) fn new(socket: UdpSocket, config: MulticastConfig) -> Self {
-        Self { socket, config, session_id: Uuid::new_v4().to_string(), seq: AtomicU64::new(0) }
+    pub(crate) fn new(socket: UdpSocket, config: MulticastConfig, registry: InstrumentRegistry) -> Self {
+        Self {
+            socket,
+            config,
+            registry,
+            seq: AtomicU64::new(0),
+        }
     }
 
-    /// Test helper that accepts a predetermined session ID.
-    #[cfg(test)]
-    const fn with_session_id(socket: UdpSocket, config: MulticastConfig, session_id: String) -> Self {
-        Self { socket, config, session_id, seq: AtomicU64::new(0) }
-    }
-
-    /// Returns the next sequence number, atomically incrementing the counter.
     fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Serializes the envelope to JSON, checks the size, and sends it as a UDP datagram.
-    /// Logs a warning and returns without panicking on any error.
-    async fn send_envelope<T: Serialize>(&self, channel: &str, data: T) {
-        let envelope = MulticastEnvelope {
-            session: self.session_id.clone(),
-            seq: self.next_seq(),
-            channel: channel.to_owned(),
-            data,
-        };
-        let json = match serde_json::to_vec(&envelope) {
-            Ok(json) => json,
-            Err(err) => {
-                warn!("multicast: failed to serialize envelope: {err}");
-                return;
-            }
-        };
-        if json.len() > MAX_DATAGRAM_SIZE {
-            warn!("multicast: dropping datagram of {} bytes (max {MAX_DATAGRAM_SIZE})", json.len());
-            return;
-        }
-        if let Err(err) = self.socket.send_to(&json, self.config.dest()).await {
-            warn!("multicast: failed to send datagram: {err}");
+    fn now_ns() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64
+    }
+
+    async fn send_frame(&self, frame: &[u8]) {
+        if let Err(err) = self.socket.send_to(frame, self.config.dest()).await {
+            warn!("multicast: failed to send frame: {err}");
         }
     }
 
-    /// Main loop: subscribes to the broadcast channel and publishes multicast datagrams.
+    async fn send_channel_reset(&self) {
+        let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
+        let buf = fb.message_buffer(CHANNEL_RESET_SIZE).expect("ChannelReset fits in empty frame");
+        encode_channel_reset(buf, Self::now_ns());
+        fb.commit_message();
+        self.send_frame(fb.finalize()).await;
+    }
+
+    async fn send_heartbeat(&self) {
+        let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
+        let buf = fb.message_buffer(HEARTBEAT_SIZE).expect("Heartbeat fits in empty frame");
+        encode_heartbeat(buf, 0, Self::now_ns());
+        fb.commit_message();
+        self.send_frame(fb.finalize()).await;
+    }
+
+    async fn send_end_of_session(&self) {
+        let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
+        let buf = fb.message_buffer(END_OF_SESSION_SIZE).expect("EndOfSession fits in empty frame");
+        encode_end_of_session(buf, Self::now_ns());
+        fb.commit_message();
+        self.send_frame(fb.finalize()).await;
+    }
+
+    /// Encodes L2 snapshots as Quote messages, batching into frames.
+    async fn publish_quotes(
+        &self,
+        snapshot_map: &HashMap<
+            crate::order_book::Coin,
+            HashMap<
+                crate::listeners::order_book::L2SnapshotParams,
+                crate::order_book::Snapshot<crate::types::inner::InnerLevel>,
+            >,
+        >,
+        time: u64,
+        is_snapshot: bool,
+    ) {
+        let flags = if is_snapshot { FLAG_SNAPSHOT } else { 0 };
+        let source_timestamp_ns = time * 1_000_000; // HL time is ms
+
+        let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
+        let default_params = crate::listeners::order_book::L2SnapshotParams::new(None, None);
+
+        for (coin, params_map) in snapshot_map {
+            let coin_name = coin.value();
+            let Some(inst) = self.registry.get(&coin_name) else {
+                continue;
+            };
+
+            let Some(snapshot) = params_map.get(&default_params) else {
+                continue;
+            };
+
+            let levels = snapshot.truncate(1).export_inner_snapshot();
+            let bids = &levels[0];
+            let asks = &levels[1];
+
+            let (bid_price, bid_qty, bid_n) = if let Some(level) = bids.first() {
+                let px = price_to_fixed(level.px(), inst.price_exponent).unwrap_or(0);
+                let qty = qty_to_fixed(level.sz(), inst.qty_exponent).unwrap_or(0);
+                (px, qty, level.n() as u16)
+            } else {
+                (0, 0, 0)
+            };
+
+            let (ask_price, ask_qty, ask_n) = if let Some(level) = asks.first() {
+                let px = price_to_fixed(level.px(), inst.price_exponent).unwrap_or(0);
+                let qty = qty_to_fixed(level.sz(), inst.qty_exponent).unwrap_or(0);
+                (px, qty, level.n() as u16)
+            } else {
+                (0, 0, 0)
+            };
+
+            let mut update_flags = 0u8;
+            if bids.is_empty() {
+                update_flags |= UPDATE_FLAG_BID_GONE;
+            } else {
+                update_flags |= UPDATE_FLAG_BID_UPDATED;
+            }
+            if asks.is_empty() {
+                update_flags |= UPDATE_FLAG_ASK_GONE;
+            } else {
+                update_flags |= UPDATE_FLAG_ASK_UPDATED;
+            }
+
+            let quote = QuoteData {
+                instrument_id: inst.instrument_id,
+                source_id: self.config.source_id,
+                update_flags,
+                source_timestamp_ns,
+                bid_price,
+                bid_qty,
+                ask_price,
+                ask_qty,
+                bid_source_count: bid_n,
+                ask_source_count: ask_n,
+            };
+
+            match fb.message_buffer(QUOTE_SIZE) {
+                Ok(buf) => {
+                    encode_quote(buf, &quote, flags);
+                    fb.commit_message();
+                }
+                Err(FrameError::ExceedsMtu { .. } | FrameError::MaxMessages) => {
+                    if !fb.is_empty() {
+                        self.send_frame(fb.finalize()).await;
+                    }
+                    fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
+                    let buf = fb.message_buffer(QUOTE_SIZE).expect("Quote fits in empty frame");
+                    encode_quote(buf, &quote, flags);
+                    fb.commit_message();
+                }
+            }
+        }
+
+        if !fb.is_empty() {
+            self.send_frame(fb.finalize()).await;
+        }
+    }
+
+    /// Encodes fills as Trade messages, batching into frames.
+    async fn publish_trades(&self, trades_by_coin: &HashMap<String, Vec<crate::types::Trade>>) {
+        let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
+
+        for trades in trades_by_coin.values() {
+            for trade in trades {
+                let Some(inst) = self.registry.get(&trade.coin) else {
+                    continue;
+                };
+
+                let aggressor_side = match trade.side {
+                    crate::order_book::types::Side::Ask => AGGRESSOR_SELL,
+                    crate::order_book::types::Side::Bid => AGGRESSOR_BUY,
+                };
+
+                let trade_data = TradeData {
+                    instrument_id: inst.instrument_id,
+                    source_id: self.config.source_id,
+                    aggressor_side,
+                    trade_flags: 0,
+                    source_timestamp_ns: trade.time * 1_000_000,
+                    trade_price: price_to_fixed(&trade.px, inst.price_exponent).unwrap_or(0),
+                    trade_qty: qty_to_fixed(&trade.sz, inst.qty_exponent).unwrap_or(0),
+                    trade_id: trade.tid,
+                    cumulative_volume: 0,
+                };
+
+                match fb.message_buffer(TRADE_SIZE) {
+                    Ok(buf) => {
+                        encode_trade(buf, &trade_data, 0);
+                        fb.commit_message();
+                    }
+                    Err(FrameError::ExceedsMtu { .. } | FrameError::MaxMessages) => {
+                        if !fb.is_empty() {
+                            self.send_frame(fb.finalize()).await;
+                        }
+                        fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
+                        let buf = fb.message_buffer(TRADE_SIZE).expect("Trade fits in empty frame");
+                        encode_trade(buf, &trade_data, 0);
+                        fb.commit_message();
+                    }
+                }
+            }
+        }
+
+        if !fb.is_empty() {
+            self.send_frame(fb.finalize()).await;
+        }
+    }
+
+    /// Main loop: subscribes to the broadcast channel and publishes binary frames.
     pub(crate) async fn run(
         &self,
         mut rx: tokio::sync::broadcast::Receiver<std::sync::Arc<crate::listeners::order_book::InternalMessage>>,
     ) {
-        use crate::listeners::order_book::{InternalMessage, L2SnapshotParams};
-        use crate::multicast::config::Channel;
+        use crate::listeners::order_book::InternalMessage;
 
         info!(
-            "multicast publisher started: group={} port={} session={}",
-            self.config.group_addr, self.config.port, self.session_id
+            "multicast publisher started: group={} port={} mtu={} source_id={}",
+            self.config.group_addr, self.config.port, self.config.mtu, self.config.source_id,
         );
 
-        let mut snapshot_interval = tokio::time::interval(self.config.snapshot_interval);
-        // The first tick completes immediately; consume it so we don't send a spurious snapshot.
-        snapshot_interval.tick().await;
+        // Send ChannelReset on startup
+        self.send_channel_reset().await;
 
-        // Cache the most recent L2 book per coin for periodic snapshot re-sends.
-        let mut cached_snapshots: HashMap<String, L2Book> = HashMap::new();
+        let mut snapshot_interval = tokio::time::interval(self.config.snapshot_interval);
+        snapshot_interval.tick().await; // consume immediate first tick
+
+        let mut heartbeat_interval = tokio::time::interval(self.config.heartbeat_interval);
+        heartbeat_interval.tick().await;
+
+        // Cache the most recent snapshot message for periodic resends
+        let mut cached_snapshot: Option<std::sync::Arc<InternalMessage>> = None;
+        let mut had_activity = false;
 
         loop {
             tokio::select! {
@@ -122,52 +246,46 @@ impl MulticastPublisher {
                     match result {
                         Ok(msg) => match msg.as_ref() {
                             InternalMessage::Snapshot { l2_snapshots, time } => {
-                                if !self.config.channels.contains(&Channel::L2) {
-                                    continue;
-                                }
                                 let snapshot_map = l2_snapshots.as_ref();
-                                for (coin, params_map) in snapshot_map {
-                                    let default_params = L2SnapshotParams::new(None, None);
-                                    if let Some(snapshot) = params_map.get(&default_params) {
-                                        let truncated = snapshot.truncate(self.config.l2_levels);
-                                        let levels = truncated.export_inner_snapshot();
-                                        let book = L2Book::from_l2_snapshot(coin.value(), levels, *time);
-                                        cached_snapshots.insert(coin.value(), book.clone());
-                                        self.send_envelope("l2Book", book).await;
-                                    }
-                                }
+                                cached_snapshot = Some(msg.clone());
+                                self.publish_quotes(snapshot_map, *time, false).await;
+                                had_activity = true;
+                                heartbeat_interval.reset();
                             }
                             InternalMessage::Fills { batch } => {
-                                if !self.config.channels.contains(&Channel::Trades) {
-                                    continue;
-                                }
                                 let trades_by_coin = crate::servers::websocket_server::coin_to_trades(batch);
-                                for trades in trades_by_coin.values() {
-                                    let mcast_trades: Vec<MulticastTrade> =
-                                        trades.iter().map(MulticastTrade::from_trade).collect();
-                                    self.send_envelope("trades", &mcast_trades).await;
-                                }
+                                self.publish_trades(&trades_by_coin).await;
+                                had_activity = true;
+                                heartbeat_interval.reset();
                             }
                             InternalMessage::L4BookUpdates { .. } => {
-                                // Ignored for multicast.
+                                // Ignored for multicast
                             }
                         },
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             warn!("multicast: broadcast receiver lagged by {n} messages");
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            warn!("multicast: broadcast channel closed, exiting");
+                            warn!("multicast: broadcast channel closed, sending EndOfSession");
+                            self.send_end_of_session().await;
                             return;
                         }
                     }
                 }
                 _ = snapshot_interval.tick() => {
-                    if !self.config.channels.contains(&Channel::L2) {
-                        continue;
+                    if let Some(ref cached) = cached_snapshot {
+                        if let InternalMessage::Snapshot { l2_snapshots, time } = cached.as_ref() {
+                            self.publish_quotes(l2_snapshots.as_ref(), *time, true).await;
+                            had_activity = true;
+                            heartbeat_interval.reset();
+                        }
                     }
-                    for book in cached_snapshots.values() {
-                        self.send_envelope("l2Snapshot", book.clone()).await;
+                }
+                _ = heartbeat_interval.tick() => {
+                    if !had_activity {
+                        self.send_heartbeat().await;
                     }
+                    had_activity = false;
                 }
             }
         }
@@ -175,126 +293,102 @@ impl MulticastPublisher {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
-
-    use std::collections::HashSet;
     use std::net::Ipv4Addr;
     use std::time::Duration;
-
-    use crate::multicast::config::{Channel, MulticastConfig};
-    use crate::order_book::types::Side;
 
     fn test_config() -> MulticastConfig {
         MulticastConfig {
             group_addr: Ipv4Addr::LOCALHOST,
-            port: 0, // will be overridden by actual bound port
+            port: 0,
             bind_addr: Ipv4Addr::LOCALHOST,
-            channels: HashSet::from([Channel::L2, Channel::Trades]),
-            l2_levels: 5,
             snapshot_interval: Duration::from_secs(60),
+            mtu: DEFAULT_MTU,
+            source_id: 1,
+            heartbeat_interval: Duration::from_secs(60),
+            hl_api_url: String::new(),
         }
     }
 
-    #[test]
-    fn test_multicast_trade_omits_users() {
-        let trade = MulticastTrade {
-            coin: "BTC".to_string(),
-            side: Side::Ask,
-            px: "50000.0".to_string(),
-            sz: "1.5".to_string(),
-            time: 1_700_000_000,
-            hash: "0xabc".to_string(),
-            tid: 42,
-        };
-        let json = serde_json::to_string(&trade).unwrap();
-        assert!(!json.contains("users"), "MulticastTrade JSON should not contain 'users' field");
-        // Verify expected fields are present.
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["coin"], "BTC");
-        assert_eq!(v["side"], "A");
-        assert_eq!(v["px"], "50000.0");
-        assert_eq!(v["sz"], "1.5");
-        assert_eq!(v["time"], 1_700_000_000_u64);
-        assert_eq!(v["hash"], "0xabc");
-        assert_eq!(v["tid"], 42);
-    }
-
-    #[test]
-    fn test_envelope_serialization() {
-        let envelope = MulticastEnvelope {
-            session: "test-session-123".to_string(),
-            seq: 7,
-            channel: "l2Book".to_string(),
-            data: serde_json::json!({"coin": "ETH"}),
-        };
-        let json = serde_json::to_string(&envelope).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["session"], "test-session-123");
-        assert_eq!(v["seq"], 7);
-        assert_eq!(v["channel"], "l2Book");
-        assert_eq!(v["data"]["coin"], "ETH");
-    }
-
-    #[test]
-    fn test_envelope_l2_snapshot_channel() {
-        let envelope = MulticastEnvelope {
-            session: "snap-session".to_string(),
-            seq: 0,
-            channel: "l2Snapshot".to_string(),
-            data: vec!["level1", "level2"],
-        };
-        let json = serde_json::to_string(&envelope).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["channel"], "l2Snapshot");
-        assert_eq!(v["session"], "snap-session");
-        assert_eq!(v["seq"], 0);
-        assert!(v["data"].is_array());
+    fn test_registry() -> InstrumentRegistry {
+        let mut map = HashMap::new();
+        map.insert(
+            "BTC".to_string(),
+            crate::instruments::InstrumentInfo {
+                instrument_id: 0,
+                price_exponent: -8,
+                qty_exponent: -8,
+                symbol: crate::instruments::make_symbol("BTC"),
+            },
+        );
+        InstrumentRegistry::new(map)
     }
 
     #[tokio::test]
-    async fn test_publisher_sends_l2_envelope() {
-        // Bind two loopback UDP sockets: one for sending, one for receiving.
-        let send_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    async fn sends_channel_reset_on_startup() {
+        let send_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let recv_addr = recv_socket.local_addr().unwrap();
 
         let mut config = test_config();
-        config.group_addr = Ipv4Addr::LOCALHOST;
         config.port = recv_addr.port();
 
-        let publisher = MulticastPublisher::with_session_id(send_socket, config, "test-session".to_string());
-
-        publisher.send_envelope("l2Book", serde_json::json!({"coin": "BTC", "levels": []})).await;
+        let publisher = MulticastPublisher::new(send_socket, config, test_registry());
+        publisher.send_channel_reset().await;
 
         let mut buf = [0u8; 2048];
         let n = tokio::time::timeout(Duration::from_secs(2), recv_socket.recv(&mut buf))
             .await
-            .expect("timed out waiting for UDP datagram")
+            .expect("timed out")
             .expect("recv failed");
 
-        let v: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
-        assert_eq!(v["session"], "test-session");
-        assert_eq!(v["seq"], 0);
-        assert_eq!(v["channel"], "l2Book");
-        assert_eq!(v["data"]["coin"], "BTC");
+        let frame = &buf[..n];
+        assert_eq!(&frame[0..2], &MAGIC_BYTES);
+        assert_eq!(frame[2], SCHEMA_VERSION);
+        assert_eq!(frame[20], 1); // msg_count
+        assert_eq!(frame[FRAME_HEADER_SIZE], MSG_TYPE_CHANNEL_RESET);
+        assert_eq!(frame[FRAME_HEADER_SIZE + 1], CHANNEL_RESET_SIZE as u8);
     }
 
     #[tokio::test]
-    async fn test_publisher_sequence_increments() {
-        let send_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    async fn heartbeat_sends_valid_frame() {
+        let send_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let recv_addr = recv_socket.local_addr().unwrap();
 
         let mut config = test_config();
         config.port = recv_addr.port();
 
-        let publisher = MulticastPublisher::with_session_id(send_socket, config, "seq-test".to_string());
+        let publisher = MulticastPublisher::new(send_socket, config, test_registry());
+        publisher.send_heartbeat().await;
 
-        // Send 3 envelopes.
-        for _ in 0..3 {
-            publisher.send_envelope("trades", serde_json::json!({"i": 1})).await;
-        }
+        let mut buf = [0u8; 2048];
+        let n = tokio::time::timeout(Duration::from_secs(2), recv_socket.recv(&mut buf))
+            .await
+            .expect("timed out")
+            .expect("recv failed");
+
+        let frame = &buf[..n];
+        assert_eq!(&frame[0..2], &MAGIC_BYTES);
+        assert_eq!(frame[FRAME_HEADER_SIZE], MSG_TYPE_HEARTBEAT);
+        assert_eq!(frame[FRAME_HEADER_SIZE + 1], HEARTBEAT_SIZE as u8);
+    }
+
+    #[tokio::test]
+    async fn sequence_numbers_increment() {
+        let send_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = recv_socket.local_addr().unwrap();
+
+        let mut config = test_config();
+        config.port = recv_addr.port();
+
+        let publisher = MulticastPublisher::new(send_socket, config, test_registry());
+
+        publisher.send_heartbeat().await;
+        publisher.send_heartbeat().await;
+        publisher.send_heartbeat().await;
 
         let mut buf = [0u8; 2048];
         let mut seqs = Vec::new();
@@ -303,35 +397,9 @@ mod test {
                 .await
                 .expect("timed out")
                 .expect("recv failed");
-            let v: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
-            seqs.push(v["seq"].as_u64().unwrap());
+            let seq = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+            seqs.push(seq);
         }
         assert_eq!(seqs, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn test_multicast_trade_from_trade() {
-        let trade = crate::types::Trade {
-            coin: "SOL".to_string(),
-            side: Side::Bid,
-            px: "123.45".to_string(),
-            sz: "10.0".to_string(),
-            time: 1_700_000_001,
-            hash: "0xdef".to_string(),
-            tid: 99,
-            users: [alloy::primitives::Address::ZERO, alloy::primitives::Address::ZERO],
-        };
-        let mc_trade = MulticastTrade::from_trade(&trade);
-        assert_eq!(mc_trade.coin, "SOL");
-        assert_eq!(mc_trade.side, Side::Bid);
-        assert_eq!(mc_trade.px, "123.45");
-        assert_eq!(mc_trade.sz, "10.0");
-        assert_eq!(mc_trade.time, 1_700_000_001);
-        assert_eq!(mc_trade.hash, "0xdef");
-        assert_eq!(mc_trade.tid, 99);
-
-        // Verify no users field in serialized JSON.
-        let json = serde_json::to_string(&mc_trade).unwrap();
-        assert!(!json.contains("users"));
     }
 }

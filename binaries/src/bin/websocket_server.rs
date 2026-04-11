@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use clap::Parser;
-use server::{MulticastConfig, Result, parse_channels, run_websocket_server};
+use server::{MulticastConfig, Result, run_websocket_server};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -16,14 +16,7 @@ struct Args {
     #[arg(long)]
     port: u16,
 
-    /// Compression level for WebSocket connections.
-    /// Accepts values in the range `0..=9`.
-    /// * `0` – compression disabled.
-    /// * `1` – fastest compression, low compression ratio (default).
-    /// * `9` – slowest compression, highest compression ratio.
-    ///
-    /// The level is passed to `flate2::Compression::new(level)`; see the
-    /// documentation for <https://docs.rs/flate2/1.1.2/flate2/struct.Compression.html#method.new> for more info.
+    /// Compression level for WebSocket connections (0-9, default 1).
     #[arg(long)]
     websocket_compression_level: Option<u32>,
 
@@ -35,22 +28,29 @@ struct Args {
     #[arg(long, default_value_t = 5000)]
     multicast_port: u16,
 
-    /// Local address to bind the multicast UDP socket. Required when
-    /// `--multicast-group` is set.
+    /// Local address to bind the multicast UDP socket.
     #[arg(long)]
     multicast_bind_addr: Option<Ipv4Addr>,
 
-    /// Comma-separated list of channels to publish via multicast (e.g., "l2,trades").
-    #[arg(long, default_value = "l2,trades")]
-    multicast_channels: String,
-
-    /// Number of price levels to include in multicast L2 snapshots.
-    #[arg(long, default_value_t = 5)]
-    multicast_l2_levels: usize,
-
-    /// Interval in seconds between full multicast book snapshots.
+    /// Interval in seconds between full BBO snapshot resends.
     #[arg(long, default_value_t = 5)]
     multicast_snapshot_interval: u64,
+
+    /// Max frame size in bytes (default 1448 for GRE tunnels).
+    #[arg(long, default_value_t = 1448)]
+    multicast_mtu: u16,
+
+    /// Hyperliquid REST API URL for instrument metadata.
+    #[arg(long, default_value = "https://api.hyperliquid.xyz")]
+    hl_api_url: String,
+
+    /// Source ID for Quote/Trade messages.
+    #[arg(long, default_value_t = 1)]
+    source_id: u16,
+
+    /// Seconds of silence before sending a Heartbeat.
+    #[arg(long, default_value_t = 5)]
+    heartbeat_interval: u64,
 }
 
 #[tokio::main]
@@ -62,27 +62,22 @@ async fn main() -> Result<()> {
     let full_address = format!("{}:{}", args.address, args.port);
     println!("Running websocket server on {full_address}");
 
-    let compression_level = args.websocket_compression_level.unwrap_or(/* Some compression */ 1);
+    let compression_level = args.websocket_compression_level.unwrap_or(1);
 
     let multicast_config = if let Some(group_addr) = args.multicast_group {
         let Some(bind_addr) = args.multicast_bind_addr else {
             eprintln!("error: --multicast-bind-addr is required when --multicast-group is set");
             std::process::exit(1);
         };
-        let channels = match parse_channels(&args.multicast_channels) {
-            Ok(c) => c,
-            Err(err) => {
-                eprintln!("error: invalid --multicast-channels: {err}");
-                std::process::exit(1);
-            }
-        };
         Some(MulticastConfig {
             group_addr,
             port: args.multicast_port,
             bind_addr,
-            channels,
-            l2_levels: args.multicast_l2_levels,
             snapshot_interval: Duration::from_secs(args.multicast_snapshot_interval),
+            mtu: args.multicast_mtu,
+            source_id: args.source_id,
+            heartbeat_interval: Duration::from_secs(args.heartbeat_interval),
+            hl_api_url: args.hl_api_url,
         })
     } else {
         None

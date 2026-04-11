@@ -63,6 +63,18 @@ pub async fn run_websocket_server(
     if let Some(mcast_config) = multicast_config {
         let mcast_rx = internal_message_tx.subscribe();
         tokio::spawn(async move {
+            // Bootstrap instrument registry from HL API
+            let instruments = match crate::instruments::hyperliquid::bootstrap_registry(&mcast_config.hl_api_url).await
+            {
+                Ok(instruments) => instruments,
+                Err(err) => {
+                    log::error!("failed to bootstrap instrument registry: {err}");
+                    std::process::exit(3);
+                }
+            };
+            let registry = crate::instruments::InstrumentRegistry::new(instruments);
+            info!("instrument registry loaded: {} instruments", registry.len());
+
             let bind_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(mcast_config.bind_addr), 0);
             match tokio::net::UdpSocket::bind(bind_addr).await {
                 Ok(socket) => {
@@ -70,7 +82,7 @@ pub async fn run_websocket_server(
                         log::error!("failed to set multicast TTL: {err}");
                         std::process::exit(3);
                     }
-                    let publisher = MulticastPublisher::new(socket, mcast_config);
+                    let publisher = MulticastPublisher::new(socket, mcast_config, registry);
                     publisher.run(mcast_rx).await;
                 }
                 Err(err) => {
