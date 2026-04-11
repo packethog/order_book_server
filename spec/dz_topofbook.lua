@@ -1,7 +1,8 @@
 -- DoubleZero Top-of-Book Feed dissector (v0.1.0)
 --
--- Based on spec/dz_topofbook.ksy and the Top-of-Book Feed + Reference Data
--- Distribution v0.1.0 specs.
+-- Based on the Top-of-Book Feed + Reference Data Distribution v0.1.0 specs:
+--   https://github.com/malbeclabs/edge-feed-spec/blob/main/top-of-book/v0.1.0.md
+--   https://github.com/malbeclabs/edge-feed-spec/blob/main/reference-data/v0.1.0.md
 --
 -- Install:
 --   Linux/Mac: copy to ~/.local/lib/wireshark/plugins/ (Wireshark 4.x)
