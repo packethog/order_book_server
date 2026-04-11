@@ -3,6 +3,7 @@ mod listeners;
 pub mod multicast;
 mod order_book;
 mod prelude;
+pub mod protocol;
 mod servers;
 mod types;
 
