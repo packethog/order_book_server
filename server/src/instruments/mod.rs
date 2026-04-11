@@ -1,9 +1,12 @@
 pub mod hyperliquid;
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use tokio::sync::RwLock;
 
 /// Metadata for a single instrument, used to encode binary messages.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstrumentInfo {
     pub instrument_id: u32,
     pub price_exponent: i8,
@@ -12,40 +15,90 @@ pub struct InstrumentInfo {
     pub symbol: [u8; 16],
 }
 
-/// Maps coin names (e.g., `"BTC"`) to their `InstrumentInfo`.
+/// A single entry in the HL universe, including delisted instruments.
+///
+/// Kept in `RegistryState::universe` for integrity checks across refreshes.
+/// The publisher does not look at these directly — it uses `active`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniverseEntry {
+    pub instrument_id: u32,
+    pub coin: String,
+    pub is_delisted: bool,
+    pub info: InstrumentInfo,
+}
+
+/// The full shared state of the instrument registry.
+///
+/// `active` is the lookup map used by the publisher (delisted instruments excluded).
+/// `universe` is the full list (including delisted) used for cross-refresh integrity checks.
+/// `manifest_seq` is the current version of the active set, bumped on any change.
+#[derive(Debug, Clone)]
+pub struct RegistryState {
+    pub active: HashMap<String, InstrumentInfo>,
+    pub universe: Vec<UniverseEntry>,
+    pub manifest_seq: u16,
+}
+
+impl RegistryState {
+    #[must_use]
+    pub fn new(universe: Vec<UniverseEntry>) -> Self {
+        let active = universe.iter().filter(|e| !e.is_delisted).map(|e| (e.coin.clone(), e.info.clone())).collect();
+        Self { active, universe, manifest_seq: 1 }
+    }
+
+    #[must_use]
+    pub fn empty() -> Self {
+        Self { active: HashMap::new(), universe: Vec::new(), manifest_seq: 1 }
+    }
+}
+
+/// Handle to the shared instrument registry.
+///
+/// Reads are lock-free from the caller's perspective (a short read lock internally).
+/// Writes (refresh) are coordinated via the publisher's refresh task.
 #[derive(Debug, Clone)]
 pub struct InstrumentRegistry {
-    instruments: HashMap<String, InstrumentInfo>,
+    state: Arc<RwLock<RegistryState>>,
 }
 
 impl InstrumentRegistry {
     #[must_use]
-    pub fn new(instruments: HashMap<String, InstrumentInfo>) -> Self {
-        Self { instruments }
+    pub fn new(state: RegistryState) -> Self {
+        Self { state: Arc::new(RwLock::new(state)) }
     }
 
     #[must_use]
-    pub fn get(&self, coin: &str) -> Option<&InstrumentInfo> {
-        self.instruments.get(coin)
+    pub fn from_arc(state: Arc<RwLock<RegistryState>>) -> Self {
+        Self { state }
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.instruments.len()
+    pub fn shared(&self) -> Arc<RwLock<RegistryState>> {
+        Arc::clone(&self.state)
     }
 
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.instruments.is_empty()
+    /// Look up an instrument by coin name. Returns an owned copy so the
+    /// caller doesn't need to hold the read lock.
+    pub async fn get(&self, coin: &str) -> Option<InstrumentInfo> {
+        self.state.read().await.active.get(coin).cloned()
+    }
+
+    pub async fn len(&self) -> usize {
+        self.state.read().await.active.len()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.state.read().await.active.is_empty()
+    }
+
+    pub async fn manifest_seq(&self) -> u16 {
+        self.state.read().await.manifest_seq
     }
 }
 
 /// Converts a decimal string price to a fixed-point `i64` using the given exponent.
 ///
 /// Example: `"106217.0"` with exponent `-1` -> `1_062_170_i64`
-///
-/// The exponent is negative: it represents how many decimal places the wire value has.
-/// We multiply the float by `10^(-exponent)` to get the integer.
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 pub fn price_to_fixed(price_str: &str, exponent: i8) -> Option<i64> {
@@ -55,8 +108,6 @@ pub fn price_to_fixed(price_str: &str, exponent: i8) -> Option<i64> {
 }
 
 /// Converts a decimal string quantity to a fixed-point `u64` using the given exponent.
-///
-/// Example: `"0.00017"` with exponent `-5` -> `17_u64`
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn qty_to_fixed(qty_str: &str, exponent: i8) -> Option<u64> {
@@ -83,6 +134,15 @@ pub fn make_symbol(name: &str) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_entry(id: u32, coin: &str, delisted: bool) -> UniverseEntry {
+        UniverseEntry {
+            instrument_id: id,
+            coin: coin.to_string(),
+            is_delisted: delisted,
+            info: InstrumentInfo { instrument_id: id, price_exponent: -1, qty_exponent: -5, symbol: make_symbol(coin) },
+        }
+    }
 
     #[test]
     fn price_to_fixed_basic() {
@@ -139,16 +199,25 @@ mod tests {
     }
 
     #[test]
-    fn registry_lookup() {
-        let mut map = HashMap::new();
-        map.insert(
-            "BTC".to_string(),
-            InstrumentInfo { instrument_id: 0, price_exponent: -1, qty_exponent: -5, symbol: make_symbol("BTC") },
-        );
-        let reg = InstrumentRegistry::new(map);
-        assert!(reg.get("BTC").is_some());
-        assert_eq!(reg.get("BTC").unwrap().instrument_id, 0);
-        assert!(reg.get("ETH").is_none());
-        assert_eq!(reg.len(), 1);
+    fn registry_state_excludes_delisted_from_active() {
+        let universe = vec![test_entry(0, "BTC", false), test_entry(1, "DEADCOIN", true), test_entry(2, "ETH", false)];
+        let state = RegistryState::new(universe);
+        assert_eq!(state.active.len(), 2);
+        assert_eq!(state.universe.len(), 3);
+        assert!(state.active.contains_key("BTC"));
+        assert!(!state.active.contains_key("DEADCOIN"));
+        assert!(state.active.contains_key("ETH"));
+        assert_eq!(state.manifest_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn registry_handle_lookup() {
+        let universe = vec![test_entry(0, "BTC", false), test_entry(1, "ETH", false)];
+        let reg = InstrumentRegistry::new(RegistryState::new(universe));
+        assert!(reg.get("BTC").await.is_some());
+        assert_eq!(reg.get("BTC").await.unwrap().instrument_id, 0);
+        assert!(reg.get("MISSING").await.is_none());
+        assert_eq!(reg.len().await, 2);
+        assert_eq!(reg.manifest_seq().await, 1);
     }
 }

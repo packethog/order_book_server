@@ -135,6 +135,27 @@ async fn recv_loop(std_socket: std::net::UdpSocket) -> Result<(), Box<dyn std::e
                     let ts = u64::from_le_bytes(body[4..12].try_into().unwrap());
                     println!("  EndOfSession: ts={ts}");
                 }
+                MSG_TYPE_INSTRUMENT_DEF => {
+                    let inst_id = u32::from_le_bytes(body[4..8].try_into().unwrap());
+                    let symbol = std::str::from_utf8(&body[8..24]).unwrap_or("<bad-utf8>").trim_end_matches('\0');
+                    let asset_class = body[40];
+                    let px_exp = body[41] as i8;
+                    let qty_exp = body[42] as i8;
+                    let market_model = body[43];
+                    let manifest_seq = u16::from_le_bytes(body[78..80].try_into().unwrap());
+                    println!(
+                        "  InstrumentDefinition: inst={inst_id} sym={symbol} asset_class={asset_class} market={market_model} px_exp={px_exp} qty_exp={qty_exp} manifest_seq={manifest_seq}"
+                    );
+                }
+                MSG_TYPE_MANIFEST_SUMMARY => {
+                    let channel = body[4];
+                    let manifest_seq = u16::from_le_bytes(body[8..10].try_into().unwrap());
+                    let inst_count = u32::from_le_bytes(body[12..16].try_into().unwrap());
+                    let ts = u64::from_le_bytes(body[16..24].try_into().unwrap());
+                    println!(
+                        "  ManifestSummary: channel={channel} manifest_seq={manifest_seq} instrument_count={inst_count} ts={ts}"
+                    );
+                }
                 _ => {
                     println!("  msg[{i}]: unknown type=0x{msg_type:02X} len={msg_len}");
                 }

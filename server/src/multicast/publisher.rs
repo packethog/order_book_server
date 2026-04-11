@@ -1,31 +1,67 @@
 #![allow(clippy::expect_used)]
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::{info, warn};
 use tokio::net::UdpSocket;
+use tokio::sync::RwLock;
 
-use crate::instruments::{InstrumentRegistry, price_to_fixed, qty_to_fixed};
+use crate::instruments::{InstrumentInfo, RegistryState, price_to_fixed, qty_to_fixed};
 use crate::multicast::config::MulticastConfig;
 use crate::protocol::constants::{
-    AGGRESSOR_BUY, AGGRESSOR_SELL, CHANNEL_RESET_SIZE, END_OF_SESSION_SIZE, FLAG_SNAPSHOT, HEARTBEAT_SIZE, QUOTE_SIZE,
-    TRADE_SIZE, UPDATE_FLAG_ASK_GONE, UPDATE_FLAG_ASK_UPDATED, UPDATE_FLAG_BID_GONE, UPDATE_FLAG_BID_UPDATED,
+    AGGRESSOR_BUY, AGGRESSOR_SELL, ASSET_CLASS_CRYPTO_SPOT, CHANNEL_RESET_SIZE, END_OF_SESSION_SIZE, FLAG_SNAPSHOT,
+    HEARTBEAT_SIZE, INSTRUMENT_DEF_SIZE, MANIFEST_SUMMARY_SIZE, MARKET_MODEL_CLOB, PRICE_BOUND_UNBOUNDED, QUOTE_SIZE,
+    SETTLE_TYPE_NA, TRADE_SIZE, UPDATE_FLAG_ASK_GONE, UPDATE_FLAG_ASK_UPDATED, UPDATE_FLAG_BID_GONE,
+    UPDATE_FLAG_BID_UPDATED,
 };
 use crate::protocol::frame::{FrameBuilder, FrameError};
 use crate::protocol::messages::{
-    QuoteData, TradeData, encode_channel_reset, encode_end_of_session, encode_heartbeat, encode_quote, encode_trade,
+    InstrumentDefinitionData, QuoteData, TradeData, encode_channel_reset, encode_end_of_session, encode_heartbeat,
+    encode_instrument_definition, encode_manifest_summary, encode_quote, encode_trade,
 };
+
+/// Per-cycle snapshot of instruments for definition retransmission.
+///
+/// The publisher uses this to iterate through the active set one frame at a time,
+/// resetting whenever `manifest_seq` changes.
+struct DefinitionCycler {
+    snapshot: Vec<(String, InstrumentInfo)>,
+    pos: usize,
+    seq_tag: u16,
+}
+
+impl DefinitionCycler {
+    const fn empty() -> Self {
+        Self { snapshot: Vec::new(), pos: 0, seq_tag: 0 }
+    }
+
+    fn reset(&mut self, new_snapshot: Vec<(String, InstrumentInfo)>, seq_tag: u16) {
+        self.snapshot = new_snapshot;
+        self.pos = 0;
+        self.seq_tag = seq_tag;
+    }
+
+    fn is_cycle_complete(&self) -> bool {
+        self.pos >= self.snapshot.len()
+    }
+
+    fn advance_to_start(&mut self) {
+        self.pos = 0;
+    }
+}
 
 pub(crate) struct MulticastPublisher {
     socket: UdpSocket,
     config: MulticastConfig,
-    registry: InstrumentRegistry,
+    registry: Arc<RwLock<RegistryState>>,
     seq: AtomicU64,
 }
 
 impl MulticastPublisher {
-    pub(crate) fn new(socket: UdpSocket, config: MulticastConfig, registry: InstrumentRegistry) -> Self {
+    pub(crate) fn new(socket: UdpSocket, config: MulticastConfig, registry: Arc<RwLock<RegistryState>>) -> Self {
         Self { socket, config, registry, seq: AtomicU64::new(0) }
     }
 
@@ -38,18 +74,18 @@ impl MulticastPublisher {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
     }
 
-    async fn send_frame(&self, frame: &[u8]) {
-        if let Err(err) = self.socket.send_to(frame, self.config.dest()).await {
-            warn!("multicast: failed to send frame: {err}");
+    async fn send_frame(&self, frame: &[u8], dest: SocketAddr) {
+        if let Err(err) = self.socket.send_to(frame, dest).await {
+            warn!("multicast: failed to send frame to {dest}: {err}");
         }
     }
 
-    async fn send_channel_reset(&self) {
+    async fn send_channel_reset(&self, dest: SocketAddr) {
         let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
         let buf = fb.message_buffer(CHANNEL_RESET_SIZE).expect("ChannelReset fits in empty frame");
         encode_channel_reset(buf, Self::now_ns());
         fb.commit_message();
-        self.send_frame(fb.finalize()).await;
+        self.send_frame(fb.finalize(), dest).await;
     }
 
     async fn send_heartbeat(&self) {
@@ -57,7 +93,7 @@ impl MulticastPublisher {
         let buf = fb.message_buffer(HEARTBEAT_SIZE).expect("Heartbeat fits in empty frame");
         encode_heartbeat(buf, 0, Self::now_ns());
         fb.commit_message();
-        self.send_frame(fb.finalize()).await;
+        self.send_frame(fb.finalize(), self.config.dest()).await;
     }
 
     async fn send_end_of_session(&self) {
@@ -65,7 +101,93 @@ impl MulticastPublisher {
         let buf = fb.message_buffer(END_OF_SESSION_SIZE).expect("EndOfSession fits in empty frame");
         encode_end_of_session(buf, Self::now_ns());
         fb.commit_message();
-        self.send_frame(fb.finalize()).await;
+        self.send_frame(fb.finalize(), self.config.dest()).await;
+    }
+
+    /// Sends a ManifestSummary on the reference-data port.
+    async fn send_manifest_summary(&self) {
+        let (seq_tag, count) = {
+            let guard = self.registry.read().await;
+            (guard.manifest_seq, u32::try_from(guard.active.len()).unwrap_or(u32::MAX))
+        };
+
+        let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
+        let buf = fb.message_buffer(MANIFEST_SUMMARY_SIZE).expect("ManifestSummary fits in empty frame");
+        encode_manifest_summary(buf, 0, seq_tag, count, Self::now_ns());
+        fb.commit_message();
+        self.send_frame(fb.finalize(), self.config.ref_data_dest()).await;
+    }
+
+    /// Computes how many InstrumentDefinition messages we should emit per cycle tick.
+    ///
+    /// Spreads the full active set evenly across `definition_cycle`. Returns the
+    /// per-tick count such that (count * ticks_per_cycle) covers all instruments.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
+    fn defs_per_tick(&self, total: usize, tick_interval: std::time::Duration) -> usize {
+        if total == 0 {
+            return 0;
+        }
+        let cycle_secs = self.config.definition_cycle.as_secs_f64().max(0.001);
+        let tick_secs = tick_interval.as_secs_f64().max(0.001);
+        let ticks_per_cycle = (cycle_secs / tick_secs).max(1.0);
+        let per_tick = (total as f64 / ticks_per_cycle).ceil() as usize;
+        per_tick.max(1)
+    }
+
+    /// Emits InstrumentDefinitions for up to `count` entries starting at `cycler.pos`,
+    /// packing them into MTU-sized frames on the reference-data port.
+    async fn publish_definitions_batch(&self, cycler: &mut DefinitionCycler, count: usize) {
+        if cycler.snapshot.is_empty() || count == 0 {
+            return;
+        }
+
+        let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
+        let mut emitted = 0usize;
+
+        while emitted < count && cycler.pos < cycler.snapshot.len() {
+            let (coin, info) = &cycler.snapshot[cycler.pos];
+            let data = build_instrument_definition(coin, info, cycler.seq_tag);
+
+            match fb.message_buffer(INSTRUMENT_DEF_SIZE) {
+                Ok(buf) => {
+                    encode_instrument_definition(buf, &data, 0);
+                    fb.commit_message();
+                    cycler.pos += 1;
+                    emitted += 1;
+                }
+                Err(FrameError::ExceedsMtu { .. } | FrameError::MaxMessages) => {
+                    if !fb.is_empty() {
+                        self.send_frame(fb.finalize(), self.config.ref_data_dest()).await;
+                    }
+                    fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
+                    // Retry: a fresh frame is guaranteed to fit one message.
+                    let buf = fb.message_buffer(INSTRUMENT_DEF_SIZE).expect("InstrumentDefinition fits in empty frame");
+                    encode_instrument_definition(buf, &data, 0);
+                    fb.commit_message();
+                    cycler.pos += 1;
+                    emitted += 1;
+                }
+            }
+        }
+
+        if !fb.is_empty() {
+            self.send_frame(fb.finalize(), self.config.ref_data_dest()).await;
+        }
+    }
+
+    /// Reads the current registry snapshot and updates the cycler if manifest_seq changed.
+    /// Returns `true` if the cycler was reset.
+    async fn sync_cycler(&self, cycler: &mut DefinitionCycler) -> bool {
+        let guard = self.registry.read().await;
+        if guard.manifest_seq != cycler.seq_tag {
+            let snapshot: Vec<(String, InstrumentInfo)> =
+                guard.active.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let new_seq = guard.manifest_seq;
+            drop(guard);
+            cycler.reset(snapshot, new_seq);
+            return true;
+        }
+        false
     }
 
     /// Encodes L2 snapshots as Quote messages, batching into frames.
@@ -87,9 +209,22 @@ impl MulticastPublisher {
         let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
         let default_params = crate::listeners::order_book::L2SnapshotParams::new(None, None);
 
+        // Take a single read lock for the whole batch — lookups don't cross await points
+        // beyond this critical section, so we can gather all needed InstrumentInfo eagerly.
+        let lookups: HashMap<String, InstrumentInfo> = {
+            let guard = self.registry.read().await;
+            snapshot_map
+                .keys()
+                .filter_map(|coin| {
+                    let name = coin.value();
+                    guard.active.get(&name).map(|info| (name, info.clone()))
+                })
+                .collect()
+        };
+
         for (coin, params_map) in snapshot_map {
             let coin_name = coin.value();
-            let Some(inst) = self.registry.get(&coin_name) else {
+            let Some(inst) = lookups.get(&coin_name) else {
                 continue;
             };
 
@@ -149,7 +284,7 @@ impl MulticastPublisher {
                 }
                 Err(FrameError::ExceedsMtu { .. } | FrameError::MaxMessages) => {
                     if !fb.is_empty() {
-                        self.send_frame(fb.finalize()).await;
+                        self.send_frame(fb.finalize(), self.config.dest()).await;
                     }
                     fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
                     let buf = fb.message_buffer(QUOTE_SIZE).expect("Quote fits in empty frame");
@@ -160,7 +295,7 @@ impl MulticastPublisher {
         }
 
         if !fb.is_empty() {
-            self.send_frame(fb.finalize()).await;
+            self.send_frame(fb.finalize(), self.config.dest()).await;
         }
     }
 
@@ -168,12 +303,20 @@ impl MulticastPublisher {
     async fn publish_trades(&self, trades_by_coin: &HashMap<String, Vec<crate::types::Trade>>) {
         let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
 
-        for trades in trades_by_coin.values() {
-            for trade in trades {
-                let Some(inst) = self.registry.get(&trade.coin) else {
-                    continue;
-                };
+        let lookups: HashMap<String, InstrumentInfo> = {
+            let guard = self.registry.read().await;
+            trades_by_coin
+                .keys()
+                .filter_map(|coin| guard.active.get(coin).map(|info| (coin.clone(), info.clone())))
+                .collect()
+        };
 
+        for (coin_name, trades) in trades_by_coin {
+            let Some(inst) = lookups.get(coin_name) else {
+                continue;
+            };
+
+            for trade in trades {
                 let aggressor_side = match trade.side {
                     crate::order_book::types::Side::Ask => AGGRESSOR_SELL,
                     crate::order_book::types::Side::Bid => AGGRESSOR_BUY,
@@ -198,7 +341,7 @@ impl MulticastPublisher {
                     }
                     Err(FrameError::ExceedsMtu { .. } | FrameError::MaxMessages) => {
                         if !fb.is_empty() {
-                            self.send_frame(fb.finalize()).await;
+                            self.send_frame(fb.finalize(), self.config.dest()).await;
                         }
                         fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
                         let buf = fb.message_buffer(TRADE_SIZE).expect("Trade fits in empty frame");
@@ -210,34 +353,50 @@ impl MulticastPublisher {
         }
 
         if !fb.is_empty() {
-            self.send_frame(fb.finalize()).await;
+            self.send_frame(fb.finalize(), self.config.dest()).await;
         }
     }
 
     /// Main loop: subscribes to the broadcast channel and publishes binary frames.
     pub(crate) async fn run(
         &self,
-        mut rx: tokio::sync::broadcast::Receiver<std::sync::Arc<crate::listeners::order_book::InternalMessage>>,
+        mut rx: tokio::sync::broadcast::Receiver<Arc<crate::listeners::order_book::InternalMessage>>,
     ) {
         use crate::listeners::order_book::InternalMessage;
 
         info!(
-            "multicast publisher started: group={} port={} mtu={} source_id={}",
-            self.config.group_addr, self.config.port, self.config.mtu, self.config.source_id,
+            "multicast publisher started: group={} hot_port={} ref_port={} mtu={} source_id={}",
+            self.config.group_addr, self.config.port, self.config.ref_data_port, self.config.mtu, self.config.source_id,
         );
 
-        // Send ChannelReset on startup
-        self.send_channel_reset().await;
+        // Send ChannelReset on both ports at startup.
+        self.send_channel_reset(self.config.dest()).await;
+        self.send_channel_reset(self.config.ref_data_dest()).await;
 
+        // Hot-path timers
         let mut snapshot_interval = tokio::time::interval(self.config.snapshot_interval);
-        snapshot_interval.tick().await; // consume immediate first tick
+        snapshot_interval.tick().await;
 
         let mut heartbeat_interval = tokio::time::interval(self.config.heartbeat_interval);
         heartbeat_interval.tick().await;
 
-        // Cache the most recent snapshot message for periodic resends
-        let mut cached_snapshot: Option<std::sync::Arc<InternalMessage>> = None;
+        // Reference-data timers
+        let mut manifest_interval = tokio::time::interval(self.config.manifest_cadence);
+        manifest_interval.tick().await;
+
+        // Definition cycle tick: we want to emit one "batch" per tick so that frames
+        // spread across the cycle. Tick rate = cycle / ceil(total / per_frame).
+        // Use a fixed-ish tick (default: cycle / 20) so behavior is independent of registry size.
+        let def_tick_interval = self.config.definition_cycle.div_f64(20.0).max(std::time::Duration::from_millis(500));
+        let mut definition_interval = tokio::time::interval(def_tick_interval);
+        definition_interval.tick().await;
+
+        // Cache the most recent snapshot message for periodic hot-path resends.
+        let mut cached_snapshot: Option<Arc<InternalMessage>> = None;
         let mut had_activity = false;
+
+        // Definition cycler state
+        let mut cycler = DefinitionCycler::empty();
 
         loop {
             tokio::select! {
@@ -272,12 +431,11 @@ impl MulticastPublisher {
                     }
                 }
                 _ = snapshot_interval.tick() => {
-                    if let Some(ref cached) = cached_snapshot {
-                        if let InternalMessage::Snapshot { l2_snapshots, time } = cached.as_ref() {
+                    if let Some(ref cached) = cached_snapshot
+                        && let InternalMessage::Snapshot { l2_snapshots, time } = cached.as_ref() {
                             self.publish_quotes(l2_snapshots.as_ref(), *time, true).await;
                             had_activity = true;
                             heartbeat_interval.reset();
-                        }
                     }
                 }
                 _ = heartbeat_interval.tick() => {
@@ -286,16 +444,86 @@ impl MulticastPublisher {
                     }
                     had_activity = false;
                 }
+                _ = manifest_interval.tick() => {
+                    // Sync cycler BEFORE sending the manifest, so they agree on seq.
+                    let reset = self.sync_cycler(&mut cycler).await;
+                    if reset {
+                        info!(
+                            "multicast: cycler reset to manifest_seq={} ({} instruments)",
+                            cycler.seq_tag,
+                            cycler.snapshot.len()
+                        );
+                    }
+                    self.send_manifest_summary().await;
+                }
+                _ = definition_interval.tick() => {
+                    self.sync_cycler(&mut cycler).await;
+                    if cycler.snapshot.is_empty() {
+                        continue;
+                    }
+                    if cycler.is_cycle_complete() {
+                        cycler.advance_to_start();
+                    }
+                    let per_tick = self.defs_per_tick(cycler.snapshot.len(), def_tick_interval);
+                    self.publish_definitions_batch(&mut cycler, per_tick).await;
+                }
             }
         }
     }
 }
 
+/// Builds an `InstrumentDefinitionData` for the given instrument, stamped with `manifest_seq`.
+fn build_instrument_definition(coin: &str, info: &InstrumentInfo, manifest_seq: u16) -> InstrumentDefinitionData {
+    // Split a coin like "BTC-USDT" into leg1="BTC", leg2="USDT" if present.
+    // For HL perps this is just the coin name on leg1.
+    let (leg1_str, leg2_str) = split_legs(coin);
+    let leg1 = make_leg(leg1_str);
+    let leg2 = make_leg(leg2_str);
+
+    InstrumentDefinitionData {
+        instrument_id: info.instrument_id,
+        symbol: info.symbol,
+        leg1,
+        leg2,
+        asset_class: ASSET_CLASS_CRYPTO_SPOT,
+        price_exponent: info.price_exponent,
+        qty_exponent: info.qty_exponent,
+        market_model: MARKET_MODEL_CLOB,
+        tick_size: 0,
+        lot_size: 0,
+        contract_value: 0,
+        expiry: 0,
+        settle_type: SETTLE_TYPE_NA,
+        price_bound: PRICE_BOUND_UNBOUNDED,
+        manifest_seq,
+    }
+}
+
+fn split_legs(coin: &str) -> (&str, &str) {
+    if let Some((a, b)) = coin.split_once('/') {
+        (a, b)
+    } else if let Some((a, b)) = coin.split_once('-') {
+        (a, b)
+    } else {
+        (coin, "")
+    }
+}
+
+fn make_leg(name: &str) -> [u8; 8] {
+    let mut buf = [0u8; 8];
+    let bytes = name.as_bytes();
+    let len = bytes.len().min(8);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instruments::{RegistryState, UniverseEntry, make_symbol};
     use crate::protocol::constants::{
-        DEFAULT_MTU, FRAME_HEADER_SIZE, MAGIC_BYTES, MSG_TYPE_CHANNEL_RESET, MSG_TYPE_HEARTBEAT, SCHEMA_VERSION,
+        DEFAULT_MTU, FRAME_HEADER_SIZE, MAGIC_BYTES, MSG_TYPE_CHANNEL_RESET, MSG_TYPE_HEARTBEAT,
+        MSG_TYPE_INSTRUMENT_DEF, MSG_TYPE_MANIFEST_SUMMARY, SCHEMA_VERSION,
     };
     use std::net::Ipv4Addr;
     use std::time::Duration;
@@ -304,53 +532,133 @@ mod tests {
         MulticastConfig {
             group_addr: Ipv4Addr::LOCALHOST,
             port: 0,
+            ref_data_port: 0,
             bind_addr: Ipv4Addr::LOCALHOST,
             snapshot_interval: Duration::from_secs(60),
             mtu: DEFAULT_MTU,
             source_id: 1,
             heartbeat_interval: Duration::from_secs(60),
             hl_api_url: String::new(),
+            instruments_refresh_interval: Duration::from_secs(60),
+            definition_cycle: Duration::from_secs(30),
+            manifest_cadence: Duration::from_secs(1),
         }
     }
 
-    fn test_registry() -> InstrumentRegistry {
-        let mut map = HashMap::new();
-        map.insert(
-            "BTC".to_string(),
-            crate::instruments::InstrumentInfo {
+    fn test_registry() -> Arc<RwLock<RegistryState>> {
+        let universe = vec![
+            UniverseEntry {
                 instrument_id: 0,
-                price_exponent: -8,
-                qty_exponent: -8,
-                symbol: crate::instruments::make_symbol("BTC"),
+                coin: "BTC".to_string(),
+                is_delisted: false,
+                info: InstrumentInfo {
+                    instrument_id: 0,
+                    price_exponent: -8,
+                    qty_exponent: -8,
+                    symbol: make_symbol("BTC"),
+                },
             },
-        );
-        InstrumentRegistry::new(map)
+            UniverseEntry {
+                instrument_id: 1,
+                coin: "ETH".to_string(),
+                is_delisted: false,
+                info: InstrumentInfo {
+                    instrument_id: 1,
+                    price_exponent: -8,
+                    qty_exponent: -8,
+                    symbol: make_symbol("ETH"),
+                },
+            },
+        ];
+        Arc::new(RwLock::new(RegistryState::new(universe)))
     }
 
     #[tokio::test]
-    async fn sends_channel_reset_on_startup() {
+    async fn sends_channel_reset_on_both_ports_at_startup() {
         let send_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let recv_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let recv_addr = recv_socket.local_addr().unwrap();
+        let hot_recv = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ref_recv = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         let mut config = test_config();
-        config.port = recv_addr.port();
+        config.port = hot_recv.local_addr().unwrap().port();
+        config.ref_data_port = ref_recv.local_addr().unwrap().port();
 
         let publisher = MulticastPublisher::new(send_socket, config, test_registry());
-        publisher.send_channel_reset().await;
+
+        publisher.send_channel_reset(publisher.config.dest()).await;
+        publisher.send_channel_reset(publisher.config.ref_data_dest()).await;
 
         let mut buf = [0u8; 2048];
-        let n = tokio::time::timeout(Duration::from_secs(2), recv_socket.recv(&mut buf))
+
+        let n1 = tokio::time::timeout(Duration::from_secs(2), hot_recv.recv(&mut buf))
+            .await
+            .expect("timed out on hot port")
+            .expect("hot recv failed");
+        assert_eq!(&buf[0..2], &MAGIC_BYTES);
+        assert_eq!(buf[2], SCHEMA_VERSION);
+        assert_eq!(buf[FRAME_HEADER_SIZE], MSG_TYPE_CHANNEL_RESET);
+        let _ = n1;
+
+        let n2 = tokio::time::timeout(Duration::from_secs(2), ref_recv.recv(&mut buf))
+            .await
+            .expect("timed out on ref port")
+            .expect("ref recv failed");
+        assert_eq!(&buf[0..2], &MAGIC_BYTES);
+        assert_eq!(buf[FRAME_HEADER_SIZE], MSG_TYPE_CHANNEL_RESET);
+        let _ = n2;
+    }
+
+    #[tokio::test]
+    async fn manifest_summary_carries_registry_state() {
+        let send_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_port = recv_socket.local_addr().unwrap().port();
+
+        let mut config = test_config();
+        config.ref_data_port = recv_port;
+
+        let publisher = MulticastPublisher::new(send_socket, config, test_registry());
+        publisher.send_manifest_summary().await;
+
+        let mut buf = [0u8; 2048];
+        tokio::time::timeout(Duration::from_secs(2), recv_socket.recv(&mut buf))
             .await
             .expect("timed out")
             .expect("recv failed");
 
-        let frame = &buf[..n];
-        assert_eq!(&frame[0..2], &MAGIC_BYTES);
-        assert_eq!(frame[2], SCHEMA_VERSION);
-        assert_eq!(frame[20], 1); // msg_count
-        assert_eq!(frame[FRAME_HEADER_SIZE], MSG_TYPE_CHANNEL_RESET);
-        assert_eq!(frame[FRAME_HEADER_SIZE + 1], CHANNEL_RESET_SIZE as u8);
+        assert_eq!(buf[FRAME_HEADER_SIZE], MSG_TYPE_MANIFEST_SUMMARY);
+        let body_offset = FRAME_HEADER_SIZE + 4; // skip app msg header
+        let seq = u16::from_le_bytes(buf[body_offset + 4..body_offset + 6].try_into().unwrap());
+        let count = u32::from_le_bytes(buf[body_offset + 8..body_offset + 12].try_into().unwrap());
+        assert_eq!(seq, 1);
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn definition_batch_emits_instruments() {
+        let send_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_port = recv_socket.local_addr().unwrap().port();
+
+        let mut config = test_config();
+        config.ref_data_port = recv_port;
+
+        let publisher = MulticastPublisher::new(send_socket, config, test_registry());
+        let mut cycler = DefinitionCycler::empty();
+        publisher.sync_cycler(&mut cycler).await;
+        assert_eq!(cycler.snapshot.len(), 2);
+        assert_eq!(cycler.seq_tag, 1);
+
+        publisher.publish_definitions_batch(&mut cycler, 2).await;
+
+        let mut buf = [0u8; 2048];
+        tokio::time::timeout(Duration::from_secs(2), recv_socket.recv(&mut buf))
+            .await
+            .expect("timed out")
+            .expect("recv failed");
+
+        assert_eq!(buf[FRAME_HEADER_SIZE], MSG_TYPE_INSTRUMENT_DEF);
+        assert_eq!(buf[20], 2); // msg_count in frame header: 2 definitions packed
     }
 
     #[tokio::test]
@@ -366,42 +674,41 @@ mod tests {
         publisher.send_heartbeat().await;
 
         let mut buf = [0u8; 2048];
-        let n = tokio::time::timeout(Duration::from_secs(2), recv_socket.recv(&mut buf))
+        tokio::time::timeout(Duration::from_secs(2), recv_socket.recv(&mut buf))
             .await
             .expect("timed out")
             .expect("recv failed");
 
-        let frame = &buf[..n];
-        assert_eq!(&frame[0..2], &MAGIC_BYTES);
-        assert_eq!(frame[FRAME_HEADER_SIZE], MSG_TYPE_HEARTBEAT);
-        assert_eq!(frame[FRAME_HEADER_SIZE + 1], HEARTBEAT_SIZE as u8);
+        assert_eq!(&buf[0..2], &MAGIC_BYTES);
+        assert_eq!(buf[FRAME_HEADER_SIZE], MSG_TYPE_HEARTBEAT);
+        assert_eq!(buf[FRAME_HEADER_SIZE + 1], HEARTBEAT_SIZE as u8);
     }
 
-    #[tokio::test]
-    async fn sequence_numbers_increment() {
-        let send_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let recv_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let recv_addr = recv_socket.local_addr().unwrap();
+    #[test]
+    fn split_legs_slash() {
+        assert_eq!(split_legs("PURR/USDC"), ("PURR", "USDC"));
+    }
 
-        let mut config = test_config();
-        config.port = recv_addr.port();
+    #[test]
+    fn split_legs_dash() {
+        assert_eq!(split_legs("BTC-USDT"), ("BTC", "USDT"));
+    }
 
-        let publisher = MulticastPublisher::new(send_socket, config, test_registry());
+    #[test]
+    fn split_legs_none() {
+        assert_eq!(split_legs("BTC"), ("BTC", ""));
+    }
 
-        publisher.send_heartbeat().await;
-        publisher.send_heartbeat().await;
-        publisher.send_heartbeat().await;
+    #[test]
+    fn make_leg_padding() {
+        let leg = make_leg("BTC");
+        assert_eq!(&leg[..3], b"BTC");
+        assert_eq!(&leg[3..], &[0u8; 5]);
+    }
 
-        let mut buf = [0u8; 2048];
-        let mut seqs = Vec::new();
-        for _ in 0..3 {
-            tokio::time::timeout(Duration::from_secs(2), recv_socket.recv(&mut buf))
-                .await
-                .expect("timed out")
-                .expect("recv failed");
-            let seq = u64::from_le_bytes(buf[4..12].try_into().unwrap());
-            seqs.push(seq);
-        }
-        assert_eq!(seqs, vec![0, 1, 2]);
+    #[test]
+    fn make_leg_truncation() {
+        let leg = make_leg("LONGLONGCOIN");
+        assert_eq!(&leg, b"LONGLONG");
     }
 }

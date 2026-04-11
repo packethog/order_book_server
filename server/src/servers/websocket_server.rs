@@ -63,17 +63,37 @@ pub async fn run_websocket_server(
     if let Some(mcast_config) = multicast_config {
         let mcast_rx = internal_message_tx.subscribe();
         tokio::spawn(async move {
+            use std::sync::Arc;
+            use tokio::sync::RwLock;
+
             // Bootstrap instrument registry from HL API
-            let instruments = match crate::instruments::hyperliquid::bootstrap_registry(&mcast_config.hl_api_url).await
-            {
-                Ok(instruments) => instruments,
+            let universe = match crate::instruments::hyperliquid::fetch_universe(&mcast_config.hl_api_url).await {
+                Ok(u) => u,
                 Err(err) => {
                     log::error!("failed to bootstrap instrument registry: {err}");
                     std::process::exit(3);
                 }
             };
-            let registry = crate::instruments::InstrumentRegistry::new(instruments);
-            info!("instrument registry loaded: {} instruments", registry.len());
+            let state = Arc::new(RwLock::new(crate::instruments::RegistryState::new(universe)));
+            {
+                let guard = state.read().await;
+                info!(
+                    "instrument registry loaded: {} active ({} in universe), manifest_seq={}",
+                    guard.active.len(),
+                    guard.universe.len(),
+                    guard.manifest_seq
+                );
+            }
+
+            // Spawn refresh task
+            {
+                let refresh_state = Arc::clone(&state);
+                let api_url = mcast_config.hl_api_url.clone();
+                let interval = mcast_config.instruments_refresh_interval;
+                tokio::spawn(async move {
+                    crate::instruments::hyperliquid::refresh_task(api_url, refresh_state, interval).await;
+                });
+            }
 
             let bind_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(mcast_config.bind_addr), 0);
             match tokio::net::UdpSocket::bind(bind_addr).await {
@@ -82,7 +102,7 @@ pub async fn run_websocket_server(
                         log::error!("failed to set multicast TTL: {err}");
                         std::process::exit(3);
                     }
-                    let publisher = MulticastPublisher::new(socket, mcast_config, registry);
+                    let publisher = MulticastPublisher::new(socket, mcast_config, state);
                     publisher.run(mcast_rx).await;
                 }
                 Err(err) => {
