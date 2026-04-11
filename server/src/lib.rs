@@ -1,4 +1,5 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+pub mod instruments;
 mod listeners;
 pub mod multicast;
 mod order_book;
