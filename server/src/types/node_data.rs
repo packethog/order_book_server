@@ -85,6 +85,11 @@ impl<E> Batch<E> {
         self.block_number
     }
 
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn local_time_ms(&self) -> u64 {
+        self.local_time.and_utc().timestamp_millis().try_into().unwrap()
+    }
+
     pub(crate) fn events(self) -> Vec<E> {
         self.events
     }

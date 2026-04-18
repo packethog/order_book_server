@@ -69,9 +69,25 @@ impl MulticastPublisher {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
+    const CATCHUP_THRESHOLD_MS: u64 = 500;
+
     #[allow(clippy::cast_possible_truncation)]
     fn now_ns() -> u64 {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    }
+
+    fn log_catchup_progress(kind: &str, lag_ms: u64, last_log_ms: &mut u64) {
+        let now = Self::now_ms();
+        if now.saturating_sub(*last_log_ms) >= 5_000 {
+            let lag_s = lag_ms / 1_000;
+            info!("multicast: catching up, suppressing {kind} (lag {lag_s}s)");
+            *last_log_ms = now;
+        }
     }
 
     async fn send_frame(&self, frame: &[u8], dest: SocketAddr) {
@@ -394,6 +410,8 @@ impl MulticastPublisher {
         // Cache the most recent snapshot message for periodic marketdata resends.
         let mut cached_snapshot: Option<Arc<InternalMessage>> = None;
         let mut had_activity = false;
+        let mut caught_up = false;
+        let mut last_catchup_log_ms: u64 = 0;
 
         // Definition cycler state
         let mut cycler = DefinitionCycler::empty();
@@ -404,17 +422,31 @@ impl MulticastPublisher {
                     match result {
                         Ok(msg) => match msg.as_ref() {
                             InternalMessage::Snapshot { l2_snapshots, time } => {
-                                let snapshot_map = l2_snapshots.as_ref();
                                 cached_snapshot = Some(msg.clone());
-                                self.publish_quotes(snapshot_map, *time, false).await;
-                                had_activity = true;
-                                heartbeat_interval.reset();
+                                let lag_ms = Self::now_ms().saturating_sub(*time);
+                                if lag_ms <= Self::CATCHUP_THRESHOLD_MS {
+                                    if !caught_up {
+                                        info!("multicast: caught up (lag {lag_ms}ms), publishing quotes");
+                                        caught_up = true;
+                                    }
+                                    let snapshot_map = l2_snapshots.as_ref();
+                                    self.publish_quotes(snapshot_map, *time, false).await;
+                                    had_activity = true;
+                                    heartbeat_interval.reset();
+                                } else {
+                                    Self::log_catchup_progress("quotes", lag_ms, &mut last_catchup_log_ms);
+                                }
                             }
                             InternalMessage::Fills { batch } => {
-                                let trades_by_coin = crate::servers::websocket_server::coin_to_trades(batch);
-                                self.publish_trades(&trades_by_coin).await;
-                                had_activity = true;
-                                heartbeat_interval.reset();
+                                let lag_ms = Self::now_ms().saturating_sub(batch.block_time());
+                                if lag_ms <= Self::CATCHUP_THRESHOLD_MS {
+                                    let trades_by_coin = crate::servers::websocket_server::coin_to_trades(batch);
+                                    self.publish_trades(&trades_by_coin).await;
+                                    had_activity = true;
+                                    heartbeat_interval.reset();
+                                }
+                                // fills are high volume during catchup; progress
+                                // is already logged by the snapshot path above
                             }
                             InternalMessage::L4BookUpdates { .. } => {
                                 // Ignored for multicast
@@ -431,11 +463,13 @@ impl MulticastPublisher {
                     }
                 }
                 _ = snapshot_interval.tick() => {
-                    if let Some(ref cached) = cached_snapshot
-                        && let InternalMessage::Snapshot { l2_snapshots, time } = cached.as_ref() {
-                            self.publish_quotes(l2_snapshots.as_ref(), *time, true).await;
-                            had_activity = true;
-                            heartbeat_interval.reset();
+                    if caught_up {
+                        if let Some(ref cached) = cached_snapshot
+                            && let InternalMessage::Snapshot { l2_snapshots, time } = cached.as_ref() {
+                                self.publish_quotes(l2_snapshots.as_ref(), *time, true).await;
+                                had_activity = true;
+                                heartbeat_interval.reset();
+                        }
                     }
                 }
                 _ = heartbeat_interval.tick() => {
