@@ -7,11 +7,15 @@ use tokio::sync::RwLock;
 
 use super::{InstrumentInfo, RegistryState, UniverseEntry, make_symbol};
 
-/// Fetches perpetual and spot metadata from the Hyperliquid REST API and builds
-/// a full `UniverseEntry` list keyed by index (including delisted entries).
+/// Fetches perpetual, spot, and builder-DEX metadata from the Hyperliquid REST API
+/// and builds a full `UniverseEntry` list keyed by index (including delisted entries).
 ///
-/// Perp instruments get `instrument_id` = array index.
-/// Spot instruments get `instrument_id` = 10000 + array index.
+/// Instrument id ranges:
+/// - Core perps: array index (0..~230)
+/// - Spot: 10_000 + array index
+/// - Builder-DEX perps: 20_000 + dex_idx * 1_000 + asset_idx
+///   (dex_idx = position in `perpDexs` response; coin name is prefixed `<dex>:<name>`
+///    to match what hl-node writes in the block files)
 pub async fn fetch_universe(api_url: &str) -> Result<Vec<UniverseEntry>, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
     let mut universe = Vec::new();
@@ -50,11 +54,67 @@ pub async fn fetch_universe(api_url: &str) -> Result<Vec<UniverseEntry>, Box<dyn
         }
     }
 
+    // Fetch builder-DEX perps. Failures here are non-fatal: we log and return
+    // whatever we've already collected so core perps stay on the air.
+    match client
+        .post(format!("{api_url}/info"))
+        .json(&serde_json::json!({"type": "perpDexs"}))
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(value) => {
+                if let Some(dexs) = value.as_array() {
+                    for (dex_idx, dex) in dexs.iter().enumerate() {
+                        let Some(dex_name) = dex.get("name").and_then(serde_json::Value::as_str) else {
+                            continue;
+                        };
+                        let id_base = 20_000 + u32::try_from(dex_idx).unwrap_or(u32::MAX) * 1_000;
+                        match fetch_dex_universe(&client, api_url, dex_name, id_base).await {
+                            Ok(mut entries) => universe.append(&mut entries),
+                            Err(err) => {
+                                warn!("instruments: skipping builder dex \"{dex_name}\": {err}");
+                            }
+                        }
+                    }
+                }
+            }
+            Err(err) => warn!("instruments: perpDexs response parse failed, skipping builder dexes: {err}"),
+        },
+        Err(err) => warn!("instruments: perpDexs fetch failed, skipping builder dexes: {err}"),
+    }
+
     let active = universe.iter().filter(|e| !e.is_delisted).count();
     let delisted = universe.len() - active;
     info!("instruments: fetched {} entries ({} active, {} delisted)", universe.len(), active, delisted);
 
     Ok(universe)
+}
+
+async fn fetch_dex_universe(
+    client: &reqwest::Client,
+    api_url: &str,
+    dex_name: &str,
+    id_base: u32,
+) -> Result<Vec<UniverseEntry>, Box<dyn std::error::Error + Send + Sync>> {
+    let resp = client
+        .post(format!("{api_url}/info"))
+        .json(&serde_json::json!({"type": "meta", "dex": dex_name}))
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+
+    let mut entries = Vec::new();
+    if let Some(arr) = resp.get("universe").and_then(serde_json::Value::as_array) {
+        for (idx, asset) in arr.iter().enumerate() {
+            let id = id_base + u32::try_from(idx).unwrap_or(u32::MAX);
+            if let Some(entry) = parse_builder_dex_asset(asset, dex_name, id) {
+                entries.push(entry);
+            }
+        }
+    }
+    Ok(entries)
 }
 
 /// Backwards-compatible wrapper that returns only the active instrument map.
@@ -88,6 +148,20 @@ fn parse_spot_asset(asset: &serde_json::Value, index: u32) -> Option<UniverseEnt
         InstrumentInfo { instrument_id: 10_000 + index, price_exponent, qty_exponent, symbol: make_symbol(name) };
 
     Some(UniverseEntry { instrument_id: 10_000 + index, coin: name.to_string(), is_delisted, info })
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn parse_builder_dex_asset(asset: &serde_json::Value, dex: &str, id: u32) -> Option<UniverseEntry> {
+    let name = asset.get("name")?.as_str()?;
+    let sz_decimals = asset.get("szDecimals")?.as_u64()?;
+    let qty_exponent = -(sz_decimals as i8);
+    let price_exponent = derive_price_exponent(asset);
+    let is_delisted = asset.get("isDelisted").and_then(serde_json::Value::as_bool).unwrap_or(false);
+
+    let coin = format!("{dex}:{name}");
+    let info = InstrumentInfo { instrument_id: id, price_exponent, qty_exponent, symbol: make_symbol(&coin) };
+
+    Some(UniverseEntry { instrument_id: id, coin, is_delisted, info })
 }
 
 /// Derives the price exponent from asset metadata.
@@ -298,6 +372,31 @@ mod tests {
         let e = parse_spot_asset(&asset, 5).unwrap();
         assert_eq!(e.coin, "PURR/USDC");
         assert_eq!(e.instrument_id, 10_005);
+    }
+
+    #[test]
+    fn parse_builder_dex_asset_prefixes_coin() {
+        let asset = serde_json::json!({"name": "CL", "szDecimals": 3, "maxDecimals": 2});
+        let e = parse_builder_dex_asset(&asset, "xyz", 21_000).unwrap();
+        assert_eq!(e.coin, "xyz:CL");
+        assert_eq!(e.instrument_id, 21_000);
+        assert_eq!(e.info.qty_exponent, -3);
+        assert_eq!(e.info.price_exponent, -2);
+        assert!(!e.is_delisted);
+    }
+
+    #[test]
+    fn parse_builder_dex_asset_delisted() {
+        let asset = serde_json::json!({"name": "OLD", "szDecimals": 2, "isDelisted": true});
+        let e = parse_builder_dex_asset(&asset, "abcd", 27_000).unwrap();
+        assert_eq!(e.coin, "abcd:OLD");
+        assert!(e.is_delisted);
+    }
+
+    #[test]
+    fn parse_builder_dex_asset_missing_fields() {
+        assert!(parse_builder_dex_asset(&serde_json::json!({"szDecimals": 3}), "xyz", 20_000).is_none());
+        assert!(parse_builder_dex_asset(&serde_json::json!({"name": "CL"}), "xyz", 20_000).is_none());
     }
 
     #[test]
