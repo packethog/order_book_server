@@ -14,6 +14,7 @@ use crate::{
 };
 use alloy::primitives::Address;
 use fs::File;
+use latency::LatencyStats;
 use log::{error, info};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::{
@@ -30,10 +31,11 @@ use tokio::{
         broadcast::Sender,
         mpsc::{UnboundedSender, unbounded_channel},
     },
-    time::{Instant, interval_at, sleep},
+    time::{Instant, interval_at},
 };
 use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
 
+pub(crate) mod latency;
 mod state;
 mod utils;
 
@@ -61,6 +63,8 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
         listener.ignore_spot
     };
 
+    let latency_stats = Arc::new(LatencyStats::new());
+
     // every so often, we fetch a new snapshot and the snapshot_fetch_task starts running.
     // Result is sent back along this channel (if error, we want to return to top level)
     let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<Result<()>>();
@@ -69,33 +73,74 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     watcher.watch(&fills_dir, RecursiveMode::Recursive)?;
     watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
     let start = Instant::now() + Duration::from_secs(5);
-    let mut ticker = interval_at(start, Duration::from_secs(10));
+    let mut ticker = interval_at(start, Duration::from_secs(60));
+    // Track last event time for liveness detection (replaces the sleep(5) branch
+    // that was recreating a Sleep future on every select! iteration)
+    let mut last_event_time: Option<Instant> = None;
+
+    // Classify an fs path into its EventSource (avoids repeating starts_with checks)
+    let classify_path = |path: &std::path::Path| -> Option<EventSource> {
+        if path.starts_with(&order_statuses_dir) {
+            Some(EventSource::OrderStatuses)
+        } else if path.starts_with(&fills_dir) {
+            Some(EventSource::Fills)
+        } else if path.starts_with(&order_diffs_dir) {
+            Some(EventSource::OrderDiffs)
+        } else {
+            None
+        }
+    };
+
     loop {
         tokio::select! {
-            event = fs_event_rx.recv() =>  match event {
-                Some(Ok(event)) => {
-                    if event.kind.is_create() || event.kind.is_modify() {
-                        let new_path = &event.paths[0];
-                        if new_path.starts_with(&order_statuses_dir) && new_path.is_file() {
-                            listener
-                                .lock()
-                                .await
-                                .process_update(&event, new_path, EventSource::OrderStatuses)
-                                .map_err(|err| format!("Order status processing error: {err}"))?;
-                        } else if new_path.starts_with(&fills_dir) && new_path.is_file() {
-                            listener
-                                .lock()
-                                .await
-                                .process_update(&event, new_path, EventSource::Fills)
-                                .map_err(|err| format!("Fill update processing error: {err}"))?;
-                        } else if new_path.starts_with(&order_diffs_dir) && new_path.is_file() {
-                            listener
-                                .lock()
-                                .await
-                                .process_update(&event, new_path, EventSource::OrderDiffs)
-                                .map_err(|err| format!("Book diff processing error: {err}"))?;
+            event = fs_event_rx.recv() => match event {
+                Some(Ok(first_event)) => {
+                    let t_wakeup = Instant::now();
+
+                    // Single lock acquisition: process the first event plus
+                    // any others that arrived while we waited for the lock.
+                    // When hl-node writes a block it touches 3 directories in
+                    // quick succession — draining batches those into one pass.
+                    let mut guard = listener.lock().await;
+
+                    // Process first event
+                    if first_event.kind.is_create() || first_event.kind.is_modify() {
+                        let path = &first_event.paths[0];
+                        if path.is_file() {
+                            if let Some(source) = classify_path(path) {
+                                guard.process_update(&first_event, path, source)
+                                    .map_err(|err| format!("{source} processing error: {err}"))?;
+                            }
                         }
                     }
+
+                    // Drain and process any additional pending events
+                    while let Ok(next) = fs_event_rx.try_recv() {
+                        match next {
+                            Ok(ev) if ev.kind.is_create() || ev.kind.is_modify() => {
+                                let path = &ev.paths[0];
+                                if path.is_file() {
+                                    if let Some(source) = classify_path(path) {
+                                        guard.process_update(&ev, path, source)
+                                            .map_err(|err| format!("{source} processing error: {err}"))?;
+                                    }
+                                }
+                            }
+                            Ok(_) => {} // non-create/modify events
+                            Err(err) => {
+                                error!("Watcher error (drained): {err}");
+                                return Err(format!("Watcher error: {err}").into());
+                            }
+                        }
+                    }
+
+                    // Record latency from the latest batch processed in this pass
+                    let t_done = Instant::now();
+                    if let Some((block_time_ms, local_time_ms)) = guard.last_batch_times() {
+                        latency_stats.record(t_wakeup.into(), t_done.into(), block_time_ms, local_time_ms);
+                    }
+
+                    last_event_time = Some(t_done);
                 }
                 Some(Err(err)) => {
                     error!("Watcher error: {err}");
@@ -118,15 +163,23 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 }
             }
             _ = ticker.tick() => {
+                // Liveness check: replaces the per-iteration sleep(5) future.
+                // Detection window is 5–15 s instead of exactly 5 s, which is
+                // fine for a "has hl-node died?" check.
+                if let Some(last) = last_event_time {
+                    if last.elapsed() > Duration::from_secs(5) {
+                        let guard = listener.lock().await;
+                        if guard.is_ready() {
+                            return Err(format!("Stream has fallen behind ({HL_NODE} failed?)").into());
+                        }
+                    }
+                }
+
+                latency_stats.report();
+
                 let listener = listener.clone();
                 let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
                 fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
-            }
-            () = sleep(Duration::from_secs(5)) => {
-                let listener = listener.lock().await;
-                if listener.is_ready() {
-                    return Err(format!("Stream has fallen behind ({HL_NODE} failed?)").into());
-                }
             }
         }
     }
@@ -140,40 +193,60 @@ fn fetch_snapshot(
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
-        let res = match process_rmp_file(&dir).await {
+        let res: Result<()> = match process_rmp_file(&dir).await {
             Ok(output_fln) => {
-                let state = {
-                    let mut listener = listener.lock().await;
-                    listener.begin_caching();
-                    listener.clone_state()
-                };
                 let snapshot = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&output_fln).await;
                 info!("Snapshot fetched");
-                // sleep to let some updates build up.
-                sleep(Duration::from_secs(1)).await;
-                let mut cache = {
-                    let mut listener = listener.lock().await;
-                    listener.take_cache()
-                };
-                info!("Cache has {} elements", cache.len());
                 match snapshot {
                     Ok((height, expected_snapshot)) => {
-                        if let Some(mut state) = state {
-                            while state.height() < height {
-                                if let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                                    state.apply_updates(order_statuses, order_diffs)?;
+                        // Single short lock: grab our internal snapshot at the
+                        // reference height, or initialize if first time.
+                        // No caching/replay needed — if our height has already
+                        // moved past the snapshot we just skip this validation
+                        // cycle (we'll catch the next one).
+                        let mut guard = listener.lock().await;
+                        if guard.is_ready() {
+                            let our_height = guard.order_book_state.as_ref()
+                                .map(|s| s.height())
+                                .unwrap_or(0);
+                            if our_height < height {
+                                // We haven't reached the snapshot height yet;
+                                // skip — we'll validate on a future cycle.
+                                info!("Validation skipped: our height {our_height} < snapshot height {height}");
+                                Ok(())
+                            } else if our_height > height {
+                                // We've moved past — snapshot is stale, skip.
+                                info!("Validation skipped: our height {our_height} > snapshot height {height}");
+                                Ok(())
+                            } else {
+                                // Heights match — clone state under lock, then
+                                // compute snapshot + validate outside the lock
+                                // so we don't block the hot path. If divergence
+                                // is found, re-lock and apply surgical per-coin
+                                // recovery rather than tearing down the feed.
+                                let state = guard.order_book_state
+                                    .clone()
+                                    .expect("is_ready checked above");
+                                drop(guard);
+                                let stored_snapshot = state.compute_snapshot().snapshot;
+                                info!("Validating snapshot at height {height}");
+                                let report = validate_snapshot_consistency(&stored_snapshot, &expected_snapshot, ignore_spot);
+                                if report.is_clean() {
+                                    Ok(())
                                 } else {
-                                    return Err::<(), Error>("Not enough cached updates".into());
+                                    log::warn!(
+                                        "snapshot validation found {} impacted coin(s): {} diverged, {} missing in fresh, {} extra in fresh — applying surgical recovery",
+                                        report.total_impacted(),
+                                        report.diverged.len(),
+                                        report.missing_in_fresh.len(),
+                                        report.extra_in_fresh.len(),
+                                    );
+                                    listener.lock().await.apply_recovery(&report, expected_snapshot);
+                                    Ok(())
                                 }
                             }
-                            if state.height() > height {
-                                return Err("Fetched snapshot lagging stored state".into());
-                            }
-                            let stored_snapshot = state.compute_snapshot().snapshot;
-                            info!("Validating snapshot");
-                            validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot)
                         } else {
-                            listener.lock().await.init_from_snapshot(expected_snapshot, height);
+                            guard.init_from_snapshot(expected_snapshot, height);
                             Ok(())
                         }
                     }
@@ -183,7 +256,7 @@ fn fetch_snapshot(
             Err(err) => Err(err),
         };
         let _unused = tx.send(res);
-        Ok(())
+        Ok::<(), Error>(())
     });
 }
 
@@ -200,6 +273,9 @@ pub(crate) struct OrderBookListener {
     // Only Some when we want it to collect updates
     fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+    // Timestamps from the most recently deserialized batch (for latency tracking)
+    last_batch_block_time_ms: Option<u64>,
+    last_batch_local_time_ms: Option<u64>,
 }
 
 impl OrderBookListener {
@@ -215,11 +291,20 @@ impl OrderBookListener {
             internal_message_tx,
             order_diff_cache: BatchQueue::new(),
             order_status_cache: BatchQueue::new(),
+            last_batch_block_time_ms: None,
+            last_batch_local_time_ms: None,
         }
     }
 
-    fn clone_state(&self) -> Option<OrderBookState> {
-        self.order_book_state.clone()
+    /// Returns (block_time_ms, local_time_ms) from the most recently
+    /// deserialized batch, if any batches have been processed since the
+    /// last call.  Clears the stored times so the caller knows whether
+    /// new data was processed in a given pass.
+    pub(crate) fn last_batch_times(&mut self) -> Option<(u64, u64)> {
+        match (self.last_batch_block_time_ms.take(), self.last_batch_local_time_ms.take()) {
+            (Some(bt), Some(lt)) => Some((bt, lt)),
+            _ => None,
+        }
     }
 
     pub(crate) const fn is_ready(&self) -> bool {
@@ -302,13 +387,49 @@ impl OrderBookListener {
         Ok(())
     }
 
-    fn begin_caching(&mut self) {
-        self.fetched_snapshot_cache = Some(VecDeque::new());
-    }
+    /// Applies surgical per-coin recovery based on a `ValidationReport`.
+    ///
+    /// Instead of exiting the process when the internal book diverges from a
+    /// fresh snapshot, we re-initialize just the affected coins in place.
+    /// The rest of the channel continues untouched — other instruments are
+    /// unaffected, and the next tick's `InternalMessage::Snapshot` will
+    /// carry the corrected BBO for the repaired coins through the normal
+    /// publish path.
+    fn apply_recovery(&mut self, report: &utils::ValidationReport, fresh_snapshot: Snapshots<InnerL4Order>) {
+        let Some(state) = self.order_book_state.as_mut() else {
+            return;
+        };
 
-    // tkae the cached updates and stop collecting updates
-    fn take_cache(&mut self) -> VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
-        self.fetched_snapshot_cache.take().unwrap_or_default()
+        let mut fresh_map = fresh_snapshot.value();
+
+        // Repair coins that diverged: replace the internal book with the fresh one.
+        for (coin, msg) in &report.diverged {
+            log::warn!("recovery: re-initializing {} (divergence: {})", coin.value(), msg);
+            if let Some(fresh_book) = fresh_map.remove(coin) {
+                state.replace_coin_from_snapshot(coin.clone(), fresh_book, true);
+            } else {
+                log::warn!(
+                    "recovery: diverged coin {} missing from fresh snapshot — dropping from state",
+                    coin.value()
+                );
+                state.remove_coin(coin);
+            }
+        }
+
+        // Drop coins that we have but the fresh snapshot doesn't (stale data).
+        for coin in &report.missing_in_fresh {
+            log::warn!("recovery: dropping stale coin {} not in fresh snapshot", coin.value());
+            state.remove_coin(coin);
+        }
+
+        // Add coins that are in the fresh snapshot but not in our state (new listings
+        // that appeared between our bootstrap and now).
+        for coin in &report.extra_in_fresh {
+            if let Some(fresh_book) = fresh_map.remove(coin) {
+                log::warn!("recovery: adding new coin {} from fresh snapshot", coin.value());
+                state.replace_coin_from_snapshot(coin.clone(), fresh_book, true);
+            }
+        }
     }
 
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
@@ -358,7 +479,22 @@ impl OrderBookListener {
                 info!("-- Event: {} modified, tracking it now --", new_path.display());
                 let file = self.file_mut(event_source);
                 let mut new_file = File::open(new_path)?;
-                new_file.seek(SeekFrom::End(0))?;
+                // Seek to end, then back up to the last newline so we start
+                // on a clean line boundary.  Without this, we can land mid-JSON
+                // if hl-node is mid-write, producing a permanent deser error.
+                let end = new_file.seek(SeekFrom::End(0))?;
+                let backtrack = end.min(8192);
+                if backtrack > 0 {
+                    new_file.seek(SeekFrom::End(-(backtrack as i64)))?;
+                    let mut buf = vec![0u8; backtrack as usize];
+                    new_file.read_exact(&mut buf)?;
+                    if let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') {
+                        // Position right after the last newline
+                        let rewind = backtrack - (last_nl as u64) - 1;
+                        new_file.seek(SeekFrom::End(-(rewind as i64)))?;
+                    }
+                    // else: no newline in last 8KB, stay at end
+                }
                 *file = Some(new_file);
             }
         }
@@ -405,14 +541,24 @@ impl DirectoryListener for OrderBookListener {
             let res = match event_source {
                 EventSource::Fills => serde_json::from_str::<Batch<NodeDataFill>>(line).map(|batch| {
                     let height = batch.block_number();
-                    (height, EventBatch::Fills(batch))
+                    let bt = batch.block_time();
+                    let lt = batch.local_time_ms();
+                    (height, bt, lt, EventBatch::Fills(batch))
                 }),
-                EventSource::OrderStatuses => serde_json::from_str(line)
-                    .map(|batch: Batch<NodeDataOrderStatus>| (batch.block_number(), EventBatch::Orders(batch))),
-                EventSource::OrderDiffs => serde_json::from_str(line)
-                    .map(|batch: Batch<NodeDataOrderDiff>| (batch.block_number(), EventBatch::BookDiffs(batch))),
+                EventSource::OrderStatuses => serde_json::from_str(line).map(|batch: Batch<NodeDataOrderStatus>| {
+                    let height = batch.block_number();
+                    let bt = batch.block_time();
+                    let lt = batch.local_time_ms();
+                    (height, bt, lt, EventBatch::Orders(batch))
+                }),
+                EventSource::OrderDiffs => serde_json::from_str(line).map(|batch: Batch<NodeDataOrderDiff>| {
+                    let height = batch.block_number();
+                    let bt = batch.block_time();
+                    let lt = batch.local_time_ms();
+                    (height, bt, lt, EventBatch::BookDiffs(batch))
+                }),
             };
-            let (height, event_batch) = match res {
+            let (height, block_time_ms, local_time_ms, event_batch) = match res {
                 Ok(data) => data,
                 Err(err) => {
                     // if we run into a serialization error (hitting EOF), just return to last line.
@@ -427,6 +573,8 @@ impl DirectoryListener for OrderBookListener {
                     break;
                 }
             };
+            self.last_batch_block_time_ms = Some(block_time_ms);
+            self.last_batch_local_time_ms = Some(local_time_ms);
             if height % 100 == 0 {
                 info!("{event_source} block: {height}");
             }

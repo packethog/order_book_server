@@ -978,6 +978,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "server",
+ "socket2",
  "tokio",
  "tokio-tungstenite",
 ]

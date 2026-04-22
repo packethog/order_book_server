@@ -14,17 +14,17 @@ pub(crate) mod subscription;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Trade {
-    pub coin: String,
-    side: Side,
-    px: String,
-    sz: String,
-    hash: String,
-    time: u64,
-    tid: u64,
-    users: [Address; 2],
+    pub(crate) coin: String,
+    pub(crate) side: Side,
+    pub(crate) px: String,
+    pub(crate) sz: String,
+    pub(crate) hash: String,
+    pub(crate) time: u64,
+    pub(crate) tid: u64,
+    pub(crate) users: [Address; 2],
 }
 
-#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Level {
     px: String,
     sz: String,
@@ -35,9 +35,21 @@ impl Level {
     pub(crate) const fn new(px: String, sz: String, n: usize) -> Self {
         Self { px, sz, n }
     }
+
+    pub(crate) fn px(&self) -> &str {
+        &self.px
+    }
+
+    pub(crate) fn sz(&self) -> &str {
+        &self.sz
+    }
+
+    pub(crate) fn n(&self) -> usize {
+        self.n
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct L2Book {
     coin: String,
     time: u64,
