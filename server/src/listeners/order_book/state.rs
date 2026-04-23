@@ -1,5 +1,5 @@
 use crate::{
-    listeners::order_book::{L2Snapshots, TimedSnapshots, utils::compute_l2_snapshots},
+    listeners::order_book::{L2Snapshots, TimedSnapshots, dob_tap::DobApplyTap, utils::compute_l2_snapshots},
     order_book::{
         Coin, InnerOrder, Oid,
         multi_book::{OrderBooks, Snapshots},
@@ -12,13 +12,31 @@ use crate::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
-#[derive(Clone)]
 pub(super) struct OrderBookState {
     order_book: OrderBooks<InnerL4Order>,
     height: u64,
     time: u64,
     snapped: bool,
     ignore_spot: bool,
+    /// Present when the DoB emitter is wired in. The tap is NOT propagated to
+    /// the cloned copy used for snapshot validation (validation reads only; no
+    /// events should be emitted from it).
+    dob_tap: Option<DobApplyTap>,
+}
+
+impl Clone for OrderBookState {
+    fn clone(&self) -> Self {
+        Self {
+            order_book: self.order_book.clone(),
+            height: self.height,
+            time: self.time,
+            snapped: self.snapped,
+            ignore_spot: self.ignore_spot,
+            // The tap is intentionally not cloned: the clone is used only for
+            // snapshot validation and must not emit DoB events.
+            dob_tap: None,
+        }
+    }
 }
 
 impl OrderBookState {
@@ -35,7 +53,13 @@ impl OrderBookState {
             height,
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
             snapped: false,
+            dob_tap: None,
         }
+    }
+
+    /// Attaches a `DobApplyTap` that will receive events on every successful apply.
+    pub(super) fn attach_dob_tap(&mut self, tap: DobApplyTap) {
+        self.dob_tap = Some(tap);
     }
 
     pub(super) const fn height(&self) -> u64 {
@@ -88,7 +112,9 @@ impl OrderBookState {
         order_diffs: Batch<NodeDataOrderDiff>,
     ) -> Result<()> {
         let height = order_statuses.block_number();
+        // block_time() returns milliseconds; multiply by 1_000_000 for nanoseconds
         let time = order_statuses.block_time();
+        let time_ns = time * 1_000_000;
         assert_eq!(order_statuses.block_number(), order_diffs.block_number());
         if height > self.height + 1 {
             return Err(format!("Expecting block {}, got block {}", self.height + 1, height).into());
@@ -124,18 +150,40 @@ impl OrderBookState {
                         // must replace time with time of entering book, which is the timestamp of the order status update
                         #[allow(clippy::unwrap_used)]
                         inner_order.convert_trigger(time.try_into().unwrap());
+                        // Clone before moving into add_order so we can emit after.
+                        // add_order always succeeds for New (returns ()), so emitting
+                        // after the successful insert is safe and avoids a phantom event.
+                        let order_for_tap = inner_order.clone();
                         self.order_book.add_order(inner_order);
+                        if let Some(tap) = self.dob_tap.as_mut() {
+                            tap.emit_order_add(&coin, &order_for_tap, time_ns);
+                        }
                     } else {
                         return Err(format!("Unable to find order opening status {diff:?}").into());
                     }
                 }
                 InnerOrderDiff::Update { new_sz, .. } => {
-                    if !self.order_book.modify_sz(oid, coin, new_sz) {
-                        return Err(format!("Unable to find order on the book {diff:?}").into());
+                    match self.order_book.modify_sz(oid.clone(), coin.clone(), new_sz) {
+                        Some((old_sz, px)) => {
+                            if let Some(tap) = self.dob_tap.as_mut() {
+                                // exec_quantity = reduction in resting size
+                                let exec_quantity = crate::order_book::Sz::new(
+                                    old_sz.value().saturating_sub(new_sz.value()),
+                                );
+                                tap.emit_order_execute(&coin, oid, px, exec_quantity, time_ns);
+                            }
+                        }
+                        None => {
+                            return Err(format!("Unable to find order on the book {diff:?}").into());
+                        }
                     }
                 }
                 InnerOrderDiff::Remove => {
-                    if !self.order_book.cancel_order(oid, coin) {
+                    if self.order_book.cancel_order(oid.clone(), coin.clone()) {
+                        if let Some(tap) = self.dob_tap.as_mut() {
+                            tap.emit_order_cancel(&coin, oid, time_ns);
+                        }
+                    } else {
                         return Err(format!("Unable to find order on the book {diff:?}").into());
                     }
                 }

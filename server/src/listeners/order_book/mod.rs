@@ -35,6 +35,7 @@ use tokio::{
 };
 use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
 
+pub(crate) mod dob_tap;
 pub(crate) mod latency;
 mod state;
 mod utils;
