@@ -6,9 +6,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub(crate) mod levels;
 mod linked_list;
 pub(crate) mod multi_book;
+pub mod per_instrument_seq;
 pub(crate) mod types;
 
 pub(crate) use types::{Coin, InnerOrder, Oid, Px, Side, Sz};
+pub use per_instrument_seq::PerInstrumentSeqCounter;
 
 #[derive(Clone, Default)]
 pub(crate) struct OrderBook<O> {
