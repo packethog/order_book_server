@@ -11,6 +11,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
+use crate::multicast::publisher::{split_legs, make_leg};
+
 use crate::protocol::dob::constants::{
     BATCH_BOUNDARY_SIZE, DEFAULT_MTU, FRAME_HEADER_SIZE, HEARTBEAT_SIZE,
     ORDER_ADD_SIZE, ORDER_CANCEL_SIZE, ORDER_EXECUTE_SIZE,
@@ -87,16 +89,9 @@ impl DobEmitter {
         self.seq
     }
 
-    fn now_ns() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
-    }
-
     fn start_frame(&mut self) -> &mut DobFrameBuilder {
         let seq = self.next_seq();
-        let ts = Self::now_ns();
+        let ts = now_ns();
         let fb = DobFrameBuilder::new(
             self.config.channel_id, seq, ts, self.reset_count, self.config.mtu,
         );
@@ -178,7 +173,7 @@ pub async fn run_dob_emitter(
                     }
                     let fb = emitter.current_frame.as_mut().unwrap();
                     let buf = fb.message_buffer(END_OF_SESSION_SIZE).expect("size checked");
-                    crate::protocol::dob::messages::encode_end_of_session(buf, DobEmitter::now_ns());
+                    crate::protocol::dob::messages::encode_end_of_session(buf, now_ns());
                     fb.commit_message();
                     emitter.flush().await?;
                     return Ok(());
@@ -191,7 +186,7 @@ pub async fn run_dob_emitter(
                     }
                     let fb = emitter.current_frame.as_mut().unwrap();
                     let buf = fb.message_buffer(HEARTBEAT_SIZE).expect("size checked");
-                    encode_heartbeat(buf, emitter.config.channel_id, DobEmitter::now_ns());
+                    encode_heartbeat(buf, emitter.config.channel_id, now_ns());
                     fb.commit_message();
                     emitter.flush().await?;
                     continue;
@@ -372,9 +367,9 @@ fn build_refdata_instrument_definition(
         ASSET_CLASS_CRYPTO_SPOT, MARKET_MODEL_CLOB, PRICE_BOUND_UNBOUNDED, SETTLE_TYPE_NA,
     };
 
-    let (leg1_str, leg2_str) = refdata_split_legs(coin);
-    let leg1 = refdata_make_leg(leg1_str);
-    let leg2 = refdata_make_leg(leg2_str);
+    let (leg1_str, leg2_str) = split_legs(coin);
+    let leg1 = make_leg(leg1_str);
+    let leg2 = make_leg(leg2_str);
 
     crate::protocol::messages::InstrumentDefinitionData {
         instrument_id: info.instrument_id,
@@ -393,24 +388,6 @@ fn build_refdata_instrument_definition(
         price_bound: PRICE_BOUND_UNBOUNDED,
         manifest_seq,
     }
-}
-
-fn refdata_split_legs(coin: &str) -> (&str, &str) {
-    if let Some((a, b)) = coin.split_once('/') {
-        (a, b)
-    } else if let Some((a, b)) = coin.split_once('-') {
-        (a, b)
-    } else {
-        (coin, "")
-    }
-}
-
-fn refdata_make_leg(name: &str) -> [u8; 8] {
-    let mut buf = [0u8; 8];
-    let bytes = name.as_bytes();
-    let len = bytes.len().min(8);
-    buf[..len].copy_from_slice(&bytes[..len]);
-    buf
 }
 
 #[inline]
