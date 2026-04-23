@@ -162,7 +162,12 @@ pub async fn run_dob_emitter(
 
     loop {
         tokio::select! {
-            Some(event) = rx.recv() => {
+            event = rx.recv() => {
+                let Some(event) = event else {
+                    // All senders dropped — clean exit without EndOfSession (sender-side
+                    // crash/restart is not a graceful shutdown).
+                    return Ok(());
+                };
                 if matches!(event, DobEvent::Shutdown) {
                     // Emit EndOfSession on mktdata before exiting so subscribers
                     // see a clean session close rather than a silent timeout.
