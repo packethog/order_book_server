@@ -173,6 +173,11 @@ impl OrderBookState {
                             tap.emit_order_add(&coin, &order_for_tap, time_ns);
                         }
                     } else {
+                        if emittable_count >= 2 {
+                            if let Some(tap) = self.dob_tap.as_mut() {
+                                tap.emit_batch_boundary(1 /* close */, height, time_ns);
+                            }
+                        }
                         return Err(format!("Unable to find order opening status {diff:?}").into());
                     }
                 }
@@ -188,6 +193,11 @@ impl OrderBookState {
                             }
                         }
                         None => {
+                            if emittable_count >= 2 {
+                                if let Some(tap) = self.dob_tap.as_mut() {
+                                    tap.emit_batch_boundary(1 /* close */, height, time_ns);
+                                }
+                            }
                             return Err(format!("Unable to find order on the book {diff:?}").into());
                         }
                     }
@@ -198,6 +208,11 @@ impl OrderBookState {
                             tap.emit_order_cancel(&coin, oid, time_ns);
                         }
                     } else {
+                        if emittable_count >= 2 {
+                            if let Some(tap) = self.dob_tap.as_mut() {
+                                tap.emit_batch_boundary(1 /* close */, height, time_ns);
+                            }
+                        }
                         return Err(format!("Unable to find order on the book {diff:?}").into());
                     }
                 }
