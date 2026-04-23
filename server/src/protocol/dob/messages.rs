@@ -242,3 +242,50 @@ mod order_execute_tests {
         assert_eq!(u64::from_le_bytes(buf[48..56].try_into().unwrap()), 999_999);
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct BatchBoundary {
+    pub channel_id: u8,
+    pub phase: u8, // 0 = open, 1 = close
+    pub batch_id: u64,
+}
+
+pub fn encode_batch_boundary(out: &mut [u8], msg: &BatchBoundary) {
+    use crate::protocol::dob::constants::{BATCH_BOUNDARY_SIZE, MSG_TYPE_BATCH_BOUNDARY};
+    assert_eq!(out.len(), BATCH_BOUNDARY_SIZE, "BatchBoundary buffer size mismatch");
+
+    out[0] = MSG_TYPE_BATCH_BOUNDARY;
+    out[1] = BATCH_BOUNDARY_SIZE as u8;
+    out[2..4].copy_from_slice(&0u16.to_le_bytes());
+    out[4] = msg.channel_id;
+    out[5] = msg.phase;
+    out[6..8].copy_from_slice(&[0u8; 2]); // reserved
+    out[8..16].copy_from_slice(&msg.batch_id.to_le_bytes());
+}
+
+#[cfg(test)]
+mod batch_boundary_tests {
+    use super::*;
+    use crate::protocol::dob::constants::{BATCH_BOUNDARY_SIZE, MSG_TYPE_BATCH_BOUNDARY};
+
+    #[test]
+    fn round_trip_batch_boundary_open() {
+        let msg = BatchBoundary { channel_id: 3, phase: 0, batch_id: 999_888_777 };
+        let mut buf = [0u8; BATCH_BOUNDARY_SIZE];
+        encode_batch_boundary(&mut buf, &msg);
+
+        assert_eq!(buf[0], MSG_TYPE_BATCH_BOUNDARY);
+        assert_eq!(buf[1], BATCH_BOUNDARY_SIZE as u8);
+        assert_eq!(buf[4], 3);
+        assert_eq!(buf[5], 0);
+        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 999_888_777);
+    }
+
+    #[test]
+    fn round_trip_batch_boundary_close() {
+        let msg = BatchBoundary { channel_id: 3, phase: 1, batch_id: 999_888_777 };
+        let mut buf = [0u8; BATCH_BOUNDARY_SIZE];
+        encode_batch_boundary(&mut buf, &msg);
+        assert_eq!(buf[5], 1, "close phase");
+    }
+}
