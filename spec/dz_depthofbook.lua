@@ -159,11 +159,11 @@ f.so_price        = ProtoField.int64 ("dz_dob.so.price",          "Price")
 f.so_quantity     = ProtoField.uint64("dz_dob.so.quantity",       "Quantity")
 
 -- SnapshotEnd (0x22) — phase 2
+-- 20 bytes total: header(4) + inst_id(4) + source_id(2) + reserved(2) + reset_seq(4) + checksum(4)
 f.se_inst_id      = ProtoField.uint32("dz_dob.se.instrument_id",  "Instrument ID",  base.DEC)
 f.se_source_id    = ProtoField.uint16("dz_dob.se.source_id",      "Source ID",      base.DEC)
 f.se_reset_seq    = ProtoField.uint32("dz_dob.se.reset_seq",      "Reset Seq",      base.DEC)
 f.se_checksum     = ProtoField.uint32("dz_dob.se.checksum",       "Checksum",       base.HEX)
-f.se_timestamp    = ProtoField.uint64("dz_dob.se.timestamp_ns",   "Timestamp",      base.DEC)
 
 -- ============================================================================
 -- Constants
@@ -405,14 +405,9 @@ local function dissect_snapshot_order(body, subtree)
 end
 
 local function dissect_snapshot_end(body, subtree)
-    -- Phase 2 message.
+    -- Phase 2 message. 20 bytes total.
     -- [4..8]: inst_id  [8..10]: source_id  [10..12]: reserved
-    -- [12..16]: reset_seq  [16..20]: checksum  [20..28]: timestamp_ns [28..32]: reserved
-    -- Wait, total is 20 bytes. Let me re-derive:
-    -- header(4) + inst_id(4) + source_id(2) + reserved(2) + reset_seq(4) + checksum(4) + timestamp(4)... = 24
-    -- Actually SNAPSHOT_END_SIZE=20, so body=16 bytes after header.
-    -- [4..8]: inst_id  [8..10]: source_id  [10..12]: reserved
-    -- [12..16]: reset_seq  [16..20]: checksum  (no timestamp fits in 20 total)
+    -- [12..16]: reset_seq  [16..20]: checksum
     subtree:add_le(f.se_inst_id,   body(4, 4))
     subtree:add_le(f.se_source_id, body(8, 2))
     subtree:add_le(f.se_reset_seq, body(12, 4))
