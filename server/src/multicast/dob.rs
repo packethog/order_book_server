@@ -222,6 +222,293 @@ mod tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DoB Refdata task — Task 13
+// ---------------------------------------------------------------------------
+
+/// Configuration for the DoB refdata multicast task.
+#[derive(Debug, Clone)]
+pub struct DobRefdataConfig {
+    pub group_addr: Ipv4Addr,
+    pub port: u16,
+    pub bind_addr: Ipv4Addr,
+    pub channel_id: u8,
+    pub mtu: u16,
+    /// How long a full InstrumentDefinition retransmission cycle takes.
+    pub definition_cycle: Duration,
+    /// How often to emit a ManifestSummary heartbeat.
+    pub manifest_cadence: Duration,
+}
+
+/// Runs the DoB refdata emitter loop.
+///
+/// Periodically emits:
+/// - `InstrumentDefinition` retransmissions (one full cycle per `definition_cycle`).
+/// - `ManifestSummary` heartbeats (one per `manifest_cadence`).
+///
+/// Both streams are packed into DoB frames and sent to the configured multicast group/port.
+/// Runs until the task is cancelled (or an I/O error occurs).
+pub async fn run_dob_refdata_task(
+    config: DobRefdataConfig,
+    registry: crate::instruments::InstrumentRegistry,
+) -> std::io::Result<()> {
+    // Bind the UDP socket and point it at the multicast group.
+    let socket = UdpSocket::bind(SocketAddrV4::new(config.bind_addr, 0)).await?;
+    socket.set_multicast_loop_v4(false)?;
+    socket.set_multicast_ttl_v4(1)?;
+    socket.connect(SocketAddrV4::new(config.group_addr, config.port)).await?;
+
+    let mut seq: u64 = 0;
+    let reset_count: u8 = 0;
+
+    // Helper: advance and return the next sequence number.
+    let mut next_seq = || {
+        seq = seq.wrapping_add(1);
+        seq
+    };
+
+    let mut definition_ticker = interval(config.definition_cycle);
+    definition_ticker.tick().await; // consume the immediate first tick
+
+    let mut manifest_ticker = interval(config.manifest_cadence);
+    manifest_ticker.tick().await; // consume the immediate first tick
+
+    loop {
+        tokio::select! {
+            _ = definition_ticker.tick() => {
+                // Take a single read-lock snapshot of all active instruments.
+                let (snapshot, manifest_seq) = {
+                    let guard = registry.shared();
+                    let state = guard.read().await;
+                    let snap: Vec<(String, crate::instruments::InstrumentInfo)> =
+                        state.active.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    let seq_tag = state.manifest_seq;
+                    (snap, seq_tag)
+                };
+
+                if snapshot.is_empty() {
+                    continue;
+                }
+
+                let now = now_ns();
+                let mut fb = DobFrameBuilder::new(
+                    config.channel_id, next_seq(), now, reset_count, config.mtu,
+                );
+
+                for (coin, info) in &snapshot {
+                    let data = build_refdata_instrument_definition(coin, info, manifest_seq);
+                    match fb.message_buffer(crate::protocol::dob::constants::INSTRUMENT_DEF_SIZE) {
+                        Ok(buf) => {
+                            crate::protocol::dob::messages::encode_instrument_definition(buf, &data, 0);
+                            fb.commit_message();
+                        }
+                        Err(_) => {
+                            // Frame full — flush and open a new one.
+                            if !fb.is_empty() {
+                                let frame = fb.finalize();
+                                socket.send(frame).await?;
+                            }
+                            let now2 = now_ns();
+                            fb = DobFrameBuilder::new(
+                                config.channel_id, next_seq(), now2, reset_count, config.mtu,
+                            );
+                            let buf = fb
+                                .message_buffer(crate::protocol::dob::constants::INSTRUMENT_DEF_SIZE)
+                                .expect("InstrumentDefinition fits in a fresh frame");
+                            crate::protocol::dob::messages::encode_instrument_definition(buf, &data, 0);
+                            fb.commit_message();
+                        }
+                    }
+                }
+
+                // Flush any partial final frame.
+                if !fb.is_empty() {
+                    let frame = fb.finalize();
+                    socket.send(frame).await?;
+                }
+            }
+
+            _ = manifest_ticker.tick() => {
+                // Collect stats under a single short read-lock.
+                let (manifest_seq, instrument_count) = {
+                    let guard = registry.shared();
+                    let state = guard.read().await;
+                    let seq_tag = state.manifest_seq;
+                    let count = u32::try_from(state.active.len()).unwrap_or(u32::MAX);
+                    (seq_tag, count)
+                };
+
+                let now = now_ns();
+                let mut fb = DobFrameBuilder::new(
+                    config.channel_id, next_seq(), now, reset_count, config.mtu,
+                );
+                let buf = fb
+                    .message_buffer(crate::protocol::dob::constants::MANIFEST_SUMMARY_SIZE)
+                    .expect("ManifestSummary fits in a fresh frame");
+                crate::protocol::dob::messages::encode_manifest_summary(
+                    buf,
+                    config.channel_id,
+                    manifest_seq,
+                    instrument_count,
+                    now,
+                );
+                fb.commit_message();
+                let frame = fb.finalize();
+                socket.send(frame).await?;
+            }
+        }
+    }
+}
+
+/// Builds an `InstrumentDefinitionData` for the given instrument.
+/// Mirrors `build_instrument_definition` in `multicast/publisher.rs` but is
+/// local to the DoB refdata task so we don't depend on a private function.
+fn build_refdata_instrument_definition(
+    coin: &str,
+    info: &crate::instruments::InstrumentInfo,
+    manifest_seq: u16,
+) -> crate::protocol::messages::InstrumentDefinitionData {
+    use crate::protocol::constants::{
+        ASSET_CLASS_CRYPTO_SPOT, MARKET_MODEL_CLOB, PRICE_BOUND_UNBOUNDED, SETTLE_TYPE_NA,
+    };
+
+    let (leg1_str, leg2_str) = refdata_split_legs(coin);
+    let leg1 = refdata_make_leg(leg1_str);
+    let leg2 = refdata_make_leg(leg2_str);
+
+    crate::protocol::messages::InstrumentDefinitionData {
+        instrument_id: info.instrument_id,
+        symbol: info.symbol,
+        leg1,
+        leg2,
+        asset_class: ASSET_CLASS_CRYPTO_SPOT,
+        price_exponent: info.price_exponent,
+        qty_exponent: info.qty_exponent,
+        market_model: MARKET_MODEL_CLOB,
+        tick_size: 0,
+        lot_size: 0,
+        contract_value: 0,
+        expiry: 0,
+        settle_type: SETTLE_TYPE_NA,
+        price_bound: PRICE_BOUND_UNBOUNDED,
+        manifest_seq,
+    }
+}
+
+fn refdata_split_legs(coin: &str) -> (&str, &str) {
+    if let Some((a, b)) = coin.split_once('/') {
+        (a, b)
+    } else if let Some((a, b)) = coin.split_once('-') {
+        (a, b)
+    } else {
+        (coin, "")
+    }
+}
+
+fn refdata_make_leg(name: &str) -> [u8; 8] {
+    let mut buf = [0u8; 8];
+    let bytes = name.as_bytes();
+    let len = bytes.len().min(8);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    buf
+}
+
+#[inline]
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod refdata_tests {
+    use super::*;
+    use crate::instruments::{InstrumentInfo, InstrumentRegistry, RegistryState, UniverseEntry, make_symbol};
+    use std::net::Ipv4Addr;
+
+    fn test_registry() -> InstrumentRegistry {
+        let universe = vec![
+            UniverseEntry {
+                instrument_id: 0,
+                coin: "BTC".to_string(),
+                is_delisted: false,
+                info: InstrumentInfo {
+                    instrument_id: 0,
+                    price_exponent: -1,
+                    qty_exponent: -5,
+                    symbol: make_symbol("BTC"),
+                },
+            },
+            UniverseEntry {
+                instrument_id: 1,
+                coin: "ETH".to_string(),
+                is_delisted: false,
+                info: InstrumentInfo {
+                    instrument_id: 1,
+                    price_exponent: -2,
+                    qty_exponent: -4,
+                    symbol: make_symbol("ETH"),
+                },
+            },
+        ];
+        InstrumentRegistry::new(RegistryState::new(universe))
+    }
+
+    async fn bind_receiver() -> (UdpSocket, SocketAddrV4) {
+        let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = match sock.local_addr().unwrap() {
+            std::net::SocketAddr::V4(a) => a,
+            _ => unreachable!(),
+        };
+        (sock, addr)
+    }
+
+    #[tokio::test]
+    async fn refdata_emits_on_wire() {
+        use crate::protocol::dob::constants::DEFAULT_MTU;
+
+        let (recv, recv_addr) = bind_receiver().await;
+        let registry = test_registry();
+
+        let config = DobRefdataConfig {
+            group_addr: *recv_addr.ip(),
+            port: recv_addr.port(),
+            bind_addr: Ipv4Addr::LOCALHOST,
+            channel_id: 2,
+            mtu: DEFAULT_MTU,
+            // Long cycle so we only see the ManifestSummary in the test window.
+            definition_cycle: Duration::from_secs(60),
+            manifest_cadence: Duration::from_millis(50),
+        };
+
+        let task = tokio::spawn(run_dob_refdata_task(config, registry));
+
+        let mut buf = [0u8; 2048];
+        let n = tokio::time::timeout(Duration::from_secs(2), recv.recv(&mut buf))
+            .await
+            .expect("timed out waiting for refdata packet")
+            .expect("recv error");
+
+        // Every DoB frame starts with magic [0x44, 0x44].
+        assert_eq!(&buf[0..2], &[0x44, 0x44], "DoB magic on wire");
+
+        // The first app message type byte is at offset FRAME_HEADER_SIZE.
+        // Accept either InstrumentDefinition (0x02) or ManifestSummary (0x07).
+        use crate::protocol::dob::constants::{
+            FRAME_HEADER_SIZE, MSG_TYPE_INSTRUMENT_DEF, MSG_TYPE_MANIFEST_SUMMARY,
+        };
+        assert!(n >= FRAME_HEADER_SIZE + 1, "frame too short to contain a message type");
+        let msg_type = buf[FRAME_HEADER_SIZE];
+        assert!(
+            msg_type == MSG_TYPE_INSTRUMENT_DEF || msg_type == MSG_TYPE_MANIFEST_SUMMARY,
+            "unexpected message type byte: 0x{msg_type:02X}",
+        );
+
+        task.abort();
+    }
+}
+
 #[cfg(test)]
 mod emitter_tests {
     use super::*;
