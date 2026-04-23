@@ -277,6 +277,8 @@ pub(crate) struct OrderBookListener {
     // Timestamps from the most recently deserialized batch (for latency tracking)
     last_batch_block_time_ms: Option<u64>,
     last_batch_local_time_ms: Option<u64>,
+    // Held until the first snapshot is ready, then attached to the state.
+    pending_dob_tap: Option<dob_tap::DobApplyTap>,
 }
 
 impl OrderBookListener {
@@ -294,6 +296,7 @@ impl OrderBookListener {
             order_status_cache: BatchQueue::new(),
             last_batch_block_time_ms: None,
             last_batch_local_time_ms: None,
+            pending_dob_tap: None,
         }
     }
 
@@ -314,6 +317,17 @@ impl OrderBookListener {
 
     pub(crate) fn universe(&self) -> HashSet<Coin> {
         self.order_book_state.as_ref().map_or_else(HashSet::new, OrderBookState::compute_universe)
+    }
+
+    /// Attaches a `DobApplyTap` to the book state. If the snapshot has not yet
+    /// arrived, stores the tap as pending; it will be attached when the first
+    /// snapshot is ready.
+    pub(crate) fn set_dob_tap(&mut self, tap: dob_tap::DobApplyTap) {
+        if let Some(state) = self.order_book_state.as_mut() {
+            state.attach_dob_tap(tap);
+        } else {
+            self.pending_dob_tap = Some(tap);
+        }
     }
 
     #[allow(clippy::type_complexity)]
@@ -447,6 +461,9 @@ impl OrderBookListener {
             }
         }
         if !retry {
+            if let Some(tap) = self.pending_dob_tap.take() {
+                new_order_book.attach_dob_tap(tap);
+            }
             self.order_book_state = Some(new_order_book);
             info!("Order book ready");
         }
