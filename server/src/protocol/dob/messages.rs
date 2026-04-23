@@ -174,3 +174,71 @@ mod order_cancel_tests {
         assert_eq!(u64::from_le_bytes(buf[24..32].try_into().unwrap()), 1_700_000_000_000_000_000);
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct OrderExecute {
+    pub instrument_id: u32,
+    pub source_id: u16,
+    pub aggressor_side: u8,
+    pub exec_flags: u8,
+    pub per_instrument_seq: u32,
+    pub order_id: u64,
+    pub trade_id: u64,
+    pub timestamp_ns: u64,
+    pub exec_price: i64,
+    pub exec_quantity: u64,
+}
+
+pub fn encode_order_execute(out: &mut [u8], msg: &OrderExecute) {
+    use crate::protocol::dob::constants::{MSG_TYPE_ORDER_EXECUTE, ORDER_EXECUTE_SIZE};
+    assert_eq!(out.len(), ORDER_EXECUTE_SIZE, "OrderExecute buffer size mismatch");
+
+    out[0] = MSG_TYPE_ORDER_EXECUTE;
+    out[1] = ORDER_EXECUTE_SIZE as u8;
+    out[2..4].copy_from_slice(&0u16.to_le_bytes());
+    out[4..8].copy_from_slice(&msg.instrument_id.to_le_bytes());
+    out[8..10].copy_from_slice(&msg.source_id.to_le_bytes());
+    out[10] = msg.aggressor_side;
+    out[11] = msg.exec_flags;
+    out[12..16].copy_from_slice(&msg.per_instrument_seq.to_le_bytes());
+    out[16..24].copy_from_slice(&msg.order_id.to_le_bytes());
+    out[24..32].copy_from_slice(&msg.trade_id.to_le_bytes());
+    out[32..40].copy_from_slice(&msg.timestamp_ns.to_le_bytes());
+    out[40..48].copy_from_slice(&msg.exec_price.to_le_bytes());
+    out[48..56].copy_from_slice(&msg.exec_quantity.to_le_bytes());
+}
+
+#[cfg(test)]
+mod order_execute_tests {
+    use super::*;
+    use crate::protocol::dob::constants::{AGGRESSOR_BUY, MSG_TYPE_ORDER_EXECUTE, ORDER_EXECUTE_SIZE};
+
+    #[test]
+    fn round_trip_order_execute() {
+        let msg = OrderExecute {
+            instrument_id: 42,
+            source_id: 1,
+            aggressor_side: AGGRESSOR_BUY,
+            exec_flags: 0,
+            per_instrument_seq: 777,
+            order_id: 0xAAAA_BBBB_CCCC_DDDD,
+            trade_id: 0x1111_2222_3333_4444,
+            timestamp_ns: 1_700_000_000_000_000_000,
+            exec_price: 12_345_678,
+            exec_quantity: 999_999,
+        };
+        let mut buf = [0u8; ORDER_EXECUTE_SIZE];
+        encode_order_execute(&mut buf, &msg);
+
+        assert_eq!(buf[0], MSG_TYPE_ORDER_EXECUTE);
+        assert_eq!(buf[1], ORDER_EXECUTE_SIZE as u8);
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 42);
+        assert_eq!(buf[10], AGGRESSOR_BUY);
+        assert_eq!(buf[11], 0);
+        assert_eq!(u32::from_le_bytes(buf[12..16].try_into().unwrap()), 777);
+        assert_eq!(u64::from_le_bytes(buf[16..24].try_into().unwrap()), 0xAAAA_BBBB_CCCC_DDDD);
+        assert_eq!(u64::from_le_bytes(buf[24..32].try_into().unwrap()), 0x1111_2222_3333_4444);
+        assert_eq!(i64::from_le_bytes(buf[40..48].try_into().unwrap()), 12_345_678);
+        assert_eq!(u64::from_le_bytes(buf[48..56].try_into().unwrap()), 999_999);
+    }
+}
