@@ -19,6 +19,7 @@ use crate::{
     },
     types::inner::InnerL4Order,
 };
+use tokio::sync::mpsc::error::TrySendError;
 
 pub(crate) struct DobApplyTap {
     sender: DobEventSender,
@@ -110,8 +111,14 @@ impl DobApplyTap {
     }
 
     fn try_send(&self, event: DobEvent, label: &'static str) {
-        if let Err(e) = self.sender.try_send(event) {
-            log::warn!("dob_tap: channel full, dropping {label}: {e}");
+        match self.sender.try_send(event) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                log::warn!("dob_tap: channel full, dropping {label}");
+            }
+            Err(TrySendError::Closed(_)) => {
+                log::error!("dob_tap: emitter channel closed, dropping {label}");
+            }
         }
     }
 }
