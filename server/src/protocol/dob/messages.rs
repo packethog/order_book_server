@@ -116,3 +116,61 @@ mod order_add_tests {
         encode_order_add(&mut buf, &msg);
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct OrderCancel {
+    pub instrument_id: u32,
+    pub source_id: u16,
+    pub reason: u8,
+    pub per_instrument_seq: u32,
+    pub order_id: u64,
+    pub timestamp_ns: u64,
+}
+
+pub fn encode_order_cancel(out: &mut [u8], msg: &OrderCancel) {
+    use crate::protocol::dob::constants::{MSG_TYPE_ORDER_CANCEL, ORDER_CANCEL_SIZE};
+    assert_eq!(out.len(), ORDER_CANCEL_SIZE, "OrderCancel buffer size mismatch");
+
+    out[0] = MSG_TYPE_ORDER_CANCEL;
+    out[1] = ORDER_CANCEL_SIZE as u8;
+    out[2..4].copy_from_slice(&0u16.to_le_bytes());
+    out[4..8].copy_from_slice(&msg.instrument_id.to_le_bytes());
+    out[8..10].copy_from_slice(&msg.source_id.to_le_bytes());
+    out[10] = msg.reason;
+    out[11] = 0; // reserved
+    out[12..16].copy_from_slice(&msg.per_instrument_seq.to_le_bytes());
+    out[16..24].copy_from_slice(&msg.order_id.to_le_bytes());
+    out[24..32].copy_from_slice(&msg.timestamp_ns.to_le_bytes());
+}
+
+#[cfg(test)]
+mod order_cancel_tests {
+    use super::*;
+    use crate::protocol::dob::constants::{
+        CANCEL_REASON_USER_CANCEL, MSG_TYPE_ORDER_CANCEL, ORDER_CANCEL_SIZE,
+    };
+
+    #[test]
+    fn round_trip_order_cancel() {
+        let msg = OrderCancel {
+            instrument_id: 7,
+            source_id: 1,
+            reason: CANCEL_REASON_USER_CANCEL,
+            per_instrument_seq: 999,
+            order_id: 0x1234_5678_9ABC_DEF0,
+            timestamp_ns: 1_700_000_000_000_000_000,
+        };
+        let mut buf = [0u8; ORDER_CANCEL_SIZE];
+        encode_order_cancel(&mut buf, &msg);
+
+        assert_eq!(buf[0], MSG_TYPE_ORDER_CANCEL);
+        assert_eq!(buf[1], ORDER_CANCEL_SIZE as u8);
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 7);
+        assert_eq!(u16::from_le_bytes(buf[8..10].try_into().unwrap()), 1);
+        assert_eq!(buf[10], CANCEL_REASON_USER_CANCEL);
+        assert_eq!(buf[11], 0, "reserved");
+        assert_eq!(u32::from_le_bytes(buf[12..16].try_into().unwrap()), 999);
+        assert_eq!(u64::from_le_bytes(buf[16..24].try_into().unwrap()), 0x1234_5678_9ABC_DEF0);
+        assert_eq!(u64::from_le_bytes(buf[24..32].try_into().unwrap()), 1_700_000_000_000_000_000);
+    }
+}
