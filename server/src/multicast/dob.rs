@@ -14,7 +14,7 @@ use tokio::time::interval;
 use crate::multicast::publisher::{split_legs, make_leg};
 
 use crate::protocol::dob::constants::{
-    BATCH_BOUNDARY_SIZE, DEFAULT_MTU, FRAME_HEADER_SIZE, HEARTBEAT_SIZE,
+    BATCH_BOUNDARY_SIZE, HEARTBEAT_SIZE,
     ORDER_ADD_SIZE, ORDER_CANCEL_SIZE, ORDER_EXECUTE_SIZE,
 };
 use crate::protocol::dob::frame::DobFrameBuilder;
@@ -489,6 +489,7 @@ mod refdata_tests {
 #[cfg(test)]
 mod emitter_tests {
     use super::*;
+    use crate::protocol::dob::constants::{DEFAULT_MTU, FRAME_HEADER_SIZE};
 
     fn sample_order_add(seq: u32) -> OrderAdd {
         OrderAdd {

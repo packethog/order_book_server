@@ -48,11 +48,11 @@ impl MulticastConfig {
 /// Configuration for the DoB (depth-of-book) UDP multicast channel.
 #[derive(Debug, Clone)]
 pub struct DobConfig {
-    pub group_addr: std::net::Ipv4Addr,
+    pub group_addr: Ipv4Addr,
     pub mktdata_port: u16,
     pub refdata_port: u16,
     pub snapshot_port: u16, // bound in phase 2; still parsed in phase 1 for stability
-    pub bind_addr: std::net::Ipv4Addr,
+    pub bind_addr: Ipv4Addr,
     pub channel_id: u8,
     pub source_id: u16,
     pub mtu: u16,
