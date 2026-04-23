@@ -104,6 +104,21 @@ cargo run --release --bin example_multicast_subscriber -- \
 
 This joins the multicast group and prints received datagrams to stdout.
 
+## Wireshark dissectors
+
+Lua dissectors for DZ-TOB and DZ-DoB live under `spec/`. To install:
+
+```bash
+mkdir -p ~/.local/lib/wireshark/plugins
+cp spec/dz_topofbook.lua spec/dz_depthofbook.lua ~/.local/lib/wireshark/plugins/
+```
+
+Then open a capture. The DZ-TOB dissector triggers on frame magic `0x445A`; the DZ-DoB dissector triggers on `0x4444`. Both support preference-based port registration (Edit → Preferences → Protocols → DZ-TOB / DZ-DoB) and ad-hoc loading:
+
+```bash
+tshark -X lua_script:spec/dz_depthofbook.lua -f "udp port 6000" -i lo
+```
+
 ## Caveats
 
 - This server does **not** show untriggered trigger orders.
