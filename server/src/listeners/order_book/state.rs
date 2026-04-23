@@ -134,6 +134,20 @@ impl OrderBookState {
                 }
             })
             .collect::<HashMap<_, _>>();
+
+        // Count how many diffs will be emitted as DoB events (same filter as the loop).
+        // If ≥ 2, wrap the block with BatchBoundary open/close.
+        let emittable_count = if self.dob_tap.is_some() {
+            diffs.iter().filter(|d| !(d.coin().is_spot() && self.ignore_spot)).count()
+        } else {
+            0
+        };
+        if emittable_count >= 2 {
+            if let Some(tap) = self.dob_tap.as_mut() {
+                tap.emit_batch_boundary(0 /* open */, height, time_ns);
+            }
+        }
+
         while let Some(diff) = diffs.pop_front() {
             let oid = diff.oid();
             let coin = diff.coin();
@@ -189,6 +203,13 @@ impl OrderBookState {
                 }
             }
         }
+
+        if emittable_count >= 2 {
+            if let Some(tap) = self.dob_tap.as_mut() {
+                tap.emit_batch_boundary(1 /* close */, height, time_ns);
+            }
+        }
+
         self.height += 1;
         self.time = time;
         self.snapped = false;

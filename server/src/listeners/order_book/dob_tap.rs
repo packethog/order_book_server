@@ -15,7 +15,7 @@ use crate::{
     },
     protocol::dob::{
         constants::{AGGRESSOR_UNKNOWN, CANCEL_REASON_UNKNOWN, SIDE_ASK, SIDE_BID},
-        messages::{OrderAdd, OrderCancel, OrderExecute},
+        messages::{BatchBoundary, OrderAdd, OrderCancel, OrderExecute},
     },
     types::inner::InnerL4Order,
 };
@@ -25,6 +25,7 @@ pub(crate) struct DobApplyTap {
     sender: DobEventSender,
     seq: PerInstrumentSeqCounter,
     source_id: u16,
+    channel_id: u8,
     coin_resolver: Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync>,
 }
 
@@ -33,9 +34,10 @@ impl DobApplyTap {
     pub(crate) fn new(
         sender: DobEventSender,
         source_id: u16,
+        channel_id: u8,
         coin_resolver: Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync>,
     ) -> Self {
-        Self { sender, seq: PerInstrumentSeqCounter::new(), source_id, coin_resolver }
+        Self { sender, seq: PerInstrumentSeqCounter::new(), source_id, channel_id, coin_resolver }
     }
 
     /// Emits an `OrderAdd` event for a newly resting order.
@@ -110,6 +112,14 @@ impl DobApplyTap {
         self.try_send(event, "OrderExecute");
     }
 
+    /// Emits a `BatchBoundary` event to mark the open (phase=0) or close (phase=1)
+    /// of a multi-event node block. `batch_id` is the block height.
+    pub(crate) fn emit_batch_boundary(&mut self, phase: u8, batch_id: u64, timestamp_ns: u64) {
+        let _ = timestamp_ns; // BatchBoundary wire format has no timestamp field
+        let msg = BatchBoundary { channel_id: self.channel_id, phase, batch_id };
+        self.try_send(DobEvent::BatchBoundary(msg), "BatchBoundary");
+    }
+
     fn try_send(&self, event: DobEvent, label: &'static str) {
         match self.sender.try_send(event) {
             Ok(()) => {}
@@ -163,7 +173,7 @@ mod tests {
     #[tokio::test]
     async fn emit_order_add_sends_order_add_event() {
         let (tx, mut rx) = channel(4);
-        let mut tap = DobApplyTap::new(tx, 1, btc_resolver());
+        let mut tap = DobApplyTap::new(tx, 1, 0, btc_resolver());
         let order = make_inner_order(42, Side::Bid, 100_000_000_000, 50_000_000);
 
         tap.emit_order_add(&btc_coin(), &order, 1_700_000_000_000_000_000);
@@ -188,7 +198,7 @@ mod tests {
     #[tokio::test]
     async fn emit_order_cancel_sends_order_cancel_event() {
         let (tx, mut rx) = channel(4);
-        let mut tap = DobApplyTap::new(tx, 2, btc_resolver());
+        let mut tap = DobApplyTap::new(tx, 2, 0, btc_resolver());
         let oid = Oid::new(99);
 
         tap.emit_order_cancel(&btc_coin(), oid, 1_700_000_000_000_000_001);
@@ -210,7 +220,7 @@ mod tests {
     #[tokio::test]
     async fn emit_order_execute_sends_order_execute_event() {
         let (tx, mut rx) = channel(4);
-        let mut tap = DobApplyTap::new(tx, 3, btc_resolver());
+        let mut tap = DobApplyTap::new(tx, 3, 0, btc_resolver());
         let oid = Oid::new(77);
         let exec_price = Px::new(200_000_000_000);
         let exec_quantity = Sz::new(10_000_000);
@@ -238,7 +248,7 @@ mod tests {
     #[tokio::test]
     async fn per_instrument_seq_advances_across_events() {
         let (tx, mut rx) = channel(16);
-        let mut tap = DobApplyTap::new(tx, 1, btc_resolver());
+        let mut tap = DobApplyTap::new(tx, 1, 0, btc_resolver());
         let coin = btc_coin();
 
         // Three different event types for instrument 0 (BTC)
@@ -262,7 +272,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_coin_skips_without_send() {
         let (tx, mut rx) = channel(4);
-        let mut tap = DobApplyTap::new(tx, 1, btc_resolver());
+        let mut tap = DobApplyTap::new(tx, 1, 0, btc_resolver());
         let unknown_coin = Coin::new("ETH");
         let order = make_inner_order(1, Side::Bid, 100, 10);
 
@@ -270,5 +280,25 @@ mod tests {
 
         // Channel should be empty — nothing was sent
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn emit_batch_boundary_sends_event() {
+        let (tx, mut rx) = channel(4);
+        let mut tap = DobApplyTap::new(
+            tx,
+            /* source_id */ 1,
+            /* channel_id */ 7,
+            btc_resolver(),
+        );
+        tap.emit_batch_boundary(0, 999, 1_700_000_000_000_000_000);
+        match rx.recv().await.unwrap() {
+            DobEvent::BatchBoundary(msg) => {
+                assert_eq!(msg.channel_id, 7);
+                assert_eq!(msg.phase, 0);
+                assert_eq!(msg.batch_id, 999);
+            }
+            other => panic!("expected BatchBoundary, got {:?}", other),
+        }
     }
 }
