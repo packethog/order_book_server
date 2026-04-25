@@ -410,3 +410,95 @@ mod snapshot_begin_tests {
         );
     }
 }
+
+/// 0x21 SnapshotOrder — one resting order in a snapshot. Same per-order
+/// fields as `OrderAdd` but no `Per-Instrument Seq` (snapshot is a state
+/// dump, not a delta) and no `Instrument ID` (implied by the containing
+/// `SnapshotBegin`). Carries the `snapshot_id` so subscribers can discard
+/// orders that don't belong to the currently-open snapshot.
+#[derive(Debug, Clone, Copy)]
+pub struct SnapshotOrder {
+    pub snapshot_id: u32,
+    pub order_id: u64,
+    pub side: u8,
+    pub order_flags: u8,
+    pub enter_timestamp_ns: u64,
+    pub price: i64,
+    pub quantity: u64,
+}
+
+pub fn encode_snapshot_order(out: &mut [u8], msg: &SnapshotOrder) {
+    use crate::protocol::dob::constants::{
+        FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_ORDER, SNAPSHOT_ORDER_SIZE,
+    };
+    assert_eq!(out.len(), SNAPSHOT_ORDER_SIZE, "SnapshotOrder buffer size mismatch");
+
+    out[0] = MSG_TYPE_SNAPSHOT_ORDER;
+    out[1] = SNAPSHOT_ORDER_SIZE as u8;
+    out[2..4].copy_from_slice(&FLAG_SNAPSHOT.to_le_bytes());
+    out[4..8].copy_from_slice(&msg.snapshot_id.to_le_bytes());
+    out[8..16].copy_from_slice(&msg.order_id.to_le_bytes());
+    out[16] = msg.side;
+    out[17] = msg.order_flags;
+    out[18..20].copy_from_slice(&[0u8; 2]); // reserved
+    out[20..28].copy_from_slice(&msg.enter_timestamp_ns.to_le_bytes());
+    out[28..36].copy_from_slice(&msg.price.to_le_bytes());
+    out[36..44].copy_from_slice(&msg.quantity.to_le_bytes());
+}
+
+#[cfg(test)]
+mod snapshot_order_tests {
+    use super::*;
+    use crate::protocol::dob::constants::{
+        FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_ORDER, ORDER_FLAG_POST_ONLY, SIDE_ASK,
+        SNAPSHOT_ORDER_SIZE,
+    };
+
+    #[test]
+    fn round_trip_snapshot_order() {
+        let msg = SnapshotOrder {
+            snapshot_id: 0x0405_0607,
+            order_id: 0xDEAD_BEEF_CAFE_BABE,
+            side: SIDE_ASK,
+            order_flags: ORDER_FLAG_POST_ONLY,
+            enter_timestamp_ns: 1_700_000_000_000_000_001,
+            price: -12_345_678,
+            quantity: 98_765_432,
+        };
+        let mut buf = [0u8; SNAPSHOT_ORDER_SIZE];
+        encode_snapshot_order(&mut buf, &msg);
+
+        assert_eq!(buf[0], MSG_TYPE_SNAPSHOT_ORDER, "type");
+        assert_eq!(buf[1] as usize, SNAPSHOT_ORDER_SIZE, "length");
+        assert_eq!(&buf[2..4], &FLAG_SNAPSHOT.to_le_bytes(), "flags");
+        assert_eq!(&buf[2..4], &[0x01, 0x00], "flags bytes");
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            0x0405_0607,
+            "snapshot_id"
+        );
+        assert_eq!(
+            u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            0xDEAD_BEEF_CAFE_BABE,
+            "order_id"
+        );
+        assert_eq!(buf[16], SIDE_ASK, "side");
+        assert_eq!(buf[17], ORDER_FLAG_POST_ONLY, "order_flags");
+        assert_eq!(&buf[18..20], &[0, 0], "reserved");
+        assert_eq!(
+            u64::from_le_bytes(buf[20..28].try_into().unwrap()),
+            1_700_000_000_000_000_001,
+            "enter_timestamp_ns"
+        );
+        assert_eq!(
+            i64::from_le_bytes(buf[28..36].try_into().unwrap()),
+            -12_345_678,
+            "price (negative, exercises i64 sign)"
+        );
+        assert_eq!(
+            u64::from_le_bytes(buf[36..44].try_into().unwrap()),
+            98_765_432,
+            "quantity"
+        );
+    }
+}
