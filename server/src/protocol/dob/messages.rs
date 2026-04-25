@@ -289,3 +289,58 @@ mod batch_boundary_tests {
         assert_eq!(buf[5], 1, "close phase");
     }
 }
+
+/// 0x14 InstrumentReset — publisher-side per-coin resync signal on mktdata.
+/// Subscribers discard state for `instrument_id`, discard buffered deltas with
+/// `mktdata_seq <= new_anchor_seq`, and await a snapshot with
+/// `Anchor Seq == new_anchor_seq` on the snapshot port.
+#[derive(Debug, Clone, Copy)]
+pub struct InstrumentReset {
+    pub instrument_id: u32,
+    pub reason: u8,
+    pub new_anchor_seq: u64,
+    pub timestamp_ns: u64,
+}
+
+pub fn encode_instrument_reset(out: &mut [u8], msg: &InstrumentReset) {
+    use crate::protocol::dob::constants::{INSTRUMENT_RESET_SIZE, MSG_TYPE_INSTRUMENT_RESET};
+    assert_eq!(out.len(), INSTRUMENT_RESET_SIZE, "InstrumentReset buffer size mismatch");
+
+    out[0] = MSG_TYPE_INSTRUMENT_RESET;
+    out[1] = INSTRUMENT_RESET_SIZE as u8;
+    out[2..4].copy_from_slice(&0u16.to_le_bytes()); // flags = 0
+    out[4..8].copy_from_slice(&msg.instrument_id.to_le_bytes());
+    out[8] = msg.reason;
+    out[9..12].copy_from_slice(&[0u8; 3]); // reserved
+    out[12..20].copy_from_slice(&msg.new_anchor_seq.to_le_bytes());
+    out[20..28].copy_from_slice(&msg.timestamp_ns.to_le_bytes());
+}
+
+#[cfg(test)]
+mod instrument_reset_tests {
+    use super::*;
+    use crate::protocol::dob::constants::{
+        INSTRUMENT_RESET_SIZE, MSG_TYPE_INSTRUMENT_RESET, RESET_REASON_PUBLISHER_INCONSISTENCY,
+    };
+
+    #[test]
+    fn round_trip_instrument_reset() {
+        let msg = InstrumentReset {
+            instrument_id: 42,
+            reason: RESET_REASON_PUBLISHER_INCONSISTENCY,
+            new_anchor_seq: 0x1122_3344_5566_7788,
+            timestamp_ns: 1_700_000_000_000_000_000,
+        };
+        let mut buf = [0u8; INSTRUMENT_RESET_SIZE];
+        encode_instrument_reset(&mut buf, &msg);
+
+        assert_eq!(buf[0], MSG_TYPE_INSTRUMENT_RESET);
+        assert_eq!(buf[1] as usize, INSTRUMENT_RESET_SIZE);
+        assert_eq!(u16::from_le_bytes(buf[2..4].try_into().unwrap()), 0, "flags");
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 42);
+        assert_eq!(buf[8], RESET_REASON_PUBLISHER_INCONSISTENCY);
+        assert_eq!(&buf[9..12], &[0, 0, 0], "reserved");
+        assert_eq!(u64::from_le_bytes(buf[12..20].try_into().unwrap()), 0x1122_3344_5566_7788);
+        assert_eq!(u64::from_le_bytes(buf[20..28].try_into().unwrap()), 1_700_000_000_000_000_000);
+    }
+}
