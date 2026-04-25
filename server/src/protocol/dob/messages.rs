@@ -502,3 +502,67 @@ mod snapshot_order_tests {
         );
     }
 }
+
+/// 0x22 SnapshotEnd — close of a per-instrument snapshot group on the
+/// `snapshot` port. Carries the same `instrument_id`, `anchor_seq`, and
+/// `snapshot_id` as the bracketing `SnapshotBegin` so subscribers can
+/// confirm the pair before applying the contained `SnapshotOrder` messages.
+#[derive(Debug, Clone, Copy)]
+pub struct SnapshotEnd {
+    pub instrument_id: u32,
+    pub anchor_seq: u64,
+    pub snapshot_id: u32,
+}
+
+pub fn encode_snapshot_end(out: &mut [u8], msg: &SnapshotEnd) {
+    use crate::protocol::dob::constants::{
+        FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_END, SNAPSHOT_END_SIZE,
+    };
+    assert_eq!(out.len(), SNAPSHOT_END_SIZE, "SnapshotEnd buffer size mismatch");
+
+    out[0] = MSG_TYPE_SNAPSHOT_END;
+    out[1] = SNAPSHOT_END_SIZE as u8;
+    out[2..4].copy_from_slice(&FLAG_SNAPSHOT.to_le_bytes());
+    out[4..8].copy_from_slice(&msg.instrument_id.to_le_bytes());
+    out[8..16].copy_from_slice(&msg.anchor_seq.to_le_bytes());
+    out[16..20].copy_from_slice(&msg.snapshot_id.to_le_bytes());
+}
+
+#[cfg(test)]
+mod snapshot_end_tests {
+    use super::*;
+    use crate::protocol::dob::constants::{
+        FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_END, SNAPSHOT_END_SIZE,
+    };
+
+    #[test]
+    fn round_trip_snapshot_end() {
+        let msg = SnapshotEnd {
+            instrument_id: 0xAABB_CCDD,
+            anchor_seq: 0x1122_3344_5566_7788,
+            snapshot_id: 0x0405_0607,
+        };
+        let mut buf = [0u8; SNAPSHOT_END_SIZE];
+        encode_snapshot_end(&mut buf, &msg);
+
+        assert_eq!(buf[0], MSG_TYPE_SNAPSHOT_END, "type");
+        assert_eq!(buf[1] as usize, SNAPSHOT_END_SIZE, "length");
+        assert_eq!(&buf[2..4], &FLAG_SNAPSHOT.to_le_bytes(), "flags");
+        assert_eq!(&buf[2..4], &[0x01, 0x00], "flags bytes");
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            0xAABB_CCDD,
+            "instrument_id"
+        );
+        assert_eq!(
+            u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            0x1122_3344_5566_7788,
+            "anchor_seq"
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+            0x0405_0607,
+            "snapshot_id"
+        );
+    }
+}
