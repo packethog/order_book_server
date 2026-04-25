@@ -533,7 +533,7 @@ fn build_instrument_definition(coin: &str, info: &InstrumentInfo, manifest_seq: 
     }
 }
 
-fn split_legs(coin: &str) -> (&str, &str) {
+pub(crate) fn split_legs(coin: &str) -> (&str, &str) {
     if let Some((a, b)) = coin.split_once('/') {
         (a, b)
     } else if let Some((a, b)) = coin.split_once('-') {
@@ -543,7 +543,7 @@ fn split_legs(coin: &str) -> (&str, &str) {
     }
 }
 
-fn make_leg(name: &str) -> [u8; 8] {
+pub(crate) fn make_leg(name: &str) -> [u8; 8] {
     let mut buf = [0u8; 8];
     let bytes = name.as_bytes();
     let len = bytes.len().min(8);
