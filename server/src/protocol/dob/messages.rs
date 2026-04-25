@@ -344,3 +344,69 @@ mod instrument_reset_tests {
         assert_eq!(u64::from_le_bytes(buf[20..28].try_into().unwrap()), 1_700_000_000_000_000_000);
     }
 }
+
+/// 0x20 SnapshotBegin — start of a per-instrument snapshot group on the
+/// `snapshot` port. Anchored to a `mktdata`-port sequence number so subscribers
+/// can reconcile the snapshot stream with the delta stream.
+#[derive(Debug, Clone, Copy)]
+pub struct SnapshotBegin {
+    pub instrument_id: u32,
+    pub anchor_seq: u64,
+    pub total_orders: u32,
+    pub snapshot_id: u32,
+    pub last_instrument_seq: u32,
+    pub timestamp_ns: u64,
+}
+
+pub fn encode_snapshot_begin(out: &mut [u8], msg: &SnapshotBegin) {
+    use crate::protocol::dob::constants::{
+        FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_BEGIN, SNAPSHOT_BEGIN_SIZE,
+    };
+    assert_eq!(out.len(), SNAPSHOT_BEGIN_SIZE, "SnapshotBegin buffer size mismatch");
+
+    out[0] = MSG_TYPE_SNAPSHOT_BEGIN;
+    out[1] = SNAPSHOT_BEGIN_SIZE as u8;
+    out[2..4].copy_from_slice(&FLAG_SNAPSHOT.to_le_bytes());
+    out[4..8].copy_from_slice(&msg.instrument_id.to_le_bytes());
+    out[8..16].copy_from_slice(&msg.anchor_seq.to_le_bytes());
+    out[16..20].copy_from_slice(&msg.total_orders.to_le_bytes());
+    out[20..24].copy_from_slice(&msg.snapshot_id.to_le_bytes());
+    out[24..28].copy_from_slice(&msg.last_instrument_seq.to_le_bytes());
+    out[28..36].copy_from_slice(&msg.timestamp_ns.to_le_bytes());
+}
+
+#[cfg(test)]
+mod snapshot_begin_tests {
+    use super::*;
+    use crate::protocol::dob::constants::{
+        FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_BEGIN, SNAPSHOT_BEGIN_SIZE,
+    };
+
+    #[test]
+    fn round_trip_snapshot_begin() {
+        let msg = SnapshotBegin {
+            instrument_id: 0xAABB_CCDD,
+            anchor_seq: 0x1122_3344_5566_7788,
+            total_orders: 0x0001_0203,
+            snapshot_id: 0x0405_0607,
+            last_instrument_seq: 0x0809_0A0B,
+            timestamp_ns: 1_700_000_000_000_000_001,
+        };
+        let mut buf = [0u8; SNAPSHOT_BEGIN_SIZE];
+        encode_snapshot_begin(&mut buf, &msg);
+
+        assert_eq!(buf[0], MSG_TYPE_SNAPSHOT_BEGIN);
+        assert_eq!(buf[1] as usize, SNAPSHOT_BEGIN_SIZE);
+        assert_eq!(&buf[2..4], &FLAG_SNAPSHOT.to_le_bytes(), "flags");
+        assert_eq!(&buf[2..4], &[0x01, 0x00], "flags bytes");
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 0xAABB_CCDD);
+        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 0x1122_3344_5566_7788);
+        assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 0x0001_0203);
+        assert_eq!(u32::from_le_bytes(buf[20..24].try_into().unwrap()), 0x0405_0607);
+        assert_eq!(u32::from_le_bytes(buf[24..28].try_into().unwrap()), 0x0809_0A0B);
+        assert_eq!(
+            u64::from_le_bytes(buf[28..36].try_into().unwrap()),
+            1_700_000_000_000_000_001
+        );
+    }
+}
