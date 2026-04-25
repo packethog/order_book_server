@@ -72,6 +72,25 @@ impl<O: InnerOrder> OrderBooks<O> {
     pub(crate) fn modify_sz(&mut self, oid: Oid, coin: Coin, sz: Sz) -> Option<(Sz, Px)> {
         self.order_books.get_mut(&coin).and_then(|book| book.modify_sz(oid, sz))
     }
+
+    /// Returns a `Vec<O>` clone of `coin`'s resting orders in deterministic
+    /// iteration order, or `None` if the coin is absent.
+    ///
+    /// Iteration order matches `OrderBook::iter_orders`: bids first
+    /// (highest price descending), then asks (lowest price ascending), with
+    /// FIFO arrival order within each price level.
+    ///
+    /// Used by the DoB snapshot stream emitter: it calls this once per
+    /// per-instrument snapshot slot to obtain a consistent point-in-time view
+    /// of a coin's orders without holding the book lock for the duration of
+    /// emission. Iteration order MUST be deterministic so subscriber replay
+    /// tracking is reproducible.
+    pub(crate) fn clone_coin_orders(&self, coin: &Coin) -> Option<Vec<O>>
+    where
+        O: Clone,
+    {
+        self.order_books.get(coin).map(|book| book.iter_orders().cloned().collect())
+    }
 }
 
 impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
@@ -119,7 +138,7 @@ mod tests {
         order_book::{
             InnerOrder, OrderBook, Px, Side, Snapshot, Sz,
             levels::build_l2_level,
-            multi_book::{Coin, Snapshots, load_snapshots_from_json, load_snapshots_from_str},
+            multi_book::{Coin, OrderBooks, Snapshots, load_snapshots_from_json, load_snapshots_from_str},
         },
         prelude::*,
         types::{
@@ -129,7 +148,7 @@ mod tests {
     };
     use alloy::primitives::Address;
     use itertools::Itertools;
-    use std::{fs::create_dir_all, path::PathBuf};
+    use std::{collections::HashMap, fs::create_dir_all, path::PathBuf};
 
     #[must_use]
     fn snapshot_to_l2_snapshot<O: InnerOrder>(
@@ -352,5 +371,71 @@ mod tests {
             ],
         ];
         assert_eq!(ans, raw_levels);
+    }
+
+    #[test]
+    fn clone_coin_orders_returns_resting_orders_for_known_coin() {
+        let mut book = OrderBook::new();
+        let coin = Coin::new("");
+        let snapshot = setup_book(&mut book);
+        let books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(snapshot, false);
+
+        let orders = books.clone_coin_orders(&coin).expect("coin present");
+        assert!(!orders.is_empty(), "expected at least one resting order");
+
+        // Calling again returns the same content — no mutation on read.
+        let orders2 = books.clone_coin_orders(&coin).expect("coin still present");
+        assert_eq!(orders.len(), orders2.len());
+
+        // Deterministic order: the two clones should match element-wise on stable fields.
+        for (a, b) in orders.iter().zip(orders2.iter()) {
+            assert_eq!(a.oid(), b.oid());
+            assert_eq!(a.limit_px(), b.limit_px());
+            assert_eq!(a.sz(), b.sz());
+            assert_eq!(a.side(), b.side());
+        }
+
+        // Iteration order: bid side first then ask side, bids descending in price,
+        // asks ascending in price, FIFO within each level.
+        let bid_count = orders.iter().take_while(|o| o.side() == Side::Bid).count();
+        assert!(bid_count > 0, "expected at least one bid in the fixture");
+        assert!(bid_count < orders.len(), "expected at least one ask in the fixture");
+
+        let bids = &orders[..bid_count];
+        let asks = &orders[bid_count..];
+        // All bids appear before any ask — verify the partitioning is clean.
+        assert!(bids.iter().all(|o| o.side() == Side::Bid));
+        assert!(asks.iter().all(|o| o.side() == Side::Ask));
+
+        // Bids are non-increasing in price, asks are non-decreasing.
+        for w in bids.windows(2) {
+            assert!(w[0].limit_px() >= w[1].limit_px(), "bids should be price-descending");
+        }
+        for w in asks.windows(2) {
+            assert!(w[0].limit_px() <= w[1].limit_px(), "asks should be price-ascending");
+        }
+
+        // Within a single price level, oids should be in arrival order (monotonically
+        // increasing under the OrderManager fixture which assigns oids sequentially).
+        for window_side in [bids, asks] {
+            let mut prev: Option<(Px, u64)> = None;
+            for order in window_side {
+                let px = order.limit_px();
+                let oid = order.oid().into_inner();
+                if let Some((prev_px, prev_oid)) = prev {
+                    if prev_px == px {
+                        assert!(oid > prev_oid, "FIFO order broken within price level");
+                    }
+                }
+                prev = Some((px, oid));
+            }
+        }
+    }
+
+    #[test]
+    fn clone_coin_orders_returns_none_for_unknown_coin() {
+        let books: OrderBooks<InnerL4Order> =
+            OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), false);
+        assert!(books.clone_coin_orders(&Coin::new("NOPE")).is_none());
     }
 }

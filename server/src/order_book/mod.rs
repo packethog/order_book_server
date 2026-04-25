@@ -124,6 +124,19 @@ impl<O: InnerOrder> OrderBook<O> {
         Snapshot([bids, asks])
     }
 
+    /// Iterates resting orders in deterministic price-priority order: bids first
+    /// (best/highest price descending), then asks (best/lowest price ascending),
+    /// with FIFO arrival order within each price level.
+    ///
+    /// The order is the same as the flattened `to_snapshot()` output and is
+    /// reproducible across calls so subscribers replaying snapshot streams see
+    /// a stable sequence.
+    pub(crate) fn iter_orders(&self) -> impl Iterator<Item = &O> {
+        let bids = self.bids.iter().rev().flat_map(|(_, l)| l.to_vec().into_iter());
+        let asks = self.asks.iter().flat_map(|(_, l)| l.to_vec().into_iter());
+        bids.chain(asks)
+    }
+
     #[must_use]
     pub(crate) fn from_snapshot(mut snapshot: Snapshot<O>, ignore_triggers: bool) -> Self {
         let mut book = Self::new();
