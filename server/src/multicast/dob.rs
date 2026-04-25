@@ -5,6 +5,8 @@
 //! Phase 1 covers mktdata + refdata; the snapshot port is wired in phase 2.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
@@ -14,14 +16,14 @@ use tokio::time::interval;
 use crate::multicast::publisher::{split_legs, make_leg};
 
 use crate::protocol::dob::constants::{
-    BATCH_BOUNDARY_SIZE, HEARTBEAT_SIZE,
+    BATCH_BOUNDARY_SIZE, HEARTBEAT_SIZE, INSTRUMENT_RESET_SIZE,
     ORDER_ADD_SIZE, ORDER_CANCEL_SIZE, ORDER_EXECUTE_SIZE,
 };
 use crate::protocol::dob::frame::DobFrameBuilder;
 use crate::protocol::dob::messages::{
-    BatchBoundary, OrderAdd, OrderCancel, OrderExecute,
-    encode_batch_boundary, encode_heartbeat, encode_order_add, encode_order_cancel,
-    encode_order_execute,
+    BatchBoundary, InstrumentReset, OrderAdd, OrderCancel, OrderExecute,
+    encode_batch_boundary, encode_heartbeat, encode_instrument_reset, encode_order_add,
+    encode_order_cancel, encode_order_execute,
 };
 
 /// Events produced by the L4 apply step, consumed by the DoB emitter.
@@ -31,6 +33,11 @@ pub enum DobEvent {
     OrderCancel(OrderCancel),
     OrderExecute(OrderExecute),
     BatchBoundary(BatchBoundary),
+    /// Per-instrument resync signal emitted by `apply_recovery` when the
+    /// publisher detects that its book state is inconsistent with the source.
+    /// Subscribers discard state for `instrument_id` and await a snapshot with
+    /// `Anchor Seq == new_anchor_seq` on the snapshot port.
+    InstrumentReset(InstrumentReset),
     /// Request a `Heartbeat` emission on mktdata (driven by the quiet-period timer).
     HeartbeatTick,
     /// Signals the emitter to flush and emit `EndOfSession` on shutdown.
@@ -49,6 +56,51 @@ pub type DobEventReceiver = mpsc::Receiver<DobEvent>;
 pub fn channel(bound: usize) -> (DobEventSender, DobEventReceiver) {
     mpsc::channel(bound)
 }
+
+// ---------------------------------------------------------------------------
+// DoB Snapshot scheduler scaffolding — Task 6
+// ---------------------------------------------------------------------------
+
+/// Snapshot stream configuration.
+#[derive(Debug, Clone)]
+pub struct DobSnapshotConfig {
+    pub group_addr: Ipv4Addr,
+    pub port: u16,
+    pub bind_addr: Ipv4Addr,
+    pub channel_id: u8,
+    pub mtu: u16,
+    /// Target round-robin cycle duration. Scheduler paces emission to hit
+    /// this; if the active set grows, cycles will simply take longer.
+    pub round_duration: Duration,
+}
+
+/// Snapshot requests are either routine round-robin slots (synthesised by
+/// the scheduler itself) or priority requests injected from `apply_recovery`.
+#[derive(Debug, Clone)]
+pub enum DobSnapshotRequest {
+    /// Out-of-cycle priority snapshot for an instrument that just received
+    /// an `InstrumentReset`. The scheduler emits this at the head of its
+    /// queue, with `Anchor Seq == anchor_seq`.
+    Priority { instrument_id: u32, anchor_seq: u64 },
+}
+
+pub type DobSnapshotRequestSender = mpsc::Sender<DobSnapshotRequest>;
+pub type DobSnapshotRequestReceiver = mpsc::Receiver<DobSnapshotRequest>;
+
+#[must_use]
+pub fn snapshot_request_channel(
+    bound: usize,
+) -> (DobSnapshotRequestSender, DobSnapshotRequestReceiver) {
+    mpsc::channel(bound)
+}
+
+/// Shared `mktdata`-port sequence number, read by the snapshot emitter at
+/// per-instrument lock-clone time and by `apply_recovery` when reserving a
+/// `new_anchor_seq` for an `InstrumentReset`. Atomic ordering: relaxed reads
+/// suffice — the value is monotonic and the snapshot port carries the
+/// resulting `anchor_seq` along with the data, so a slightly stale read is
+/// harmless (subscribers reconcile via the carried `anchor_seq`).
+pub type SharedMktdataSeq = Arc<AtomicU64>;
 
 #[derive(Debug, Clone)]
 pub struct DobMktdataConfig {
@@ -130,6 +182,7 @@ impl DobEmitter {
             DobEvent::OrderCancel(msg) => encode_order_cancel(buf, msg),
             DobEvent::OrderExecute(msg) => encode_order_execute(buf, msg),
             DobEvent::BatchBoundary(msg) => encode_batch_boundary(buf, msg),
+            DobEvent::InstrumentReset(msg) => encode_instrument_reset(buf, msg),
             _ => unreachable!("size filter should have returned"),
         }
         fb.commit_message();
@@ -143,6 +196,7 @@ fn event_size(event: &DobEvent) -> usize {
         DobEvent::OrderCancel(_) => ORDER_CANCEL_SIZE,
         DobEvent::OrderExecute(_) => ORDER_EXECUTE_SIZE,
         DobEvent::BatchBoundary(_) => BATCH_BOUNDARY_SIZE,
+        DobEvent::InstrumentReset(_) => INSTRUMENT_RESET_SIZE,
         DobEvent::HeartbeatTick | DobEvent::Shutdown => 0,
     }
 }
