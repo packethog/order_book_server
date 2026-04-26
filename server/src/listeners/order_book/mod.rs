@@ -319,6 +319,14 @@ impl OrderBookListener {
         self.order_book_state.as_ref().map_or_else(HashSet::new, OrderBookState::compute_universe)
     }
 
+    /// Returns a deterministic clone of the resting orders for `coin`, or
+    /// `None` if the book state has not yet initialized or the coin is
+    /// absent. Called by the DoB snapshot emitter task once per snapshot
+    /// slot — keeps the lock held only for the duration of the clone.
+    pub(crate) fn clone_coin_orders(&self, coin: &Coin) -> Option<Vec<InnerL4Order>> {
+        self.order_book_state.as_ref().and_then(|s| s.clone_coin_orders(coin))
+    }
+
     /// Attaches a `DobApplyTap` to the book state. If the snapshot has not yet
     /// arrived, stores the tap as pending; it will be attached when the first
     /// snapshot is ready.

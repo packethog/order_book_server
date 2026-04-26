@@ -19,11 +19,24 @@ use crate::{
     },
     types::inner::InnerL4Order,
 };
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::TrySendError;
+
+/// Shared per-instrument sequence counter, held jointly by the L4 apply tap
+/// and the snapshot emitter task. The counter is bumped on every emitted
+/// delta event by `DobApplyTap`, and read (without bumping) by the snapshot
+/// emitter when populating `SnapshotBegin.last_instrument_seq`.
+///
+/// A `std::sync::Mutex` is used (not `tokio::sync::Mutex`) because the apply
+/// path is synchronous code running on a tokio worker thread; calling
+/// `tokio::sync::Mutex::blocking_lock` from there would panic. Lock holds on
+/// either side are very brief (a hashmap insert / lookup) and never bracket
+/// an `.await`, so a sync mutex is the correct primitive.
+pub(crate) type SharedSeqCounter = Arc<Mutex<PerInstrumentSeqCounter>>;
 
 pub(crate) struct DobApplyTap {
     sender: DobEventSender,
-    seq: PerInstrumentSeqCounter,
+    seq: SharedSeqCounter,
     source_id: u16,
     channel_id: u8,
     coin_resolver: Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync>,
@@ -31,13 +44,18 @@ pub(crate) struct DobApplyTap {
 
 impl DobApplyTap {
     /// Creates a new tap.
+    ///
+    /// The `seq` counter is shared with the DoB snapshot emitter task so the
+    /// emitter can read the last-emitted per-instrument seq when building
+    /// `SnapshotBegin.last_instrument_seq`.
     pub(crate) fn new(
         sender: DobEventSender,
         source_id: u16,
         channel_id: u8,
+        seq: SharedSeqCounter,
         coin_resolver: Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync>,
     ) -> Self {
-        Self { sender, seq: PerInstrumentSeqCounter::new(), source_id, channel_id, coin_resolver }
+        Self { sender, seq, source_id, channel_id, coin_resolver }
     }
 
     /// Emits an `OrderAdd` event for a newly resting order.
@@ -46,7 +64,7 @@ impl DobApplyTap {
             log::warn!("dob_tap: unknown coin '{}' — skipping OrderAdd", coin.value());
             return;
         };
-        let per_instrument_seq = self.seq.next(instrument_id);
+        let per_instrument_seq = self.seq.lock().expect("seq mutex poisoned").next(instrument_id);
         let side = match inner_order.side {
             Side::Bid => SIDE_BID,
             Side::Ask => SIDE_ASK,
@@ -71,7 +89,7 @@ impl DobApplyTap {
             log::warn!("dob_tap: unknown coin '{}' — skipping OrderCancel", coin.value());
             return;
         };
-        let per_instrument_seq = self.seq.next(instrument_id);
+        let per_instrument_seq = self.seq.lock().expect("seq mutex poisoned").next(instrument_id);
         let event = DobEvent::OrderCancel(OrderCancel {
             instrument_id,
             source_id: self.source_id,
@@ -96,7 +114,7 @@ impl DobApplyTap {
             log::warn!("dob_tap: unknown coin '{}' — skipping OrderExecute", coin.value());
             return;
         };
-        let per_instrument_seq = self.seq.next(instrument_id);
+        let per_instrument_seq = self.seq.lock().expect("seq mutex poisoned").next(instrument_id);
         let event = DobEvent::OrderExecute(OrderExecute {
             instrument_id,
             source_id: self.source_id,
@@ -173,7 +191,8 @@ mod tests {
     #[tokio::test]
     async fn emit_order_add_sends_order_add_event() {
         let (tx, mut rx) = channel(4);
-        let mut tap = DobApplyTap::new(tx, 1, 0, btc_resolver());
+        let seq = Arc::new(Mutex::new(PerInstrumentSeqCounter::new()));
+        let mut tap = DobApplyTap::new(tx, 1, 0, seq, btc_resolver());
         let order = make_inner_order(42, Side::Bid, 100_000_000_000, 50_000_000);
 
         tap.emit_order_add(&btc_coin(), &order, 1_700_000_000_000_000_000);
@@ -198,7 +217,8 @@ mod tests {
     #[tokio::test]
     async fn emit_order_cancel_sends_order_cancel_event() {
         let (tx, mut rx) = channel(4);
-        let mut tap = DobApplyTap::new(tx, 2, 0, btc_resolver());
+        let seq = Arc::new(Mutex::new(PerInstrumentSeqCounter::new()));
+        let mut tap = DobApplyTap::new(tx, 2, 0, seq, btc_resolver());
         let oid = Oid::new(99);
 
         tap.emit_order_cancel(&btc_coin(), oid, 1_700_000_000_000_000_001);
@@ -220,7 +240,8 @@ mod tests {
     #[tokio::test]
     async fn emit_order_execute_sends_order_execute_event() {
         let (tx, mut rx) = channel(4);
-        let mut tap = DobApplyTap::new(tx, 3, 0, btc_resolver());
+        let seq = Arc::new(Mutex::new(PerInstrumentSeqCounter::new()));
+        let mut tap = DobApplyTap::new(tx, 3, 0, seq, btc_resolver());
         let oid = Oid::new(77);
         let exec_price = Px::new(200_000_000_000);
         let exec_quantity = Sz::new(10_000_000);
@@ -248,7 +269,8 @@ mod tests {
     #[tokio::test]
     async fn per_instrument_seq_advances_across_events() {
         let (tx, mut rx) = channel(16);
-        let mut tap = DobApplyTap::new(tx, 1, 0, btc_resolver());
+        let seq = Arc::new(Mutex::new(PerInstrumentSeqCounter::new()));
+        let mut tap = DobApplyTap::new(tx, 1, 0, seq, btc_resolver());
         let coin = btc_coin();
 
         // Three different event types for instrument 0 (BTC)
@@ -272,7 +294,8 @@ mod tests {
     #[tokio::test]
     async fn unknown_coin_skips_without_send() {
         let (tx, mut rx) = channel(4);
-        let mut tap = DobApplyTap::new(tx, 1, 0, btc_resolver());
+        let seq = Arc::new(Mutex::new(PerInstrumentSeqCounter::new()));
+        let mut tap = DobApplyTap::new(tx, 1, 0, seq, btc_resolver());
         let unknown_coin = Coin::new("ETH");
         let order = make_inner_order(1, Side::Bid, 100, 10);
 
@@ -285,10 +308,12 @@ mod tests {
     #[tokio::test]
     async fn emit_batch_boundary_sends_event() {
         let (tx, mut rx) = channel(4);
+        let seq = Arc::new(Mutex::new(PerInstrumentSeqCounter::new()));
         let mut tap = DobApplyTap::new(
             tx,
             /* source_id */ 1,
             /* channel_id */ 7,
+            seq,
             btc_resolver(),
         );
         tap.emit_batch_boundary(0, 999, 1_700_000_000_000_000_000);

@@ -137,7 +137,18 @@ pub async fn run_websocket_server(
             let reg = Arc::clone(&registry);
             Box::new(move |coin: &Coin| reg.try_read().ok()?.active.get(&coin.value()).map(|info| info.instrument_id))
         };
-        let tap = DobApplyTap::new(dob_tx.clone(), cfg.source_id, cfg.channel_id, coin_resolver);
+        // Shared per-instrument seq counter: bumped by the apply tap, read by
+        // the snapshot emitter (Task 9 wires the snapshot side).
+        let seq_counter = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::order_book::PerInstrumentSeqCounter::new(),
+        ));
+        let tap = DobApplyTap::new(
+            dob_tx.clone(),
+            cfg.source_id,
+            cfg.channel_id,
+            seq_counter,
+            coin_resolver,
+        );
         listener.lock().await.set_dob_tap(tap);
 
         let mktdata_cfg = DobMktdataConfig {
