@@ -593,6 +593,16 @@ impl OrderBookListener {
         }
     }
 
+    /// Test-only constructor: builds a listener pre-seeded from `snapshot`,
+    /// bypassing the file-watcher and validation paths. Mirrors the call
+    /// `init_from_snapshot` makes during normal startup.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_snapshot(snapshot: Snapshots<InnerL4Order>, height: u64) -> Self {
+        let mut listener = Self::new(None, false);
+        listener.init_from_snapshot(snapshot, height);
+        listener
+    }
+
     // forcibly grab current snapshot
     pub(crate) fn compute_snapshot(&mut self) -> Option<TimedSnapshots> {
         self.order_book_state.as_mut().map(|o| o.compute_snapshot())
