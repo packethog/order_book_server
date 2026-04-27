@@ -103,6 +103,15 @@ struct Args {
     /// Bound on the MPSC channel between L4 apply and the DoB emitter.
     #[arg(long, default_value_t = 4096)]
     dob_channel_bound: usize,
+
+    /// Target round-robin duration for the DoB snapshot stream (seconds).
+    #[arg(long, default_value_t = 30)]
+    dob_snapshot_round_duration: u64,
+
+    /// Max frame size for DoB snapshot frames. Defaults to the same MTU as
+    /// the mktdata stream.
+    #[arg(long, default_value_t = 1232)]
+    dob_snapshot_mtu: u16,
 }
 
 #[tokio::main]
@@ -154,6 +163,8 @@ async fn main() -> Result<()> {
             definition_cycle: Duration::from_secs(args.definition_cycle),
             manifest_cadence: Duration::from_secs(args.manifest_cadence),
             channel_bound: args.dob_channel_bound,
+            snapshot_round_duration: Duration::from_secs(args.dob_snapshot_round_duration),
+            snapshot_mtu: args.dob_snapshot_mtu,
         }
     });
 

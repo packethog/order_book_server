@@ -118,13 +118,32 @@ pub struct DobMktdataConfig {
 pub struct DobEmitter {
     config: DobMktdataConfig,
     socket: UdpSocket,
-    seq: u64,
+    /// Shared frame seq with `apply_recovery`. The recovery path reserves
+    /// `new_anchor_seq` via `fetch_add` on this same atomic so that
+    /// `InstrumentReset.new_anchor_seq` always points to a future mktdata
+    /// frame seq, never colliding with what the emitter is about to write.
+    seq: SharedMktdataSeq,
     reset_count: u8,
     current_frame: Option<DobFrameBuilder>,
 }
 
 impl DobEmitter {
+    /// Convenience constructor for tests and standalone use; allocates a
+    /// fresh, unshared seq counter. Production code should use
+    /// `bind_with_seq` so the recovery path can share the same atomic.
     pub async fn bind(config: DobMktdataConfig) -> std::io::Result<Self> {
+        Self::bind_with_seq(config, Arc::new(AtomicU64::new(0))).await
+    }
+
+    /// Binds the mktdata socket using a caller-provided shared seq atomic.
+    /// The same `Arc<AtomicU64>` MUST be passed to the snapshot scheduler
+    /// (read via `load`) and the `DobReplayTaps` (which `fetch_add`s when
+    /// reserving an `InstrumentReset` anchor) so seq numbers stay coherent
+    /// across the three call sites.
+    pub async fn bind_with_seq(
+        config: DobMktdataConfig,
+        seq: SharedMktdataSeq,
+    ) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(SocketAddrV4::new(config.bind_addr, 0)).await?;
         socket.set_multicast_loop_v4(false)?;
         socket.set_multicast_ttl_v4(1)?;
@@ -133,15 +152,18 @@ impl DobEmitter {
         Ok(Self {
             config,
             socket,
-            seq: 0,
+            seq,
             reset_count: 0,
             current_frame: None,
         })
     }
 
     fn next_seq(&mut self) -> u64 {
-        self.seq = self.seq.wrapping_add(1);
-        self.seq
+        // Relaxed: the atomic carries no other published memory; monotonicity
+        // comes from fetch_add itself. Mirrors the read in the snapshot
+        // scheduler and the reserve-on-recovery path in apply_recovery.
+        let prev = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        prev.wrapping_add(1)
     }
 
     fn start_frame(&mut self) -> &mut DobFrameBuilder {

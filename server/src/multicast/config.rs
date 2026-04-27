@@ -60,6 +60,11 @@ pub struct DobConfig {
     pub definition_cycle: Duration,
     pub manifest_cadence: Duration,
     pub channel_bound: usize,
+    /// Target round-robin cycle duration for the DoB snapshot stream.
+    pub snapshot_round_duration: Duration,
+    /// Max frame size for DoB snapshot frames (typically the same MTU as
+    /// the DoB mktdata stream).
+    pub snapshot_mtu: u16,
 }
 
 #[cfg(test)]
