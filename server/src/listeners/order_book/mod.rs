@@ -1,11 +1,17 @@
 use crate::{
     HL_NODE,
     listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
+    multicast::dob::{
+        DobEvent, DobEventSender, DobSnapshotRequest, DobSnapshotRequestSender, SharedMktdataSeq,
+    },
     order_book::{
         Coin, Snapshot,
         multi_book::{Snapshots, load_snapshots_from_json},
     },
     prelude::*,
+    protocol::dob::{
+        constants::RESET_REASON_PUBLISHER_INCONSISTENCY, messages::InstrumentReset,
+    },
     types::{
         L4Order,
         inner::{InnerL4Order, InnerLevel},
@@ -23,7 +29,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{
@@ -39,6 +45,17 @@ pub(crate) mod dob_tap;
 pub(crate) mod latency;
 mod state;
 mod utils;
+
+/// Wall-clock nanoseconds since the Unix epoch. Mirrors the helper in
+/// `multicast::dob` (kept module-local there) so `apply_recovery` can stamp
+/// `InstrumentReset.timestamp_ns` without crossing a privacy boundary.
+#[inline]
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
 
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
 // if there are scripts running, this may not work as intended
@@ -261,6 +278,24 @@ fn fetch_snapshot(
     });
 }
 
+/// Channels and resolution callbacks the DoB recovery path uses to emit
+/// `InstrumentReset` on mktdata and schedule a priority snapshot. Constructed
+/// at startup once the DoB pipeline is running and attached to the listener
+/// via `attach_dob_replay_taps`. Recovery falls back to a no-op emission
+/// (book mutation still happens) when no taps are attached.
+pub(crate) struct DobReplayTaps {
+    pub(crate) mktdata_tx: DobEventSender,
+    pub(crate) snapshot_request_tx: DobSnapshotRequestSender,
+    pub(crate) mktdata_seq: SharedMktdataSeq,
+    /// Resolves a public `instrument_id` for a given internal `Coin`. Called
+    /// from the recovery path (which runs synchronously inside `apply_recovery`),
+    /// so this resolver MUST be a synchronous lookup against a cached snapshot
+    /// — Task 9 wires this against a HashMap snapshot of the instrument
+    /// registry's `active` map (refreshed on each registry-refresh tick), not
+    /// directly against the async `InstrumentRegistry::get` API.
+    pub(crate) instrument_id_for: Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync>,
+}
+
 pub(crate) struct OrderBookListener {
     ignore_spot: bool,
     fill_status_file: Option<File>,
@@ -279,6 +314,10 @@ pub(crate) struct OrderBookListener {
     last_batch_local_time_ms: Option<u64>,
     // Held until the first snapshot is ready, then attached to the state.
     pending_dob_tap: Option<dob_tap::DobApplyTap>,
+    // Channels into the DoB pipeline, used by `apply_recovery` to emit
+    // `InstrumentReset` and schedule priority snapshots. `None` until
+    // `attach_dob_replay_taps` is called; recovery still runs without it.
+    dob_replay_taps: Option<DobReplayTaps>,
 }
 
 impl OrderBookListener {
@@ -297,6 +336,7 @@ impl OrderBookListener {
             last_batch_block_time_ms: None,
             last_batch_local_time_ms: None,
             pending_dob_tap: None,
+            dob_replay_taps: None,
         }
     }
 
@@ -335,6 +375,72 @@ impl OrderBookListener {
             state.attach_dob_tap(tap);
         } else {
             self.pending_dob_tap = Some(tap);
+        }
+    }
+
+    /// Attaches the channels and instrument resolver that `apply_recovery`
+    /// uses to emit `InstrumentReset` and schedule priority snapshots.
+    pub(crate) fn attach_dob_replay_taps(&mut self, taps: DobReplayTaps) {
+        self.dob_replay_taps = Some(taps);
+    }
+
+    /// Emits `InstrumentReset` on mktdata for `coin` and schedules a priority
+    /// snapshot. Per spec invariant, `Per-Instrument Seq` is NOT reset on
+    /// `InstrumentReset` — it only resets on `Reset Count` change.
+    ///
+    /// Both sends are best-effort: if either receiver is gone (shutdown), we
+    /// log and let the caller proceed with the book mutation. The mutation
+    /// must still happen even if the DoB pipeline isn't draining.
+    ///
+    /// Takes `&Option<DobReplayTaps>` (rather than `&self`) so the apply
+    /// path can call this while holding a disjoint mutable borrow on
+    /// `self.order_book_state`.
+    fn emit_dob_instrument_reset(taps: Option<&DobReplayTaps>, coin: &Coin) {
+        use std::sync::atomic::Ordering;
+
+        let Some(taps) = taps else { return };
+        let Some(instrument_id) = (taps.instrument_id_for)(coin) else {
+            log::error!(
+                "dob taps: coin '{}' has no instrument_id at recovery time — \
+                 book mutation will proceed but no InstrumentReset will be sent. \
+                 Stream consumers for this instrument may be inconsistent until \
+                 next refresh.",
+                coin.value()
+            );
+            return;
+        };
+
+        // Reserve the next mktdata seq as the anchor. fetch_add returns the
+        // previous value, so the +1 is what the next-emitted mktdata frame
+        // will carry.
+        // Relaxed: monotonicity comes from fetch_add itself; no other memory
+        // is published through this atomic. The consumer at `multicast::dob`'s
+        // snapshot scheduler reads via `load(Relaxed)` for the same reason —
+        // see SharedMktdataSeq's doc comment in multicast/dob.rs.
+        let prev = taps.mktdata_seq.fetch_add(1, Ordering::Relaxed);
+        let new_anchor_seq = prev + 1;
+
+        let msg = InstrumentReset {
+            instrument_id,
+            reason: RESET_REASON_PUBLISHER_INCONSISTENCY,
+            new_anchor_seq,
+            timestamp_ns: now_ns(),
+        };
+
+        if let Err(err) = taps.mktdata_tx.try_send(DobEvent::InstrumentReset(msg)) {
+            log::warn!(
+                "dob taps: dropped InstrumentReset for {}: {err}",
+                coin.value()
+            );
+        }
+        if let Err(err) = taps.snapshot_request_tx.try_send(DobSnapshotRequest::Priority {
+            instrument_id,
+            anchor_seq: new_anchor_seq,
+        }) {
+            log::warn!(
+                "dob taps: dropped priority snapshot request for {}: {err}",
+                coin.value()
+            );
         }
     }
 
@@ -419,6 +525,10 @@ impl OrderBookListener {
     /// carry the corrected BBO for the repaired coins through the normal
     /// publish path.
     fn apply_recovery(&mut self, report: &utils::ValidationReport, fresh_snapshot: Snapshots<InnerL4Order>) {
+        // Disjoint borrows: `state` is the &mut on the book, `taps` is the
+        // &shared on the DoB channels. Splitting at the field level lets the
+        // emit helper borrow `taps` while `state` mutation continues.
+        let taps = self.dob_replay_taps.as_ref();
         let Some(state) = self.order_book_state.as_mut() else {
             return;
         };
@@ -426,8 +536,12 @@ impl OrderBookListener {
         let mut fresh_map = fresh_snapshot.value();
 
         // Repair coins that diverged: replace the internal book with the fresh one.
+        // Emit InstrumentReset BEFORE the mutation so subscribers discard
+        // delta state for the affected instrument before any new deltas
+        // derived from the replaced book begin flowing.
         for (coin, msg) in &report.diverged {
             log::warn!("recovery: re-initializing {} (divergence: {})", coin.value(), msg);
+            Self::emit_dob_instrument_reset(taps, coin);
             if let Some(fresh_book) = fresh_map.remove(coin) {
                 state.replace_coin_from_snapshot(coin.clone(), fresh_book, true);
             } else {
@@ -442,6 +556,7 @@ impl OrderBookListener {
         // Drop coins that we have but the fresh snapshot doesn't (stale data).
         for coin in &report.missing_in_fresh {
             log::warn!("recovery: dropping stale coin {} not in fresh snapshot", coin.value());
+            Self::emit_dob_instrument_reset(taps, coin);
             state.remove_coin(coin);
         }
 
@@ -450,6 +565,7 @@ impl OrderBookListener {
         for coin in &report.extra_in_fresh {
             if let Some(fresh_book) = fresh_map.remove(coin) {
                 log::warn!("recovery: adding new coin {} from fresh snapshot", coin.value());
+                Self::emit_dob_instrument_reset(taps, coin);
                 state.replace_coin_from_snapshot(coin.clone(), fresh_book, true);
             }
         }
