@@ -956,78 +956,15 @@ mod snapshot_anchor_tests {
     //! priority-path code (`run_dob_snapshot_task` → `emit_snapshot` →
     //! `encode_snapshot_begin`) and asserts the exact same invariants.
     use super::*;
-    use crate::instruments::{InstrumentInfo, RegistryState, UniverseEntry, make_symbol};
     use crate::listeners::order_book::OrderBookListener;
-    use crate::order_book::{Coin, OrderBook, PerInstrumentSeqCounter, Px, Side, Snapshot, Sz};
-    use crate::order_book::multi_book::Snapshots;
+    use crate::order_book::PerInstrumentSeqCounter;
     use crate::protocol::dob::constants::{
         DEFAULT_MTU, FRAME_HEADER_SIZE, MSG_TYPE_SNAPSHOT_BEGIN,
     };
-    use crate::types::inner::InnerL4Order;
-    use alloy::primitives::Address;
-    use std::collections::HashMap;
+    use crate::test_fixtures::{build_one_coin_snapshot, build_registry_with_one_instrument};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::net::UdpSocket;
-
-    fn make_order(coin: &Coin, oid: u64, side: Side, px: u64, sz: u64) -> InnerL4Order {
-        InnerL4Order {
-            user: Address::new([0; 20]),
-            coin: coin.clone(),
-            side,
-            limit_px: Px::new(px),
-            sz: Sz::new(sz),
-            oid,
-            timestamp: 0,
-            trigger_condition: String::new(),
-            is_trigger: false,
-            trigger_px: String::new(),
-            is_position_tpsl: false,
-            reduce_only: false,
-            order_type: String::new(),
-            tif: None,
-            cloid: None,
-        }
-    }
-
-    fn build_one_coin_snapshot(coin_str: &str, num_orders: usize) -> Snapshots<InnerL4Order> {
-        let coin = Coin::new(coin_str);
-        let mut book: OrderBook<InnerL4Order> = OrderBook::new();
-        for i in 0..num_orders {
-            // Distinct, non-crossing bid/ask prices.
-            book.add_order(make_order(
-                &coin,
-                (1000 + i) as u64,
-                Side::Bid,
-                100 - (i as u64),
-                10,
-            ));
-            book.add_order(make_order(
-                &coin,
-                (2000 + i) as u64,
-                Side::Ask,
-                200 + (i as u64),
-                10,
-            ));
-        }
-        let mut map: HashMap<Coin, Snapshot<InnerL4Order>> = HashMap::new();
-        map.insert(coin, book.to_snapshot());
-        Snapshots::new(map)
-    }
-
-    fn build_registry_with_one_instrument(coin_str: &str, instrument_id: u32) -> RegistryState {
-        RegistryState::new(vec![UniverseEntry {
-            instrument_id,
-            coin: coin_str.to_string(),
-            is_delisted: false,
-            info: InstrumentInfo {
-                instrument_id,
-                price_exponent: -1,
-                qty_exponent: -5,
-                symbol: make_symbol(coin_str),
-            },
-        }])
-    }
 
     #[tokio::test]
     async fn snapshot_anchor_matches_request_and_last_instrument_seq() {
@@ -1059,7 +996,7 @@ mod snapshot_anchor_tests {
         // 3. Build a listener pre-seeded with one coin's resting orders.
         let coin_str = "BTC";
         let listener = OrderBookListener::for_test_with_snapshot(
-            build_one_coin_snapshot(coin_str, 3),
+            build_one_coin_snapshot(coin_str, 3, /* oid_offset = */ 0),
             /* height = */ 1,
         );
         let listener = Arc::new(tokio::sync::Mutex::new(listener));
@@ -1081,9 +1018,7 @@ mod snapshot_anchor_tests {
         .unwrap();
 
         // 5. Build the registry with one instrument (id=0 for BTC).
-        let registry = Arc::new(tokio::sync::RwLock::new(build_registry_with_one_instrument(
-            coin_str, 0,
-        )));
+        let registry = build_registry_with_one_instrument(coin_str, 0);
 
         // 6. Send the priority request BEFORE spawning the task so the test
         //    doesn't rely on tokio's current-thread-runtime scheduler ordering.

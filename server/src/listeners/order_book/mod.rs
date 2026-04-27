@@ -775,3 +775,272 @@ pub(crate) struct L2SnapshotParams {
     n_sig_figs: Option<u32>,
     mantissa: Option<u64>,
 }
+
+#[cfg(test)]
+mod instrument_reset_recovery_tests {
+    //! End-to-end `InstrumentReset` recovery flow test.
+    //!
+    //! After a divergence is reported by validation, `apply_recovery` MUST:
+    //!   1. Emit `InstrumentReset` on the `mktdata` port with
+    //!      `reason == RESET_REASON_PUBLISHER_INCONSISTENCY` and a
+    //!      `new_anchor_seq` strictly greater than the pre-mismatch
+    //!      `mktdata_seq` (it reserves the next mktdata frame seq).
+    //!   2. Schedule a priority snapshot on the `snapshot` port with
+    //!      `Anchor Seq == new_anchor_seq` (matching the reset's reservation).
+    //!   3. NOT reset the per-instrument delta seq counter — subsequent
+    //!      deltas continue from the pre-mismatch counter value (the wire
+    //!      spec invariant: `Per-Instrument Seq` resets only on
+    //!      `Reset Count` change, not on `InstrumentReset`).
+    //!
+    //! This test wires the real recovery path (no mocks beyond the UDP
+    //! collectors and a synchronous instrument resolver) and asserts all
+    //! three observable contract clauses on the wire / shared counter.
+    use super::*;
+    use crate::listeners::order_book::dob_tap::SharedSeqCounter;
+    use crate::multicast::dob::{
+        DobMktdataConfig, DobSnapshotConfig, DobSnapshotEmitter, DobEmitter, channel,
+        run_dob_emitter, run_dob_snapshot_task, snapshot_request_channel,
+    };
+    use crate::order_book::{Coin, PerInstrumentSeqCounter};
+    use crate::protocol::dob::constants::{
+        DEFAULT_MTU, FRAME_HEADER_SIZE, INSTRUMENT_RESET_SIZE, MSG_TYPE_HEARTBEAT,
+        MSG_TYPE_INSTRUMENT_RESET, MSG_TYPE_SNAPSHOT_BEGIN, RESET_REASON_PUBLISHER_INCONSISTENCY,
+        SNAPSHOT_BEGIN_SIZE,
+    };
+    use crate::test_fixtures::{build_one_coin_snapshot, build_registry_with_one_instrument};
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
+
+    async fn bind_collector() -> (UdpSocket, SocketAddrV4) {
+        let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = match sock.local_addr().unwrap() {
+            std::net::SocketAddr::V4(a) => a,
+            _ => unreachable!(),
+        };
+        (sock, addr)
+    }
+
+    /// Receives one or more datagrams on `sock`, scanning past frames whose
+    /// first message type is in `skip_types`, and returns the first frame
+    /// whose first message type is `target_type`. Bounded by `timeout`.
+    /// Used to skip past any heartbeat or other "in-band noise" the emitter
+    /// might happen to send before our event of interest.
+    async fn recv_first_with_msg_type(
+        sock: &UdpSocket,
+        target_type: u8,
+        skip_types: &[u8],
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut buf = [0u8; 2048];
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for msg_type 0x{target_type:02X}",
+            );
+            let (n, _) = tokio::time::timeout(remaining, sock.recv_from(&mut buf))
+                .await
+                .expect("recv timed out")
+                .expect("recv error");
+            assert!(
+                n >= FRAME_HEADER_SIZE + 1,
+                "frame too short to contain a message type byte",
+            );
+            assert_eq!(&buf[0..2], &[0x44, 0x44], "DoB magic on wire");
+            let msg_type = buf[FRAME_HEADER_SIZE];
+            if msg_type == target_type {
+                return buf[..n].to_vec();
+            }
+            if !skip_types.contains(&msg_type) {
+                panic!(
+                    "unexpected msg_type 0x{msg_type:02X} on collector while waiting \
+                     for 0x{target_type:02X}",
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn instrument_reset_emits_on_mktdata_then_priority_snapshot_then_resumes_with_continuing_seq()
+    {
+        // 1. Two collector sockets standing in for the mktdata and snapshot
+        //    multicast subscribers.
+        let (mktdata_collector, mktdata_addr) = bind_collector().await;
+        let (snapshot_collector, snapshot_addr) = bind_collector().await;
+
+        // 2. Pre-populate shared state. The mktdata seq baseline is 100;
+        //    apply_recovery's fetch_add(1, ...) returns 100 (the prior value)
+        //    so `new_anchor_seq` will be 101. The per-instrument seq counter
+        //    is bumped 5 times so its `last(0) == 5` — the post-recovery
+        //    `next(0)` MUST return 6 (NOT 1).
+        let mktdata_seq: SharedMktdataSeq = Arc::new(AtomicU64::new(100));
+        let seq_counter: SharedSeqCounter = Arc::new(StdMutex::new(PerInstrumentSeqCounter::new()));
+        {
+            let mut g = seq_counter.lock().unwrap();
+            for _ in 0..5 {
+                g.next(0);
+            }
+            assert_eq!(g.last(0), 5, "pre-recovery per-instrument seq baseline");
+        }
+
+        // 3. Build a listener pre-seeded with one coin at a known initial
+        //    snapshot. apply_recovery consumes a "fresh" Snapshots that we
+        //    construct with a different oid offset so validation would have
+        //    found the coin diverged.
+        let coin_str = "BTC";
+        let coin = Coin::new(coin_str);
+        let initial = build_one_coin_snapshot(coin_str, 3, /* oid_offset = */ 0);
+        let listener = OrderBookListener::for_test_with_snapshot(initial, /* height = */ 1);
+        let listener = Arc::new(tokio::sync::Mutex::new(listener));
+
+        // 4. Mktdata pipeline: bounded mpsc -> run_dob_emitter -> mktdata UDP
+        //    socket. The emitter shares the same SharedMktdataSeq atomic as
+        //    apply_recovery, so seq bumps from both sides stay coherent.
+        let (mkt_tx, mkt_rx) = channel(64);
+        let mkt_emitter = DobEmitter::bind_with_seq(
+            DobMktdataConfig {
+                group_addr: *mktdata_addr.ip(),
+                port: mktdata_addr.port(),
+                bind_addr: Ipv4Addr::LOCALHOST,
+                channel_id: 0,
+                mtu: DEFAULT_MTU,
+                // Short interval drives the emitter loop's periodic flush
+                // so a single in-flight InstrumentReset gets out on the wire
+                // promptly. The interval ONLY flushes — it does not emit a
+                // Heartbeat message itself (that requires an explicit
+                // DobEvent::HeartbeatTick), so the collector never sees a
+                // heartbeat byte regardless of the cadence.
+                heartbeat_interval: Duration::from_millis(50),
+            },
+            mktdata_seq.clone(),
+        )
+        .await
+        .unwrap();
+        let mkt_handle = tokio::spawn(run_dob_emitter(mkt_emitter, mkt_rx));
+
+        // 5. Snapshot pipeline: priority-request channel -> run_dob_snapshot_task.
+        //    Long round_duration so the round-robin path stays parked on its
+        //    sleep — only the priority-path snapshot can fire within the
+        //    test's recv timeout.
+        let (snap_tx, snap_rx) = snapshot_request_channel(8);
+        let snap_emitter = DobSnapshotEmitter::bind(DobSnapshotConfig {
+            group_addr: *snapshot_addr.ip(),
+            port: snapshot_addr.port(),
+            bind_addr: Ipv4Addr::LOCALHOST,
+            channel_id: 1,
+            mtu: DEFAULT_MTU,
+            round_duration: Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+        let registry = build_registry_with_one_instrument(coin_str, 0);
+        let snap_handle = tokio::spawn(run_dob_snapshot_task(
+            snap_emitter,
+            listener.clone(),
+            seq_counter.clone(),
+            registry.clone(),
+            mktdata_seq.clone(),
+            snap_rx,
+        ));
+
+        // 6. Attach replay taps and trigger the recovery. The instrument
+        //    resolver is a sync closure (matches Task 9's contract). The
+        //    fresh snapshot we hand to apply_recovery has the same coin
+        //    with different orders — the report's `diverged` entry is what
+        //    drives the InstrumentReset emission.
+        {
+            let mut guard = listener.lock().await;
+            guard.attach_dob_replay_taps(DobReplayTaps {
+                mktdata_tx: mkt_tx.clone(),
+                snapshot_request_tx: snap_tx.clone(),
+                mktdata_seq: mktdata_seq.clone(),
+                instrument_id_for: Box::new(|c: &Coin| {
+                    if c.value() == "BTC" { Some(0) } else { None }
+                }),
+            });
+
+            let mut report = utils::ValidationReport::default();
+            report.diverged.push((coin.clone(), "test-injected divergence".into()));
+            let fresh = build_one_coin_snapshot(coin_str, 3, /* oid_offset = */ 5_000);
+
+            guard.apply_recovery(&report, fresh);
+        }
+
+        // 7. Mktdata: expect the InstrumentReset.
+        let frame = recv_first_with_msg_type(
+            &mktdata_collector,
+            MSG_TYPE_INSTRUMENT_RESET,
+            // Tolerate a Heartbeat slipping in (msg_type 0x01). None expected
+            // given the 60s interval, but we don't want flakes if the timer
+            // happened to fire at startup.
+            &[MSG_TYPE_HEARTBEAT],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            frame.len() >= FRAME_HEADER_SIZE + INSTRUMENT_RESET_SIZE,
+            "mktdata frame too short for InstrumentReset (got {} bytes)",
+            frame.len(),
+        );
+        let body = &frame[FRAME_HEADER_SIZE..];
+        // InstrumentReset wire layout (28 bytes):
+        //   msg_type(1) + msg_size(1) + flags(2) = app header (4)
+        //   instrument_id(4)                       offset 4..8
+        //   reason(1)                              offset 8
+        //   reserved(3)                            offset 9..12
+        //   new_anchor_seq(8)                      offset 12..20
+        //   timestamp_ns(8)                        offset 20..28
+        let instrument_id = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        let reason = body[8];
+        let new_anchor_seq = u64::from_le_bytes(body[12..20].try_into().unwrap());
+        assert_eq!(instrument_id, 0, "instrument_id from coin resolver");
+        assert_eq!(
+            reason, RESET_REASON_PUBLISHER_INCONSISTENCY,
+            "reason byte must be 1 (publisher-inconsistency)",
+        );
+        assert_eq!(
+            new_anchor_seq, 101,
+            "new_anchor_seq must be the pre-mismatch mktdata_seq + 1 (100 + 1)",
+        );
+
+        // 8. Snapshot port: expect a SnapshotBegin with anchor_seq == 101.
+        let frame = recv_first_with_msg_type(
+            &snapshot_collector,
+            MSG_TYPE_SNAPSHOT_BEGIN,
+            &[],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            frame.len() >= FRAME_HEADER_SIZE + SNAPSHOT_BEGIN_SIZE,
+            "snapshot frame too short for SnapshotBegin (got {} bytes)",
+            frame.len(),
+        );
+        let body = &frame[FRAME_HEADER_SIZE..];
+        let snap_instrument_id = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        let snap_anchor_seq = u64::from_le_bytes(body[8..16].try_into().unwrap());
+        assert_eq!(snap_instrument_id, 0, "SnapshotBegin instrument_id");
+        assert_eq!(
+            snap_anchor_seq, 101,
+            "SnapshotBegin anchor_seq must match the InstrumentReset new_anchor_seq",
+        );
+
+        // 9. Wire-spec invariant: per-instrument seq is NOT reset on
+        //    InstrumentReset. The next delta must carry seq = 6 (not 1).
+        let next = seq_counter.lock().unwrap().next(0);
+        assert_eq!(
+            next, 6,
+            "post-recovery per-instrument seq must continue from pre-mismatch baseline (5 + 1)",
+        );
+
+        // Clean shutdown: drop senders so the emitter loop exits, then abort
+        // the snapshot task (which sleeps in its round-robin path).
+        drop(mkt_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), mkt_handle).await;
+        snap_handle.abort();
+    }
+}
