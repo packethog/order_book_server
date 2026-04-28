@@ -104,6 +104,22 @@ cargo run --release --bin example_multicast_subscriber -- \
 
 This joins the multicast group and prints received datagrams to stdout.
 
+## DZ-DoB
+
+Binary depth-of-book multicast (frame magic `0x4444`). Three streams off the same `--dob-group`:
+
+- **mktdata** (`--dob-mktdata-port`, default `6000`) — incremental L4 events.
+- **refdata** (`--dob-refdata-port`, default `6001`) — `InstrumentDefinition` retransmissions.
+- **snapshot** (`--dob-snapshot-port`, default `6002`) — round-robin per-instrument snapshots.
+
+### DoB Phase 2
+
+Phase 2 adds the snapshot stream and the `InstrumentReset` recovery flow:
+
+- The snapshot stream emits a continuous round-robin per-instrument snapshot anchored to the mktdata sequence number. Configure cycle duration via `--dob-snapshot-round-duration` (seconds, default `30`) and frame size via `--dob-snapshot-mtu` (default `1232`).
+- When the publisher's per-coin validation check detects divergence from the venue, it emits an `InstrumentReset` (msg type `0x14`) on mktdata and immediately schedules a priority snapshot for that instrument on the snapshot port.
+- `Per-Instrument Seq` is preserved across `InstrumentReset` per the wire spec — it only resets on a `Reset Count` change.
+
 ## Wireshark dissectors
 
 Lua dissectors for DZ-TOB and DZ-DoB live under `spec/`. To install:
