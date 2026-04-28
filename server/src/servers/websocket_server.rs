@@ -1,5 +1,5 @@
 use crate::{
-    instruments::RegistryState,
+    instruments::{RegistryState, SharedRegistry},
     listeners::order_book::{
         DobReplayTaps, InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener,
         TimedSnapshots, dob_tap::DobApplyTap, hl_listen,
@@ -34,7 +34,7 @@ use tokio::select;
 use tokio::{
     net::TcpListener,
     sync::{
-        Mutex, RwLock,
+        Mutex,
         broadcast::{Sender, channel},
     },
 };
@@ -75,7 +75,7 @@ pub async fn run_websocket_server(
 
     // Bootstrap a shared instrument registry when any multicast channel is enabled.
     // If only DoB is enabled (no TOB), the registry starts empty (no HL API URL available).
-    let registry: Option<Arc<RwLock<RegistryState>>> = if let Some(ref cfg) = multicast_config {
+    let registry: Option<SharedRegistry> = if let Some(ref cfg) = multicast_config {
         let universe = match crate::instruments::hyperliquid::fetch_universe(&cfg.hl_api_url).await {
             Ok(u) => u,
             Err(err) => {
@@ -83,9 +83,9 @@ pub async fn run_websocket_server(
                 std::process::exit(3);
             }
         };
-        let state = Arc::new(RwLock::new(RegistryState::new(universe)));
+        let state = crate::instruments::new_shared_registry(RegistryState::new(universe));
         {
-            let guard = state.read().await;
+            let guard = state.load();
             info!(
                 "instrument registry loaded: {} active ({} in universe), manifest_seq={}",
                 guard.active.len(),
@@ -103,7 +103,7 @@ pub async fn run_websocket_server(
         }
         Some(state)
     } else if dob_config.is_some() {
-        Some(Arc::new(RwLock::new(RegistryState::empty())))
+        Some(crate::instruments::new_shared_registry(RegistryState::empty()))
     } else {
         None
     };
@@ -148,15 +148,15 @@ pub async fn run_websocket_server(
         // recovery; the snapshot scheduler drains them ahead of round-robin.
         let (snapshot_req_tx, snapshot_req_rx) = snapshot_request_channel(cfg.channel_bound);
 
-        // Coin resolver for the apply tap: non-blocking try_read() so it is
-        // safe to call from the sync apply_updates path without risk of
-        // blocking a tokio worker. Returns `(instrument_id, qty_exponent)` so
-        // the tap can scale internal `Sz` (10^8 fixed) to the venue's wire
-        // representation per instrument.
+        // Coin resolver for the apply tap: backed by `ArcSwap`, so `.load()`
+        // never blocks and never fails. Safe to call from the sync apply_updates
+        // path without risk of stalling a tokio worker. Returns
+        // `(instrument_id, qty_exponent)` so the tap can scale internal `Sz`
+        // (10^8 fixed) to the venue's wire representation per instrument.
         let coin_resolver: crate::listeners::order_book::dob_tap::CoinResolver = {
             let reg = Arc::clone(&registry);
             Box::new(move |coin: &Coin| {
-                reg.try_read().ok()?.active.get(&coin.value()).map(|info| (info.instrument_id, info.qty_exponent))
+                reg.load().active.get(&coin.value()).map(|info| (info.instrument_id, info.qty_exponent))
             })
         };
         // Shared per-instrument seq counter: bumped by the apply tap, read by
@@ -190,7 +190,7 @@ pub async fn run_websocket_server(
         // log an error per the resolver's contract in
         // listeners/order_book/mod.rs's emit_dob_instrument_reset.
         let instrument_id_cache: Arc<StdRwLock<HashMap<Coin, u32>>> = {
-            let registry_state = registry.read().await;
+            let registry_state = registry.load();
             let mut map = HashMap::new();
             for (coin_str, info) in &registry_state.active {
                 map.insert(Coin::new(coin_str), info.instrument_id);

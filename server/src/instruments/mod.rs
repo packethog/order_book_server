@@ -3,7 +3,7 @@ pub mod hyperliquid;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use arc_swap::ArcSwap;
 
 /// Metadata for a single instrument, used to encode binary messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,47 +52,67 @@ impl RegistryState {
     }
 }
 
+/// Shared, lock-free handle to a `RegistryState`.
+///
+/// Backed by `arc_swap::ArcSwap`: readers do `.load()` (atomic, never blocks);
+/// the refresh task does `.store(Arc::new(new_state))` to publish a fresh
+/// state. There is no write lock to contend on, so the apply tap, the TOB
+/// publisher, and the snapshot scheduler all see updates without ever
+/// blocking each other or the writer.
+pub type SharedRegistry = Arc<ArcSwap<RegistryState>>;
+
+/// Constructs a new `SharedRegistry` from a `RegistryState`.
+#[must_use]
+pub fn new_shared_registry(state: RegistryState) -> SharedRegistry {
+    Arc::new(ArcSwap::from(Arc::new(state)))
+}
+
 /// Handle to the shared instrument registry.
 ///
-/// Reads are lock-free from the caller's perspective (a short read lock internally).
-/// Writes (refresh) are coordinated via the publisher's refresh task.
+/// Reads are lock-free; the underlying `ArcSwap` returns a `Guard` over an
+/// `Arc<RegistryState>` snapshot. Writers (the refresh task) atomically
+/// publish a new state via `Arc::store`.
 #[derive(Debug, Clone)]
 pub struct InstrumentRegistry {
-    state: Arc<RwLock<RegistryState>>,
+    state: SharedRegistry,
 }
 
 impl InstrumentRegistry {
     #[must_use]
     pub fn new(state: RegistryState) -> Self {
-        Self { state: Arc::new(RwLock::new(state)) }
+        Self { state: new_shared_registry(state) }
     }
 
     #[must_use]
-    pub fn from_arc(state: Arc<RwLock<RegistryState>>) -> Self {
+    pub fn from_arc(state: SharedRegistry) -> Self {
         Self { state }
     }
 
     #[must_use]
-    pub fn shared(&self) -> Arc<RwLock<RegistryState>> {
+    pub fn shared(&self) -> SharedRegistry {
         Arc::clone(&self.state)
     }
 
     /// Look up an instrument by coin name. Returns an owned copy so the
-    /// caller doesn't need to hold the read lock.
-    pub async fn get(&self, coin: &str) -> Option<InstrumentInfo> {
-        self.state.read().await.active.get(coin).cloned()
+    /// caller is independent of the underlying snapshot.
+    #[must_use]
+    pub fn get(&self, coin: &str) -> Option<InstrumentInfo> {
+        self.state.load().active.get(coin).cloned()
     }
 
-    pub async fn len(&self) -> usize {
-        self.state.read().await.active.len()
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.state.load().active.len()
     }
 
-    pub async fn is_empty(&self) -> bool {
-        self.state.read().await.active.is_empty()
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.state.load().active.is_empty()
     }
 
-    pub async fn manifest_seq(&self) -> u16 {
-        self.state.read().await.manifest_seq
+    #[must_use]
+    pub fn manifest_seq(&self) -> u16 {
+        self.state.load().manifest_seq
     }
 }
 
@@ -210,14 +230,14 @@ mod tests {
         assert_eq!(state.manifest_seq, 1);
     }
 
-    #[tokio::test]
-    async fn registry_handle_lookup() {
+    #[test]
+    fn registry_handle_lookup() {
         let universe = vec![test_entry(0, "BTC", false), test_entry(1, "ETH", false)];
         let reg = InstrumentRegistry::new(RegistryState::new(universe));
-        assert!(reg.get("BTC").await.is_some());
-        assert_eq!(reg.get("BTC").await.unwrap().instrument_id, 0);
-        assert!(reg.get("MISSING").await.is_none());
-        assert_eq!(reg.len().await, 2);
-        assert_eq!(reg.manifest_seq().await, 1);
+        assert!(reg.get("BTC").is_some());
+        assert_eq!(reg.get("BTC").unwrap().instrument_id, 0);
+        assert!(reg.get("MISSING").is_none());
+        assert_eq!(reg.len(), 2);
+        assert_eq!(reg.manifest_seq(), 1);
     }
 }

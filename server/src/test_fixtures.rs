@@ -9,12 +9,10 @@
 //! tests.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use alloy::primitives::Address;
-use tokio::sync::RwLock;
 
-use crate::instruments::{InstrumentInfo, RegistryState, UniverseEntry, make_symbol};
+use crate::instruments::{InstrumentInfo, RegistryState, SharedRegistry, UniverseEntry, make_symbol, new_shared_registry};
 use crate::order_book::multi_book::Snapshots;
 use crate::order_book::{Coin, OrderBook, Px, Side, Snapshot, Sz};
 use crate::types::inner::InnerL4Order;
@@ -78,13 +76,13 @@ pub(crate) fn build_one_coin_snapshot(
     Snapshots::new(map)
 }
 
-/// Build an `Arc<RwLock<RegistryState>>` with a single instrument entry
-/// suitable for tests that need a registry to look up one coin.
+/// Build a `SharedRegistry` with a single instrument entry suitable for tests
+/// that need a registry to look up one coin.
 pub(crate) fn build_registry_with_one_instrument(
     coin_str: &str,
     instrument_id: u32,
-) -> Arc<RwLock<RegistryState>> {
-    Arc::new(RwLock::new(RegistryState::new(vec![UniverseEntry {
+) -> SharedRegistry {
+    new_shared_registry(RegistryState::new(vec![UniverseEntry {
         instrument_id,
         coin: coin_str.to_string(),
         is_delisted: false,
@@ -94,5 +92,5 @@ pub(crate) fn build_registry_with_one_instrument(
             qty_exponent: -5,
             symbol: make_symbol(coin_str),
         },
-    }])))
+    }]))
 }

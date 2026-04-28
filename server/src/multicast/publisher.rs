@@ -7,9 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::{info, warn};
 use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
 
-use crate::instruments::{InstrumentInfo, RegistryState, price_to_fixed, qty_to_fixed};
+use crate::instruments::{InstrumentInfo, SharedRegistry, price_to_fixed, qty_to_fixed};
 use crate::multicast::config::MulticastConfig;
 use crate::protocol::constants::{
     AGGRESSOR_BUY, AGGRESSOR_SELL, ASSET_CLASS_CRYPTO_SPOT, CHANNEL_RESET_SIZE, END_OF_SESSION_SIZE, FLAG_SNAPSHOT,
@@ -56,12 +55,12 @@ impl DefinitionCycler {
 pub(crate) struct MulticastPublisher {
     socket: UdpSocket,
     config: MulticastConfig,
-    registry: Arc<RwLock<RegistryState>>,
+    registry: SharedRegistry,
     seq: AtomicU64,
 }
 
 impl MulticastPublisher {
-    pub(crate) fn new(socket: UdpSocket, config: MulticastConfig, registry: Arc<RwLock<RegistryState>>) -> Self {
+    pub(crate) fn new(socket: UdpSocket, config: MulticastConfig, registry: SharedRegistry) -> Self {
         Self { socket, config, registry, seq: AtomicU64::new(0) }
     }
 
@@ -123,7 +122,7 @@ impl MulticastPublisher {
     /// Sends a ManifestSummary on the refdata port.
     async fn send_manifest_summary(&self) {
         let (seq_tag, count) = {
-            let guard = self.registry.read().await;
+            let guard = self.registry.load();
             (guard.manifest_seq, u32::try_from(guard.active.len()).unwrap_or(u32::MAX))
         };
 
@@ -193,8 +192,8 @@ impl MulticastPublisher {
 
     /// Reads the current registry snapshot and updates the cycler if manifest_seq changed.
     /// Returns `true` if the cycler was reset.
-    async fn sync_cycler(&self, cycler: &mut DefinitionCycler) -> bool {
-        let guard = self.registry.read().await;
+    fn sync_cycler(&self, cycler: &mut DefinitionCycler) -> bool {
+        let guard = self.registry.load();
         if guard.manifest_seq != cycler.seq_tag {
             let snapshot: Vec<(String, InstrumentInfo)> =
                 guard.active.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -225,10 +224,12 @@ impl MulticastPublisher {
         let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
         let default_params = crate::listeners::order_book::L2SnapshotParams::new(None, None);
 
-        // Take a single read lock for the whole batch — lookups don't cross await points
-        // beyond this critical section, so we can gather all needed InstrumentInfo eagerly.
+        // Snapshot-then-lookup against the lock-free ArcSwap. Holding the load
+        // guard across the full batch is fine — it's just a ref-counted view of
+        // an immutable RegistryState, and a concurrent refresh-task store will
+        // simply publish a newer state we'll pick up on the next batch.
         let lookups: HashMap<String, InstrumentInfo> = {
-            let guard = self.registry.read().await;
+            let guard = self.registry.load();
             snapshot_map
                 .keys()
                 .filter_map(|coin| {
@@ -320,7 +321,7 @@ impl MulticastPublisher {
         let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
 
         let lookups: HashMap<String, InstrumentInfo> = {
-            let guard = self.registry.read().await;
+            let guard = self.registry.load();
             trades_by_coin
                 .keys()
                 .filter_map(|coin| guard.active.get(coin).map(|info| (coin.clone(), info.clone())))
@@ -480,7 +481,7 @@ impl MulticastPublisher {
                 }
                 _ = manifest_interval.tick() => {
                     // Sync cycler BEFORE sending the manifest, so they agree on seq.
-                    let reset = self.sync_cycler(&mut cycler).await;
+                    let reset = self.sync_cycler(&mut cycler);
                     if reset {
                         info!(
                             "multicast: cycler reset to manifest_seq={} ({} instruments)",
@@ -491,7 +492,7 @@ impl MulticastPublisher {
                     self.send_manifest_summary().await;
                 }
                 _ = definition_interval.tick() => {
-                    self.sync_cycler(&mut cycler).await;
+                    self.sync_cycler(&mut cycler);
                     if cycler.snapshot.is_empty() {
                         continue;
                     }
@@ -579,7 +580,7 @@ mod tests {
         }
     }
 
-    fn test_registry() -> Arc<RwLock<RegistryState>> {
+    fn test_registry() -> SharedRegistry {
         let universe = vec![
             UniverseEntry {
                 instrument_id: 0,
@@ -604,7 +605,7 @@ mod tests {
                 },
             },
         ];
-        Arc::new(RwLock::new(RegistryState::new(universe)))
+        crate::instruments::new_shared_registry(RegistryState::new(universe))
     }
 
     #[tokio::test]
@@ -679,7 +680,7 @@ mod tests {
 
         let publisher = MulticastPublisher::new(send_socket, config, test_registry());
         let mut cycler = DefinitionCycler::empty();
-        publisher.sync_cycler(&mut cycler).await;
+        publisher.sync_cycler(&mut cycler);
         assert_eq!(cycler.snapshot.len(), 2);
         assert_eq!(cycler.seq_tag, 1);
 
