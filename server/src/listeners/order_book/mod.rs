@@ -43,6 +43,8 @@ use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consiste
 
 pub(crate) mod dob_tap;
 pub(crate) mod latency;
+#[cfg(test)]
+mod parity_tests;
 mod state;
 mod utils;
 
@@ -601,6 +603,32 @@ impl OrderBookListener {
         let mut listener = Self::new(None, false);
         listener.init_from_snapshot(snapshot, height);
         listener
+    }
+
+    /// Test-only entry point: feeds a synthetic `(order_statuses, order_diffs)`
+    /// pair through the same `apply_updates` path the file-watcher uses. The
+    /// DoB tap (if attached) fires on every successful apply, and the
+    /// internal book mutates exactly as in production. Bypasses the
+    /// `BatchQueue` cache and `pop_cache` reordering — callers must supply
+    /// matched batches directly.
+    #[cfg(test)]
+    pub(crate) fn apply_test_batch(
+        &mut self,
+        order_statuses: Batch<NodeDataOrderStatus>,
+        order_diffs: Batch<NodeDataOrderDiff>,
+    ) -> Result<()> {
+        self.order_book_state
+            .as_mut()
+            .ok_or("apply_test_batch: order book state not ready")?
+            .apply_updates(order_statuses, order_diffs)
+    }
+
+    /// Test-only accessor for the listener's `l2_snapshots` so parity tests
+    /// can derive what the TOB publisher would emit without spinning up the
+    /// full publisher loop.
+    #[cfg(test)]
+    pub(crate) fn l2_snapshots_for_test(&mut self) -> Option<(u64, L2Snapshots)> {
+        self.l2_snapshots(false)
     }
 
     // forcibly grab current snapshot

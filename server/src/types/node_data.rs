@@ -29,6 +29,19 @@ impl NodeDataOrderDiff {
     pub(crate) fn coin(&self) -> Coin {
         Coin::new(&self.coin)
     }
+
+    /// Test-only constructor.  Lets parity tests build a synthetic diff
+    /// without round-tripping through serde.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        user: Address,
+        oid: u64,
+        px: String,
+        coin: String,
+        raw_book_diff: OrderDiff,
+    ) -> Self {
+        Self { user, oid, px, coin, raw_book_diff }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,5 +105,20 @@ impl<E> Batch<E> {
 
     pub(crate) fn events(self) -> Vec<E> {
         self.events
+    }
+
+    /// Test-only constructor.  Lets parity / synthetic-driver tests build a
+    /// `Batch<E>` directly without round-tripping through serde.  The
+    /// `block_time_ms` is interpreted as UTC milliseconds since epoch and
+    /// stored as the `block_time` `NaiveDateTime`; `local_time` mirrors it.
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used, clippy::cast_possible_wrap)]
+    pub(crate) fn new_for_test(block_number: u64, block_time_ms: u64, events: Vec<E>) -> Self {
+        let secs = (block_time_ms / 1_000) as i64;
+        let nsecs = ((block_time_ms % 1_000) * 1_000_000) as u32;
+        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsecs)
+            .unwrap()
+            .naive_utc();
+        Self { local_time: dt, block_time: dt, block_number, events }
     }
 }
