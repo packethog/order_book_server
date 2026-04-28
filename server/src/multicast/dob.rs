@@ -146,7 +146,7 @@ impl DobEmitter {
     ) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(SocketAddrV4::new(config.bind_addr, 0)).await?;
         socket.set_multicast_loop_v4(false)?;
-        socket.set_multicast_ttl_v4(1)?;
+        socket.set_multicast_ttl_v4(64)?;
         // Connect so send() pushes to the configured multicast group:port
         socket.connect(SocketAddrV4::new(config.group_addr, config.port)).await?;
         Ok(Self {
@@ -320,7 +320,7 @@ impl DobSnapshotEmitter {
     pub(crate) async fn bind(config: DobSnapshotConfig) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(SocketAddrV4::new(config.bind_addr, 0)).await?;
         socket.set_multicast_loop_v4(false)?;
-        socket.set_multicast_ttl_v4(1)?;
+        socket.set_multicast_ttl_v4(64)?;
         socket.connect(SocketAddrV4::new(config.group_addr, config.port)).await?;
         Ok(Self {
             config,
@@ -653,7 +653,7 @@ pub async fn run_dob_refdata_task(
     // Bind the UDP socket and point it at the multicast group.
     let socket = UdpSocket::bind(SocketAddrV4::new(config.bind_addr, 0)).await?;
     socket.set_multicast_loop_v4(false)?;
-    socket.set_multicast_ttl_v4(1)?;
+    socket.set_multicast_ttl_v4(64)?;
     socket.connect(SocketAddrV4::new(config.group_addr, config.port)).await?;
 
     let mut seq: u64 = 0;
