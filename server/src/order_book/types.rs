@@ -147,3 +147,54 @@ impl Sz {
         s.trim_end_matches('.').to_string()
     }
 }
+
+/// Converts an internal `Sz` (which carries a quantity at the publisher's
+/// fixed 10^8 scale) to the wire encoding for an instrument whose
+/// `qty_exponent` is `qty_exponent`. The wire encoding is `qty * 10^-qty_exponent`,
+/// and `Sz::value() == qty * 10^8`, so the divisor is `10^(8 + qty_exponent)`.
+///
+/// HL's `qty_exponent` range is `-8..=0` in practice (today: `-5..=0`); for any
+/// value in that range the divisor is `>= 1` and the division is exact for any
+/// quantity emitted by the venue (which is always an integer multiple of
+/// `10^qty_exponent`).
+#[must_use]
+pub(crate) fn sz_to_fixed(sz: Sz, qty_exponent: i8) -> u64 {
+    let div_pow = 8i32 + i32::from(qty_exponent);
+    if div_pow <= 0 {
+        sz.value().saturating_mul(10u64.pow((-div_pow) as u32))
+    } else {
+        sz.value() / 10u64.pow(div_pow as u32)
+    }
+}
+
+#[cfg(test)]
+mod sz_to_fixed_tests {
+    use super::*;
+
+    #[test]
+    fn qty_exponent_zero_divides_by_1e8() {
+        // Sz::parse_from_str("2921") -> 2921 * 10^8. qty_exponent=0 wants 2921.
+        let sz = Sz::parse_from_str("2921").unwrap();
+        assert_eq!(sz_to_fixed(sz, 0), 2921);
+    }
+
+    #[test]
+    fn qty_exponent_negative_three() {
+        // "1.234" with qty_exponent=-3 should yield 1234.
+        let sz = Sz::parse_from_str("1.234").unwrap();
+        assert_eq!(sz_to_fixed(sz, -3), 1234);
+    }
+
+    #[test]
+    fn qty_exponent_negative_eight_is_identity() {
+        // qty_exponent=-8 means the wire representation already matches Sz::value().
+        let sz = Sz::parse_from_str("0.00000017").unwrap();
+        assert_eq!(sz_to_fixed(sz, -8), sz.value());
+    }
+
+    #[test]
+    fn zero_quantity_is_zero() {
+        assert_eq!(sz_to_fixed(Sz::new(0), -3), 0);
+        assert_eq!(sz_to_fixed(Sz::new(0), 0), 0);
+    }
+}

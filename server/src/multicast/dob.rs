@@ -350,6 +350,8 @@ impl DobSnapshotEmitter {
     /// snapshot was anchored; subscribers reconcile the snapshot stream with
     /// the delta stream against this value. `last_instrument_seq` is the most
     /// recently emitted per-instrument seq for `instrument_id` (or 0 if none).
+    /// `qty_exponent` is the venue's per-instrument exponent used to scale
+    /// each `SnapshotOrder.quantity` from internal `Sz` (10^8 fixed) to wire.
     /// The empty-orders case is supported and emits Begin + End with no
     /// `SnapshotOrder` frames in between.
     pub(crate) async fn emit_snapshot(
@@ -357,6 +359,7 @@ impl DobSnapshotEmitter {
         instrument_id: u32,
         anchor_seq: u64,
         last_instrument_seq: u32,
+        qty_exponent: i8,
         orders: Vec<crate::types::inner::InnerL4Order>,
     ) -> std::io::Result<()> {
         let snapshot_id = self.next_snapshot_id();
@@ -428,7 +431,7 @@ impl DobSnapshotEmitter {
                 order_flags: 0, // Phase 1 leaves these at 0; mirrors OrderAdd in dob_tap.
                 enter_timestamp_ns,
                 price: order.limit_px.value() as i64,
-                quantity: order.sz.value(),
+                quantity: crate::order_book::sz_to_fixed(order.sz, qty_exponent),
             };
             encode_snapshot_order(buf, &msg);
             fb.commit_message();
@@ -512,7 +515,9 @@ pub(crate) async fn run_dob_snapshot_task(
         if let Some(DobSnapshotRequest::Priority { instrument_id, anchor_seq }) =
             priority_queue.pop_front()
         {
-            let Some(coin) = lookup_coin_for_instrument(&registry, instrument_id).await else {
+            let Some((coin, qty_exponent)) =
+                lookup_coin_for_instrument(&registry, instrument_id).await
+            else {
                 log::warn!(
                     "dob_snapshot: priority request for unknown instrument_id {instrument_id}, skipping"
                 );
@@ -533,7 +538,7 @@ pub(crate) async fn run_dob_snapshot_task(
                 .clone_coin_orders(&coin)
                 .unwrap_or_default();
             emitter
-                .emit_snapshot(instrument_id, anchor_seq, last_instrument_seq, orders)
+                .emit_snapshot(instrument_id, anchor_seq, last_instrument_seq, qty_exponent, orders)
                 .await?;
             continue;
         }
@@ -548,7 +553,7 @@ pub(crate) async fn run_dob_snapshot_task(
         let active_len = u32::try_from(active.len()).unwrap_or(u32::MAX).max(1);
         let slot_budget = emitter.config.round_duration / active_len;
 
-        for (instrument_id, coin) in active {
+        for (instrument_id, coin, qty_exponent) in active {
             // Re-check the priority queue between slots so a recovery snapshot
             // does not have to wait a full cycle.
             loop {
@@ -581,7 +586,7 @@ pub(crate) async fn run_dob_snapshot_task(
 
             let emit_start = std::time::Instant::now();
             emitter
-                .emit_snapshot(instrument_id, anchor_seq, last_instrument_seq, orders)
+                .emit_snapshot(instrument_id, anchor_seq, last_instrument_seq, qty_exponent, orders)
                 .await?;
             let elapsed = emit_start.elapsed();
             if elapsed < slot_budget {
@@ -591,32 +596,32 @@ pub(crate) async fn run_dob_snapshot_task(
     }
 }
 
-/// Linear-scan lookup of `instrument_id -> Coin` against the active instrument
-/// set. Used by the priority path; cost is fine because priority requests are
-/// rare (only on validation mismatch via `apply_recovery`).
+/// Linear-scan lookup of `instrument_id -> (Coin, qty_exponent)` against the
+/// active instrument set. Used by the priority path; cost is fine because
+/// priority requests are rare (only on validation mismatch via `apply_recovery`).
 async fn lookup_coin_for_instrument(
     registry: &Arc<tokio::sync::RwLock<crate::instruments::RegistryState>>,
     instrument_id: u32,
-) -> Option<crate::order_book::Coin> {
+) -> Option<(crate::order_book::Coin, i8)> {
     let state = registry.read().await;
     state
         .active
         .iter()
         .find(|(_coin, info)| info.instrument_id == instrument_id)
-        .map(|(coin, _info)| crate::order_book::Coin::new(coin))
+        .map(|(coin, info)| (crate::order_book::Coin::new(coin), info.qty_exponent))
 }
 
-/// Snapshot of the active instrument set as `(instrument_id, Coin)` pairs.
-/// The scheduler iterates this once per round; if the set changes mid-cycle
-/// we'll pick up the change on the next round.
+/// Snapshot of the active instrument set as `(instrument_id, Coin, qty_exponent)`
+/// triples. The scheduler iterates this once per round; if the set changes
+/// mid-cycle we'll pick up the change on the next round.
 async fn list_active_instruments(
     registry: &Arc<tokio::sync::RwLock<crate::instruments::RegistryState>>,
-) -> Vec<(u32, crate::order_book::Coin)> {
+) -> Vec<(u32, crate::order_book::Coin, i8)> {
     let state = registry.read().await;
     state
         .active
         .iter()
-        .map(|(coin, info)| (info.instrument_id, crate::order_book::Coin::new(coin)))
+        .map(|(coin, info)| (info.instrument_id, crate::order_book::Coin::new(coin), info.qty_exponent))
         .collect()
 }
 
@@ -1086,5 +1091,154 @@ mod snapshot_anchor_tests {
         );
 
         handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod snapshot_qty_scaling_tests {
+    //! Verifies `SnapshotOrder.quantity` is scaled to the venue's
+    //! `qty_exponent` (issue #10). Internal `Sz` carries quantity at the
+    //! publisher's fixed 10^8 scale; the wire field must be
+    //! `qty * 10^-qty_exponent` (i.e. `Sz::value() / 10^(8 + qty_exponent)`).
+    use super::*;
+    use crate::order_book::{Coin, Px, Side, Sz};
+    use crate::protocol::dob::constants::{
+        DEFAULT_MTU, FRAME_HEADER_SIZE, MSG_TYPE_SNAPSHOT_ORDER, SNAPSHOT_ORDER_SIZE,
+    };
+    use alloy::primitives::Address;
+    use tokio::net::UdpSocket;
+
+    fn make_inner_order(coin: &Coin, oid: u64, side: Side, px: &str, sz: &str) -> crate::types::inner::InnerL4Order {
+        crate::types::inner::InnerL4Order {
+            user: Address::new([0; 20]),
+            coin: coin.clone(),
+            side,
+            limit_px: Px::parse_from_str(px).unwrap(),
+            sz: Sz::parse_from_str(sz).unwrap(),
+            oid,
+            timestamp: 0,
+            trigger_condition: String::new(),
+            is_trigger: false,
+            trigger_px: String::new(),
+            is_position_tpsl: false,
+            reduce_only: false,
+            order_type: String::new(),
+            tif: None,
+            cloid: None,
+        }
+    }
+
+    /// Walks the captured datagrams and returns the `quantity` field of the
+    /// first `SnapshotOrder` found. Each datagram is one DoB frame; a single
+    /// frame may pack multiple SnapshotOrder messages, but the first message
+    /// in the frame is sufficient to verify scaling.
+    fn first_snapshot_order_quantity(frames: &[Vec<u8>]) -> Option<u64> {
+        for frame in frames {
+            if frame.len() < FRAME_HEADER_SIZE + SNAPSHOT_ORDER_SIZE {
+                continue;
+            }
+            let body = &frame[FRAME_HEADER_SIZE..];
+            if body[0] != MSG_TYPE_SNAPSHOT_ORDER {
+                continue;
+            }
+            // SnapshotOrder body offsets: quantity at 36..44 (see encode_snapshot_order).
+            return Some(u64::from_le_bytes(body[36..44].try_into().ok()?));
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn snapshot_order_quantity_scales_to_qty_exponent() {
+        // 1. Bind collector and the snapshot emitter pointing at it.
+        let collector = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let collector_addr = match collector.local_addr().unwrap() {
+            std::net::SocketAddr::V4(a) => a,
+            _ => unreachable!(),
+        };
+        let mut emitter = DobSnapshotEmitter::bind(DobSnapshotConfig {
+            group_addr: *collector_addr.ip(),
+            port: collector_addr.port(),
+            bind_addr: Ipv4Addr::LOCALHOST,
+            channel_id: 0,
+            mtu: DEFAULT_MTU,
+            round_duration: Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+
+        // 2. One order with sz="1.234" → Sz::value() == 1.234 * 1e8 == 123_400_000.
+        //    With qty_exponent=-3, wire quantity must be 1234.
+        let coin = Coin::new("BTC");
+        let orders = vec![make_inner_order(&coin, 42, Side::Bid, "100", "1.234")];
+
+        // 3. Emit one snapshot triad.
+        emitter
+            .emit_snapshot(
+                /* instrument_id = */ 0,
+                /* anchor_seq = */ 0,
+                /* last_instrument_seq = */ 0,
+                /* qty_exponent = */ -3,
+                orders,
+            )
+            .await
+            .unwrap();
+
+        // 4. Drain frames (Begin, Orders, End all emit immediately above).
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let mut buf = [0u8; 4096];
+            match tokio::time::timeout(Duration::from_millis(200), collector.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => frames.push(buf[..n].to_vec()),
+                _ => break,
+            }
+        }
+
+        // 5. Verify the SnapshotOrder.quantity was scaled to qty_exponent.
+        let qty = first_snapshot_order_quantity(&frames)
+            .expect("captured at least one SnapshotOrder frame");
+        assert_eq!(
+            qty, 1234,
+            "SnapshotOrder.quantity must equal 1234 for sz=1.234 at qty_exponent=-3 (got {})",
+            qty,
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_order_quantity_at_qty_exponent_zero() {
+        // qty_exponent=0 case (e.g. instrument 2Z from issue #10): wire must
+        // be the integer count, not Sz::value() (which is qty * 1e8).
+        let collector = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let collector_addr = match collector.local_addr().unwrap() {
+            std::net::SocketAddr::V4(a) => a,
+            _ => unreachable!(),
+        };
+        let mut emitter = DobSnapshotEmitter::bind(DobSnapshotConfig {
+            group_addr: *collector_addr.ip(),
+            port: collector_addr.port(),
+            bind_addr: Ipv4Addr::LOCALHOST,
+            channel_id: 0,
+            mtu: DEFAULT_MTU,
+            round_duration: Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+
+        let coin = Coin::new("2Z");
+        let orders = vec![make_inner_order(&coin, 42, Side::Bid, "100", "2921")];
+
+        emitter.emit_snapshot(0, 0, 0, 0, orders).await.unwrap();
+
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let mut buf = [0u8; 4096];
+            match tokio::time::timeout(Duration::from_millis(200), collector.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => frames.push(buf[..n].to_vec()),
+                _ => break,
+            }
+        }
+
+        let qty = first_snapshot_order_quantity(&frames)
+            .expect("captured at least one SnapshotOrder frame");
+        assert_eq!(qty, 2921);
     }
 }

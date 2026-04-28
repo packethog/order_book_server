@@ -10,7 +10,7 @@
 use crate::{
     multicast::dob::{DobEvent, DobEventSender},
     order_book::{
-        Coin, Oid, Px, Side, Sz,
+        Coin, Oid, Px, Side, Sz, sz_to_fixed,
         per_instrument_seq::PerInstrumentSeqCounter,
     },
     protocol::dob::{
@@ -34,12 +34,18 @@ use tokio::sync::mpsc::error::TrySendError;
 /// an `.await`, so a sync mutex is the correct primitive.
 pub(crate) type SharedSeqCounter = Arc<Mutex<PerInstrumentSeqCounter>>;
 
+/// Resolver returning the on-wire `(instrument_id, qty_exponent)` for a coin,
+/// or `None` if the coin is not in the active registry. The `qty_exponent` is
+/// required so emitted quantities can be scaled to the venue's per-instrument
+/// fixed-point representation (the publisher's internal `Sz` is at 10^8).
+pub(crate) type CoinResolver = Box<dyn Fn(&Coin) -> Option<(u32, i8)> + Send + Sync>;
+
 pub(crate) struct DobApplyTap {
     sender: DobEventSender,
     seq: SharedSeqCounter,
     source_id: u16,
     channel_id: u8,
-    coin_resolver: Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync>,
+    coin_resolver: CoinResolver,
 }
 
 impl DobApplyTap {
@@ -53,14 +59,14 @@ impl DobApplyTap {
         source_id: u16,
         channel_id: u8,
         seq: SharedSeqCounter,
-        coin_resolver: Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync>,
+        coin_resolver: CoinResolver,
     ) -> Self {
         Self { sender, seq, source_id, channel_id, coin_resolver }
     }
 
     /// Emits an `OrderAdd` event for a newly resting order.
     pub(crate) fn emit_order_add(&mut self, coin: &Coin, inner_order: &InnerL4Order, timestamp_ns: u64) {
-        let Some(instrument_id) = (self.coin_resolver)(coin) else {
+        let Some((instrument_id, qty_exponent)) = (self.coin_resolver)(coin) else {
             log::warn!("dob_tap: unknown coin '{}' — skipping OrderAdd", coin.value());
             return;
         };
@@ -78,14 +84,14 @@ impl DobApplyTap {
             order_id: inner_order.oid,
             enter_timestamp_ns: timestamp_ns,
             price: inner_order.limit_px.value() as i64,
-            quantity: inner_order.sz.value(),
+            quantity: sz_to_fixed(inner_order.sz, qty_exponent),
         });
         self.try_send(event, "OrderAdd");
     }
 
     /// Emits an `OrderCancel` event when an order is removed from the book.
     pub(crate) fn emit_order_cancel(&mut self, coin: &Coin, oid: Oid, timestamp_ns: u64) {
-        let Some(instrument_id) = (self.coin_resolver)(coin) else {
+        let Some((instrument_id, _qty_exponent)) = (self.coin_resolver)(coin) else {
             log::warn!("dob_tap: unknown coin '{}' — skipping OrderCancel", coin.value());
             return;
         };
@@ -110,7 +116,7 @@ impl DobApplyTap {
         exec_quantity: Sz,
         timestamp_ns: u64,
     ) {
-        let Some(instrument_id) = (self.coin_resolver)(coin) else {
+        let Some((instrument_id, qty_exponent)) = (self.coin_resolver)(coin) else {
             log::warn!("dob_tap: unknown coin '{}' — skipping OrderExecute", coin.value());
             return;
         };
@@ -125,7 +131,7 @@ impl DobApplyTap {
             trade_id: 0, // Phase 1: no trade_id available from diff alone
             timestamp_ns,
             exec_price: exec_price.value() as i64,
-            exec_quantity: exec_quantity.value(),
+            exec_quantity: sz_to_fixed(exec_quantity, qty_exponent),
         });
         self.try_send(event, "OrderExecute");
     }
@@ -163,8 +169,16 @@ mod tests {
         Coin::new("BTC")
     }
 
-    fn btc_resolver() -> Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync> {
-        Box::new(|coin: &Coin| if coin.value() == "BTC" { Some(0) } else { None })
+    /// Default resolver: BTC -> (id=0, qty_exponent=-8). The -8 case is the
+    /// no-op for `sz_to_fixed`, so existing tests that assert on `Sz::value()`
+    /// (e.g. 50_000_000 from a parsed `Sz`) continue to hold.
+    fn btc_resolver() -> CoinResolver {
+        Box::new(|coin: &Coin| if coin.value() == "BTC" { Some((0, -8)) } else { None })
+    }
+
+    /// Resolver with a non-trivial qty_exponent for testing wire scaling.
+    fn btc_resolver_with_qty_exponent(qty_exponent: i8) -> CoinResolver {
+        Box::new(move |coin: &Coin| if coin.value() == "BTC" { Some((0, qty_exponent)) } else { None })
     }
 
     fn make_inner_order(oid: u64, side: Side, limit_px: u64, sz: u64) -> InnerL4Order {
@@ -324,6 +338,90 @@ mod tests {
                 assert_eq!(msg.batch_id, 999);
             }
             other => panic!("expected BatchBoundary, got {:?}", other),
+        }
+    }
+
+    /// `Sz::parse_from_str("0.5")` is `0.5 * 1e8 = 50_000_000` internally.
+    /// With `qty_exponent = -3`, the wire representation is `0.5 * 10^3 = 500`.
+    #[tokio::test]
+    async fn emit_order_add_scales_quantity_to_qty_exponent() {
+        let (tx, mut rx) = channel(4);
+        let seq = Arc::new(Mutex::new(PerInstrumentSeqCounter::new()));
+        let mut tap = DobApplyTap::new(tx, 1, 0, seq, btc_resolver_with_qty_exponent(-3));
+        let order = make_inner_order(
+            42,
+            Side::Bid,
+            Px::parse_from_str("100").unwrap().value(),
+            Sz::parse_from_str("0.5").unwrap().value(),
+        );
+
+        tap.emit_order_add(&btc_coin(), &order, 1_000);
+
+        match rx.recv().await.unwrap() {
+            DobEvent::OrderAdd(msg) => {
+                assert_eq!(
+                    msg.quantity, 500,
+                    "quantity must be scaled to qty_exponent=-3 (expected 500, got {})",
+                    msg.quantity,
+                );
+            }
+            other => panic!("expected OrderAdd, got {other:?}"),
+        }
+    }
+
+    /// `qty_exponent = 0` (e.g. instrument `2Z` from issue #10) — wire qty must
+    /// be the integer count (`Sz::value() / 1e8`), not the raw 10^8 internal.
+    #[tokio::test]
+    async fn emit_order_add_scales_quantity_at_qty_exponent_zero() {
+        let (tx, mut rx) = channel(4);
+        let seq = Arc::new(Mutex::new(PerInstrumentSeqCounter::new()));
+        let mut tap = DobApplyTap::new(tx, 1, 0, seq, btc_resolver_with_qty_exponent(0));
+        let order = make_inner_order(
+            42,
+            Side::Bid,
+            Px::parse_from_str("100").unwrap().value(),
+            Sz::parse_from_str("2921").unwrap().value(),
+        );
+
+        tap.emit_order_add(&btc_coin(), &order, 1_000);
+
+        match rx.recv().await.unwrap() {
+            DobEvent::OrderAdd(msg) => {
+                assert_eq!(
+                    msg.quantity, 2921,
+                    "quantity must be scaled to qty_exponent=0 (expected 2921, got {})",
+                    msg.quantity,
+                );
+            }
+            other => panic!("expected OrderAdd, got {other:?}"),
+        }
+    }
+
+    /// `OrderExecute.exec_quantity` must follow the same scaling rule.
+    #[tokio::test]
+    async fn emit_order_execute_scales_exec_quantity_to_qty_exponent() {
+        let (tx, mut rx) = channel(4);
+        let seq = Arc::new(Mutex::new(PerInstrumentSeqCounter::new()));
+        let mut tap = DobApplyTap::new(tx, 1, 0, seq, btc_resolver_with_qty_exponent(-3));
+        let exec_quantity = Sz::parse_from_str("1.234").unwrap();
+
+        tap.emit_order_execute(
+            &btc_coin(),
+            Oid::new(77),
+            Px::parse_from_str("100").unwrap(),
+            exec_quantity,
+            2_000,
+        );
+
+        match rx.recv().await.unwrap() {
+            DobEvent::OrderExecute(msg) => {
+                assert_eq!(
+                    msg.exec_quantity, 1234,
+                    "exec_quantity must be scaled to qty_exponent=-3 (expected 1234, got {})",
+                    msg.exec_quantity,
+                );
+            }
+            other => panic!("expected OrderExecute, got {other:?}"),
         }
     }
 }
