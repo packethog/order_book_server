@@ -66,13 +66,11 @@ use crate::types::inner::InnerL4Order;
 use crate::types::node_data::{Batch, NodeDataOrderDiff, NodeDataOrderStatus};
 use crate::types::{L4Order, OrderDiff};
 
-/// Use exponent -8 so that fixed-point scales of TOB and DoB align with the
-/// internal `Px`/`Sz` representation (which is `value * 1e8`). With -8,
-/// `price_to_fixed("100", -8) == 10_000_000_000 == Px("100").value()`, so a
-/// price of 100 in human form survives both encoding paths as the same
-/// `i64` on the wire.
+/// Price exponent stays at -8 across all parity-test scenarios so that the
+/// internal `Px` representation (`value * 1e8`) aligns with both TOB and DoB
+/// price encodings. (Price-side scaling for non-trivial `price_exponent` is a
+/// separate concern and not covered by this test family.)
 const PRICE_EXPONENT: i8 = -8;
-const QTY_EXPONENT: i8 = -8;
 const TEST_INSTRUMENT_ID: u32 = 0;
 const TEST_COIN: &str = "BTC";
 
@@ -191,9 +189,9 @@ fn cancel_diff(oid: u64, px: &str) -> NodeDataOrderDiff {
 }
 
 /// Build a registry containing a single instrument matching `TEST_COIN` /
-/// `TEST_INSTRUMENT_ID`, with the price/qty exponents the parity test
-/// requires.
-fn build_test_registry() -> RegistryState {
+/// `TEST_INSTRUMENT_ID`, with the given `qty_exponent`. The `price_exponent`
+/// is fixed at `PRICE_EXPONENT`.
+fn build_test_registry(qty_exponent: i8) -> RegistryState {
     RegistryState::new(vec![UniverseEntry {
         instrument_id: TEST_INSTRUMENT_ID,
         coin: TEST_COIN.to_string(),
@@ -201,7 +199,7 @@ fn build_test_registry() -> RegistryState {
         info: InstrumentInfo {
             instrument_id: TEST_INSTRUMENT_ID,
             price_exponent: PRICE_EXPONENT,
-            qty_exponent: QTY_EXPONENT,
+            qty_exponent,
             symbol: make_symbol(TEST_COIN),
         },
     }])
@@ -258,8 +256,12 @@ async fn drain_collector(sock: &UdpSocket, timeout: Duration) -> Vec<Vec<u8>> {
     frames
 }
 
-#[tokio::test]
-async fn tob_dob_best_bid_ask_parity_at_end_state() {
+/// Runs the full TOB/DoB parity scenario at a given `qty_exponent`. The
+/// scenario applies the same fixed sequence of L4 events; only the registry's
+/// `qty_exponent` (and therefore the on-wire qty scaling) varies. End-state
+/// quantities are bid=2 and ask=7 (decimal), which the assertions verify
+/// after applying the wire scaling rule `wire = decimal * 10^-qty_exponent`.
+async fn run_tob_dob_parity_scenario(qty_exponent: i8) {
     // 1. Bind a UDP collector that the DoB emitter will multicast-loop into.
     let dob_collector = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .await
@@ -304,8 +306,8 @@ async fn tob_dob_best_bid_ask_parity_at_end_state() {
         /* source_id = */ 1,
         /* channel_id = */ 0,
         seq_counter.clone(),
-        Box::new(|c: &Coin| {
-            if c.value() == TEST_COIN { Some(TEST_INSTRUMENT_ID) } else { None }
+        Box::new(move |c: &Coin| {
+            if c.value() == TEST_COIN { Some((TEST_INSTRUMENT_ID, qty_exponent)) } else { None }
         }),
     );
     listener.set_dob_tap(tap);
@@ -420,7 +422,7 @@ async fn tob_dob_best_bid_ask_parity_at_end_state() {
     //    does. The actual websocket-server publisher loop is intentionally
     //    NOT spun up: the conversion is the load-bearing step, and decoupling
     //    keeps the test fast and deterministic.
-    let registry = build_test_registry();
+    let registry = build_test_registry(qty_exponent);
     let inst = registry.active.get(TEST_COIN).expect("instrument registered").clone();
     let (_time, l2_snapshots) = listener.l2_snapshots_for_test().expect("snapshot ready");
     let (tob_bid_price, tob_bid_qty, tob_ask_price, tob_ask_qty) =
@@ -479,9 +481,37 @@ async fn tob_dob_best_bid_ask_parity_at_end_state() {
     );
 
     // Sanity: the test sequence ends with bid=100 (qty=2), ask=109 (qty=7).
-    // With PRICE_EXPONENT=QTY_EXPONENT=-8 these become _ × 1e8.
+    // PRICE_EXPONENT=-8 fixes the price scale to × 1e8; qty scale follows
+    // `qty_exponent`: wire = decimal × 10^-qty_exponent.
+    let qty_scale = 10u64.pow(((-qty_exponent) as i32).max(0) as u32);
     assert_eq!(tob_bid_price, 100 * 100_000_000);
-    assert_eq!(tob_bid_qty, 2 * 100_000_000);
+    assert_eq!(tob_bid_qty, 2 * qty_scale);
     assert_eq!(tob_ask_price, 109 * 100_000_000);
-    assert_eq!(tob_ask_qty, 7 * 100_000_000);
+    assert_eq!(tob_ask_qty, 7 * qty_scale);
+}
+
+/// Original parity test at `qty_exponent = -8`: this is the no-op case for
+/// `sz_to_fixed` (publisher's internal `Sz` already at 10^8). Confirms TOB
+/// and DoB still agree under the trivial scaling.
+#[tokio::test]
+async fn tob_dob_best_bid_ask_parity_at_qty_exponent_neg8() {
+    run_tob_dob_parity_scenario(-8).await;
+}
+
+/// Parity test at `qty_exponent = -3` — the regression test for issue #10.
+/// Before the fix, DoB emitted `OrderAdd.quantity` and
+/// `OrderExecute.exec_quantity` at the publisher's raw 10^8 scale while TOB
+/// emitted the venue's per-instrument scale, so this assertion would fail
+/// with `dob_qty = tob_qty * 10^(8 + qty_exponent)`.
+#[tokio::test]
+async fn tob_dob_best_bid_ask_parity_at_qty_exponent_neg3() {
+    run_tob_dob_parity_scenario(-3).await;
+}
+
+/// Parity test at `qty_exponent = 0` — exercises the integer-only case (e.g.
+/// instrument `2Z` from issue #10). With the bug present, the failure is
+/// most extreme here: `dob_qty / tob_qty == 10^8`.
+#[tokio::test]
+async fn tob_dob_best_bid_ask_parity_at_qty_exponent_zero() {
+    run_tob_dob_parity_scenario(0).await;
 }

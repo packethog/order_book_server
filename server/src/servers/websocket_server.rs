@@ -150,10 +150,14 @@ pub async fn run_websocket_server(
 
         // Coin resolver for the apply tap: non-blocking try_read() so it is
         // safe to call from the sync apply_updates path without risk of
-        // blocking a tokio worker.
-        let coin_resolver: Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync> = {
+        // blocking a tokio worker. Returns `(instrument_id, qty_exponent)` so
+        // the tap can scale internal `Sz` (10^8 fixed) to the venue's wire
+        // representation per instrument.
+        let coin_resolver: crate::listeners::order_book::dob_tap::CoinResolver = {
             let reg = Arc::clone(&registry);
-            Box::new(move |coin: &Coin| reg.try_read().ok()?.active.get(&coin.value()).map(|info| info.instrument_id))
+            Box::new(move |coin: &Coin| {
+                reg.try_read().ok()?.active.get(&coin.value()).map(|info| (info.instrument_id, info.qty_exponent))
+            })
         };
         // Shared per-instrument seq counter: bumped by the apply tap, read by
         // the snapshot emitter when populating SnapshotBegin.last_instrument_seq.
