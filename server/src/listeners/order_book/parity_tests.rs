@@ -217,7 +217,7 @@ fn derive_tob_quote_prices(
         HashMap<L2SnapshotParams, crate::order_book::Snapshot<crate::types::inner::InnerLevel>>,
     >,
     inst: &InstrumentInfo,
-) -> Option<(i64, i64)> {
+) -> Option<(i64, u64, i64, u64)> {
     let coin = Coin::new(TEST_COIN);
     let params_map = snapshot_map.get(&coin)?;
     let default_params = L2SnapshotParams::new(None, None);
@@ -233,13 +233,15 @@ fn derive_tob_quote_prices(
         .first()
         .and_then(|level| price_to_fixed(level.px(), inst.price_exponent))
         .unwrap_or(0);
-    let _bid_qty = bids
+    let bid_qty = bids
         .first()
-        .and_then(|level| qty_to_fixed(level.sz(), inst.qty_exponent));
-    let _ask_qty = asks
+        .and_then(|level| qty_to_fixed(level.sz(), inst.qty_exponent))
+        .unwrap_or(0);
+    let ask_qty = asks
         .first()
-        .and_then(|level| qty_to_fixed(level.sz(), inst.qty_exponent));
-    Some((bid_price, ask_price))
+        .and_then(|level| qty_to_fixed(level.sz(), inst.qty_exponent))
+        .unwrap_or(0);
+    Some((bid_price, bid_qty, ask_price, ask_qty))
 }
 
 /// Drains the UDP collector for `timeout`. Each datagram is one DoB frame.
@@ -421,7 +423,7 @@ async fn tob_dob_best_bid_ask_parity_at_end_state() {
     let registry = build_test_registry();
     let inst = registry.active.get(TEST_COIN).expect("instrument registered").clone();
     let (_time, l2_snapshots) = listener.l2_snapshots_for_test().expect("snapshot ready");
-    let (tob_bid_price, tob_ask_price) =
+    let (tob_bid_price, tob_bid_qty, tob_ask_price, tob_ask_qty) =
         derive_tob_quote_prices(l2_snapshots.as_ref(), &inst).expect("instrument in snapshot");
 
     // 7. Tear down the emitter so its loop drains and frames hit the wire,
@@ -454,20 +456,32 @@ async fn tob_dob_best_bid_ask_parity_at_end_state() {
     let dob_best_bid = book.best_bid().expect("subscriber has a best bid at end-state");
     let dob_best_ask = book.best_ask().expect("subscriber has a best ask at end-state");
 
-    // 9. Compare. TOB and DoB MUST agree on best bid/ask price.
+    // 9. Compare. TOB and DoB MUST agree on best bid/ask price AND size.
     assert_eq!(
         tob_bid_price, dob_best_bid.0,
-        "TOB best bid ({}) != DoB best bid ({}) — apply-step parity violation",
+        "TOB best bid price ({}) != DoB best bid price ({}) — apply-step parity violation",
         tob_bid_price, dob_best_bid.0,
     );
     assert_eq!(
+        tob_bid_qty, dob_best_bid.1,
+        "TOB best bid qty ({}) != DoB best bid qty ({}) — apply-step parity violation",
+        tob_bid_qty, dob_best_bid.1,
+    );
+    assert_eq!(
         tob_ask_price, dob_best_ask.0,
-        "TOB best ask ({}) != DoB best ask ({}) — apply-step parity violation",
+        "TOB best ask price ({}) != DoB best ask price ({}) — apply-step parity violation",
         tob_ask_price, dob_best_ask.0,
+    );
+    assert_eq!(
+        tob_ask_qty, dob_best_ask.1,
+        "TOB best ask qty ({}) != DoB best ask qty ({}) — apply-step parity violation",
+        tob_ask_qty, dob_best_ask.1,
     );
 
-    // Sanity: the test sequence ends with bid=100, ask=109. With
-    // PRICE_EXPONENT=-8 these become 1e10 and 1.09e10 respectively.
+    // Sanity: the test sequence ends with bid=100 (qty=2), ask=109 (qty=7).
+    // With PRICE_EXPONENT=QTY_EXPONENT=-8 these become _ × 1e8.
     assert_eq!(tob_bid_price, 100 * 100_000_000);
+    assert_eq!(tob_bid_qty, 2 * 100_000_000);
     assert_eq!(tob_ask_price, 109 * 100_000_000);
+    assert_eq!(tob_ask_qty, 7 * 100_000_000);
 }
