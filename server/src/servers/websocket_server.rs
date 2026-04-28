@@ -1,12 +1,16 @@
 use crate::{
     instruments::RegistryState,
     listeners::order_book::{
-        InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, dob_tap::DobApplyTap,
-        hl_listen,
+        DobReplayTaps, InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener,
+        TimedSnapshots, dob_tap::DobApplyTap, hl_listen,
     },
     multicast::{
         config::{DobConfig, MulticastConfig},
-        dob::{DobEmitter, DobEvent, DobMktdataConfig, DobRefdataConfig, channel as dob_channel, run_dob_emitter, run_dob_refdata_task},
+        dob::{
+            DobEmitter, DobEvent, DobMktdataConfig, DobRefdataConfig, DobSnapshotConfig,
+            DobSnapshotEmitter, channel as dob_channel, run_dob_emitter, run_dob_refdata_task,
+            run_dob_snapshot_task, snapshot_request_channel,
+        },
         publisher::MulticastPublisher,
     },
     order_book::{Coin, Snapshot},
@@ -24,7 +28,7 @@ use log::{error, info};
 use std::{
     collections::{HashMap, HashSet},
     env::home_dir,
-    sync::Arc,
+    sync::{Arc, RwLock as StdRwLock, atomic::AtomicU64},
 };
 use tokio::select;
 use tokio::{
@@ -131,15 +135,86 @@ pub async fn run_websocket_server(
 
         let (dob_tx, dob_rx) = dob_channel(cfg.channel_bound);
 
-        // Coin resolver: non-blocking try_read() so it is safe to call from the
-        // sync apply_updates path without risk of blocking a tokio worker.
+        // Single shared mktdata-port frame seq, threaded through:
+        //   1. the mktdata emitter (writer; fetch_add for each frame),
+        //   2. the snapshot scheduler (reader; load to stamp anchor_seq), and
+        //   3. the recovery path inside the listener (writer; fetch_add when
+        //      reserving an InstrumentReset.new_anchor_seq).
+        // Sharing this atomic across all three is what guarantees subscribers
+        // can reconcile snapshots vs. deltas via anchor_seq without collisions.
+        let mktdata_seq = Arc::new(AtomicU64::new(0));
+
+        // Snapshot request channel: DobReplayTaps pushes Priority requests on
+        // recovery; the snapshot scheduler drains them ahead of round-robin.
+        let (snapshot_req_tx, snapshot_req_rx) = snapshot_request_channel(cfg.channel_bound);
+
+        // Coin resolver for the apply tap: non-blocking try_read() so it is
+        // safe to call from the sync apply_updates path without risk of
+        // blocking a tokio worker.
         let coin_resolver: Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync> = {
             let reg = Arc::clone(&registry);
             Box::new(move |coin: &Coin| reg.try_read().ok()?.active.get(&coin.value()).map(|info| info.instrument_id))
         };
-        let tap = DobApplyTap::new(dob_tx.clone(), cfg.source_id, cfg.channel_id, coin_resolver);
+        // Shared per-instrument seq counter: bumped by the apply tap, read by
+        // the snapshot emitter when populating SnapshotBegin.last_instrument_seq.
+        let seq_counter = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::order_book::PerInstrumentSeqCounter::new(),
+        ));
+        let tap = DobApplyTap::new(
+            dob_tx.clone(),
+            cfg.source_id,
+            cfg.channel_id,
+            seq_counter.clone(),
+            coin_resolver,
+        );
         listener.lock().await.set_dob_tap(tap);
 
+        // Synchronous instrument-id cache for the recovery path. The
+        // DobReplayTaps closure must be sync (called from inside the
+        // synchronous apply_recovery), so we maintain a HashMap<Coin, u32>
+        // snapshot of the registry's `active` map under a std::sync::RwLock.
+        // TODO: Refresh this cache on each registry-refresh tick. Hook point:
+        // `instruments/hyperliquid.rs::refresh_task` — at the end of its success
+        // path (after `*guard = new_state` around line 225), rebuild the cache
+        // from the new universe and store via this Arc<RwLock>. Pass the Arc
+        // into refresh_task as a new parameter, or wrap both in a small struct
+        // that holds the registry + cache atomically.
+        //
+        // Until this is wired, the cache reflects the active set as of process
+        // startup. New listings (e.g., builder-DEX coins added mid-run) won't
+        // resolve here; recovery for those coins will skip InstrumentReset and
+        // log an error per the resolver's contract in
+        // listeners/order_book/mod.rs's emit_dob_instrument_reset.
+        let instrument_id_cache: Arc<StdRwLock<HashMap<Coin, u32>>> = {
+            let registry_state = registry.read().await;
+            let mut map = HashMap::new();
+            for (coin_str, info) in &registry_state.active {
+                map.insert(Coin::new(coin_str), info.instrument_id);
+            }
+            Arc::new(StdRwLock::new(map))
+        };
+        let instrument_id_for: Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync> = {
+            let cache = instrument_id_cache.clone();
+            Box::new(move |coin: &Coin| -> Option<u32> {
+                cache.read().ok()?.get(coin).copied()
+            })
+        };
+
+        let dob_replay_taps = DobReplayTaps {
+            mktdata_tx: dob_tx.clone(),
+            snapshot_request_tx: snapshot_req_tx,
+            mktdata_seq: mktdata_seq.clone(),
+            instrument_id_for,
+        };
+        listener.lock().await.attach_dob_replay_taps(dob_replay_taps);
+
+        // Bind the mktdata and snapshot sockets up front, BEFORE spawning any
+        // emitter task. If snapshot bind fails we exit before any mktdata
+        // frames hit the wire — externally-visible subscribers must never
+        // observe deltas without a snapshot stream backing them.
+        // (Refdata's task constructs its socket internally inside
+        // `run_dob_refdata_task`, so it is spawned alongside the others
+        // below; a refdata bind failure would surface from that task only.)
         let mktdata_cfg = DobMktdataConfig {
             group_addr: cfg.group_addr,
             port: cfg.mktdata_port,
@@ -148,15 +223,32 @@ pub async fn run_websocket_server(
             mtu: cfg.mtu,
             heartbeat_interval: cfg.heartbeat_interval,
         };
-        let emitter = match DobEmitter::bind(mktdata_cfg).await {
+        let mktdata_emitter = match DobEmitter::bind_with_seq(mktdata_cfg, mktdata_seq.clone()).await {
             Ok(e) => e,
             Err(err) => {
                 log::error!("failed to bind DoB mktdata socket: {err}");
                 std::process::exit(3);
             }
         };
-        tokio::spawn(run_dob_emitter(emitter, dob_rx));
+        let snapshot_emitter = match DobSnapshotEmitter::bind(DobSnapshotConfig {
+            group_addr: cfg.group_addr,
+            port: cfg.snapshot_port,
+            bind_addr: cfg.bind_addr,
+            channel_id: cfg.channel_id,
+            mtu: cfg.snapshot_mtu,
+            round_duration: cfg.snapshot_round_duration,
+        })
+        .await
+        {
+            Ok(e) => e,
+            Err(err) => {
+                log::error!("failed to bind DoB snapshot socket: {err}");
+                std::process::exit(3);
+            }
+        };
 
+        // Both sockets are bound; now spawn the emitter tasks.
+        tokio::spawn(run_dob_emitter(mktdata_emitter, dob_rx));
         tokio::spawn(run_dob_refdata_task(
             DobRefdataConfig {
                 group_addr: cfg.group_addr,
@@ -167,7 +259,15 @@ pub async fn run_websocket_server(
                 definition_cycle: cfg.definition_cycle,
                 manifest_cadence: cfg.manifest_cadence,
             },
-            crate::instruments::InstrumentRegistry::from_arc(registry),
+            crate::instruments::InstrumentRegistry::from_arc(registry.clone()),
+        ));
+        tokio::spawn(run_dob_snapshot_task(
+            snapshot_emitter,
+            listener.clone(),
+            seq_counter.clone(),
+            registry.clone(),
+            mktdata_seq.clone(),
+            snapshot_req_rx,
         ));
 
         // Drive the DoB heartbeat via HeartbeatTick events on the MPSC channel.

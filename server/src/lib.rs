@@ -6,6 +6,10 @@ mod order_book;
 mod prelude;
 pub mod protocol;
 mod servers;
+#[cfg(test)]
+mod test_fixtures;
+#[cfg(test)]
+mod test_subscriber;
 mod types;
 
 pub use multicast::config::{DobConfig, MulticastConfig};

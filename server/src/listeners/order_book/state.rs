@@ -85,6 +85,14 @@ impl OrderBookState {
         self.order_book.as_ref().keys().cloned().collect()
     }
 
+    /// Returns a deterministic clone of the resting orders for `coin`, or
+    /// `None` if the coin is not present. Used by the DoB snapshot emitter
+    /// to take a brief, lock-held copy that it can then drain into wire
+    /// messages without keeping the listener mutex.
+    pub(super) fn clone_coin_orders(&self, coin: &Coin) -> Option<Vec<InnerL4Order>> {
+        self.order_book.clone_coin_orders(coin)
+    }
+
     /// Replaces a single coin's book with a fresh one from the given snapshot.
     /// Used to recover from per-coin drift without resetting all other coins.
     /// Also clears the `snapped` flag so the next tick will emit a fresh L2 snapshot

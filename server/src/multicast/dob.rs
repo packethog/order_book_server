@@ -5,6 +5,8 @@
 //! Phase 1 covers mktdata + refdata; the snapshot port is wired in phase 2.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
@@ -14,14 +16,17 @@ use tokio::time::interval;
 use crate::multicast::publisher::{split_legs, make_leg};
 
 use crate::protocol::dob::constants::{
-    BATCH_BOUNDARY_SIZE, HEARTBEAT_SIZE,
+    BATCH_BOUNDARY_SIZE, HEARTBEAT_SIZE, INSTRUMENT_RESET_SIZE,
     ORDER_ADD_SIZE, ORDER_CANCEL_SIZE, ORDER_EXECUTE_SIZE,
+    SNAPSHOT_BEGIN_SIZE, SNAPSHOT_END_SIZE, SNAPSHOT_ORDER_SIZE,
+    SIDE_ASK, SIDE_BID,
 };
 use crate::protocol::dob::frame::DobFrameBuilder;
 use crate::protocol::dob::messages::{
-    BatchBoundary, OrderAdd, OrderCancel, OrderExecute,
-    encode_batch_boundary, encode_heartbeat, encode_order_add, encode_order_cancel,
-    encode_order_execute,
+    BatchBoundary, InstrumentReset, OrderAdd, OrderCancel, OrderExecute,
+    SnapshotBegin, SnapshotEnd, SnapshotOrder, encode_batch_boundary, encode_heartbeat,
+    encode_instrument_reset, encode_order_add, encode_order_cancel, encode_order_execute,
+    encode_snapshot_begin, encode_snapshot_end, encode_snapshot_order,
 };
 
 /// Events produced by the L4 apply step, consumed by the DoB emitter.
@@ -31,6 +36,11 @@ pub enum DobEvent {
     OrderCancel(OrderCancel),
     OrderExecute(OrderExecute),
     BatchBoundary(BatchBoundary),
+    /// Per-instrument resync signal emitted by `apply_recovery` when the
+    /// publisher detects that its book state is inconsistent with the source.
+    /// Subscribers discard state for `instrument_id` and await a snapshot with
+    /// `Anchor Seq == new_anchor_seq` on the snapshot port.
+    InstrumentReset(InstrumentReset),
     /// Request a `Heartbeat` emission on mktdata (driven by the quiet-period timer).
     HeartbeatTick,
     /// Signals the emitter to flush and emit `EndOfSession` on shutdown.
@@ -50,6 +60,51 @@ pub fn channel(bound: usize) -> (DobEventSender, DobEventReceiver) {
     mpsc::channel(bound)
 }
 
+// ---------------------------------------------------------------------------
+// DoB Snapshot scheduler scaffolding — Task 6
+// ---------------------------------------------------------------------------
+
+/// Snapshot stream configuration.
+#[derive(Debug, Clone)]
+pub struct DobSnapshotConfig {
+    pub group_addr: Ipv4Addr,
+    pub port: u16,
+    pub bind_addr: Ipv4Addr,
+    pub channel_id: u8,
+    pub mtu: u16,
+    /// Target round-robin cycle duration. Scheduler paces emission to hit
+    /// this; if the active set grows, cycles will simply take longer.
+    pub round_duration: Duration,
+}
+
+/// Snapshot requests are either routine round-robin slots (synthesised by
+/// the scheduler itself) or priority requests injected from `apply_recovery`.
+#[derive(Debug, Clone)]
+pub enum DobSnapshotRequest {
+    /// Out-of-cycle priority snapshot for an instrument that just received
+    /// an `InstrumentReset`. The scheduler emits this at the head of its
+    /// queue, with `Anchor Seq == anchor_seq`.
+    Priority { instrument_id: u32, anchor_seq: u64 },
+}
+
+pub type DobSnapshotRequestSender = mpsc::Sender<DobSnapshotRequest>;
+pub type DobSnapshotRequestReceiver = mpsc::Receiver<DobSnapshotRequest>;
+
+#[must_use]
+pub fn snapshot_request_channel(
+    bound: usize,
+) -> (DobSnapshotRequestSender, DobSnapshotRequestReceiver) {
+    mpsc::channel(bound)
+}
+
+/// Shared `mktdata`-port sequence number, read by the snapshot emitter at
+/// per-instrument lock-clone time and by `apply_recovery` when reserving a
+/// `new_anchor_seq` for an `InstrumentReset`. Atomic ordering: relaxed reads
+/// suffice — the value is monotonic and the snapshot port carries the
+/// resulting `anchor_seq` along with the data, so a slightly stale read is
+/// harmless (subscribers reconcile via the carried `anchor_seq`).
+pub type SharedMktdataSeq = Arc<AtomicU64>;
+
 #[derive(Debug, Clone)]
 pub struct DobMktdataConfig {
     pub group_addr: Ipv4Addr,
@@ -63,30 +118,52 @@ pub struct DobMktdataConfig {
 pub struct DobEmitter {
     config: DobMktdataConfig,
     socket: UdpSocket,
-    seq: u64,
+    /// Shared frame seq with `apply_recovery`. The recovery path reserves
+    /// `new_anchor_seq` via `fetch_add` on this same atomic so that
+    /// `InstrumentReset.new_anchor_seq` always points to a future mktdata
+    /// frame seq, never colliding with what the emitter is about to write.
+    seq: SharedMktdataSeq,
     reset_count: u8,
     current_frame: Option<DobFrameBuilder>,
 }
 
 impl DobEmitter {
+    /// Convenience constructor for tests and standalone use; allocates a
+    /// fresh, unshared seq counter. Production code should use
+    /// `bind_with_seq` so the recovery path can share the same atomic.
     pub async fn bind(config: DobMktdataConfig) -> std::io::Result<Self> {
+        Self::bind_with_seq(config, Arc::new(AtomicU64::new(0))).await
+    }
+
+    /// Binds the mktdata socket using a caller-provided shared seq atomic.
+    /// The same `Arc<AtomicU64>` MUST be passed to the snapshot scheduler
+    /// (read via `load`) and the `DobReplayTaps` (which `fetch_add`s when
+    /// reserving an `InstrumentReset` anchor) so seq numbers stay coherent
+    /// across the three call sites.
+    pub async fn bind_with_seq(
+        config: DobMktdataConfig,
+        seq: SharedMktdataSeq,
+    ) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(SocketAddrV4::new(config.bind_addr, 0)).await?;
         socket.set_multicast_loop_v4(false)?;
-        socket.set_multicast_ttl_v4(1)?;
+        socket.set_multicast_ttl_v4(64)?;
         // Connect so send() pushes to the configured multicast group:port
         socket.connect(SocketAddrV4::new(config.group_addr, config.port)).await?;
         Ok(Self {
             config,
             socket,
-            seq: 0,
+            seq,
             reset_count: 0,
             current_frame: None,
         })
     }
 
     fn next_seq(&mut self) -> u64 {
-        self.seq = self.seq.wrapping_add(1);
-        self.seq
+        // Relaxed: the atomic carries no other published memory; monotonicity
+        // comes from fetch_add itself. Mirrors the read in the snapshot
+        // scheduler and the reserve-on-recovery path in apply_recovery.
+        let prev = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        prev.wrapping_add(1)
     }
 
     fn start_frame(&mut self) -> &mut DobFrameBuilder {
@@ -130,6 +207,7 @@ impl DobEmitter {
             DobEvent::OrderCancel(msg) => encode_order_cancel(buf, msg),
             DobEvent::OrderExecute(msg) => encode_order_execute(buf, msg),
             DobEvent::BatchBoundary(msg) => encode_batch_boundary(buf, msg),
+            DobEvent::InstrumentReset(msg) => encode_instrument_reset(buf, msg),
             _ => unreachable!("size filter should have returned"),
         }
         fb.commit_message();
@@ -143,6 +221,7 @@ fn event_size(event: &DobEvent) -> usize {
         DobEvent::OrderCancel(_) => ORDER_CANCEL_SIZE,
         DobEvent::OrderExecute(_) => ORDER_EXECUTE_SIZE,
         DobEvent::BatchBoundary(_) => BATCH_BOUNDARY_SIZE,
+        DobEvent::InstrumentReset(_) => INSTRUMENT_RESET_SIZE,
         DobEvent::HeartbeatTick | DobEvent::Shutdown => 0,
     }
 }
@@ -218,6 +297,330 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
+// DoB Snapshot emitter & scheduler — Task 7
+// ---------------------------------------------------------------------------
+
+/// Emits `SnapshotBegin` / `SnapshotOrder` / `SnapshotEnd` triads on the
+/// snapshot multicast port. One emitter is shared by all instruments — each
+/// `emit_snapshot` call produces a complete, self-contained snapshot group
+/// for a single instrument.
+pub(crate) struct DobSnapshotEmitter {
+    config: DobSnapshotConfig,
+    socket: UdpSocket,
+    /// Snapshot-port frame seq, independent of the mktdata-port `seq`. The
+    /// two streams are correlated only via `anchor_seq` carried in
+    /// `SnapshotBegin`/`SnapshotEnd`.
+    seq: u64,
+    reset_count: u8,
+    snapshot_id_counter: u32,
+}
+
+impl DobSnapshotEmitter {
+    /// Binds the snapshot UDP socket. Mirrors `DobEmitter::bind`.
+    pub(crate) async fn bind(config: DobSnapshotConfig) -> std::io::Result<Self> {
+        let socket = UdpSocket::bind(SocketAddrV4::new(config.bind_addr, 0)).await?;
+        socket.set_multicast_loop_v4(false)?;
+        socket.set_multicast_ttl_v4(64)?;
+        socket.connect(SocketAddrV4::new(config.group_addr, config.port)).await?;
+        Ok(Self {
+            config,
+            socket,
+            seq: 0,
+            reset_count: 0,
+            snapshot_id_counter: 0,
+        })
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        self.seq = self.seq.wrapping_add(1);
+        self.seq
+    }
+
+    fn next_snapshot_id(&mut self) -> u32 {
+        self.snapshot_id_counter = self.snapshot_id_counter.wrapping_add(1);
+        self.snapshot_id_counter
+    }
+
+    /// Emits one full snapshot triad for `instrument_id`:
+    /// - `SnapshotBegin` in its own frame.
+    /// - Zero or more `SnapshotOrder` frames, packed up to `config.mtu`.
+    /// - `SnapshotEnd` in its own frame.
+    ///
+    /// `anchor_seq` is the mktdata-port sequence number at the time the
+    /// snapshot was anchored; subscribers reconcile the snapshot stream with
+    /// the delta stream against this value. `last_instrument_seq` is the most
+    /// recently emitted per-instrument seq for `instrument_id` (or 0 if none).
+    /// The empty-orders case is supported and emits Begin + End with no
+    /// `SnapshotOrder` frames in between.
+    pub(crate) async fn emit_snapshot(
+        &mut self,
+        instrument_id: u32,
+        anchor_seq: u64,
+        last_instrument_seq: u32,
+        orders: Vec<crate::types::inner::InnerL4Order>,
+    ) -> std::io::Result<()> {
+        let snapshot_id = self.next_snapshot_id();
+        let total_orders = u32::try_from(orders.len()).unwrap_or(u32::MAX);
+
+        // 1. SnapshotBegin in its own frame.
+        {
+            let begin = SnapshotBegin {
+                instrument_id,
+                anchor_seq,
+                total_orders,
+                snapshot_id,
+                last_instrument_seq,
+                timestamp_ns: now_ns(),
+            };
+            let mut fb = DobFrameBuilder::new(
+                self.config.channel_id,
+                self.next_seq(),
+                now_ns(),
+                self.reset_count,
+                self.config.mtu,
+            );
+            let buf = fb
+                .message_buffer(SNAPSHOT_BEGIN_SIZE)
+                .expect("SnapshotBegin fits in a fresh frame");
+            encode_snapshot_begin(buf, &begin);
+            fb.commit_message();
+            let frame = fb.finalize();
+            self.socket.send(frame).await?;
+        }
+
+        // 2. Pack SnapshotOrder messages into MTU-sized frames.
+        let mut fb_opt: Option<DobFrameBuilder> = None;
+        for order in &orders {
+            // Open a frame on demand.
+            if fb_opt.as_ref().map_or(true, |fb| fb.remaining() < SNAPSHOT_ORDER_SIZE) {
+                if let Some(mut fb) = fb_opt.take() {
+                    if !fb.is_empty() {
+                        let frame = fb.finalize();
+                        self.socket.send(frame).await?;
+                    }
+                }
+                fb_opt = Some(DobFrameBuilder::new(
+                    self.config.channel_id,
+                    self.next_seq(),
+                    now_ns(),
+                    self.reset_count,
+                    self.config.mtu,
+                ));
+            }
+            let fb = fb_opt.as_mut().expect("opened above");
+            let buf = fb
+                .message_buffer(SNAPSHOT_ORDER_SIZE)
+                .expect("SnapshotOrder fits, just-checked remaining()");
+            let side = match order.side {
+                crate::order_book::Side::Bid => SIDE_BID,
+                crate::order_book::Side::Ask => SIDE_ASK,
+            };
+            // `InnerL4Order.timestamp` is an entry timestamp in milliseconds
+            // (set from the order-status row's wall-clock time). Convert to
+            // ns to match the wire field. This is the right field per the
+            // Task 7 brief's decision #5; using apply-time would be a
+            // different (misleading) signal.
+            let enter_timestamp_ns = order.timestamp.saturating_mul(1_000_000);
+            let msg = SnapshotOrder {
+                snapshot_id,
+                order_id: order.oid,
+                side,
+                order_flags: 0, // Phase 1 leaves these at 0; mirrors OrderAdd in dob_tap.
+                enter_timestamp_ns,
+                price: order.limit_px.value() as i64,
+                quantity: order.sz.value(),
+            };
+            encode_snapshot_order(buf, &msg);
+            fb.commit_message();
+        }
+        // Flush any pending SnapshotOrder frame.
+        if let Some(mut fb) = fb_opt.take() {
+            if !fb.is_empty() {
+                let frame = fb.finalize();
+                self.socket.send(frame).await?;
+            }
+        }
+
+        // 3. SnapshotEnd in its own frame.
+        {
+            let end = SnapshotEnd {
+                instrument_id,
+                anchor_seq,
+                snapshot_id,
+            };
+            let mut fb = DobFrameBuilder::new(
+                self.config.channel_id,
+                self.next_seq(),
+                now_ns(),
+                self.reset_count,
+                self.config.mtu,
+            );
+            let buf = fb
+                .message_buffer(SNAPSHOT_END_SIZE)
+                .expect("SnapshotEnd fits in a fresh frame");
+            encode_snapshot_end(buf, &end);
+            fb.commit_message();
+            let frame = fb.finalize();
+            self.socket.send(frame).await?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Spawns the snapshot emitter task: round-robin across active instruments
+/// with a priority queue head that preempts BETWEEN slots (not mid-slot or
+/// mid-sleep). Recovery snapshots queued via `priority_rx` typically wait
+/// at most one slot's worth of `round_duration / active.len()` before
+/// being serviced. With a single active instrument the wait can extend up
+/// to the full `round_duration`.
+///
+/// On each iteration:
+/// 1. Drain any pending `DobSnapshotRequest::Priority` requests.
+/// 2. If priority work is queued, emit one priority snapshot and loop.
+/// 3. Otherwise iterate the active instrument set once, emitting one snapshot
+///    per slot and pacing with `config.round_duration / active.len()`.
+///    Between slots, re-check the priority queue so a recovery snapshot does
+///    not have to wait a full cycle.
+///
+/// Returns Ok(()) when the priority channel is closed.
+pub(crate) async fn run_dob_snapshot_task(
+    mut emitter: DobSnapshotEmitter,
+    listener: Arc<tokio::sync::Mutex<crate::listeners::order_book::OrderBookListener>>,
+    seq_counter: crate::listeners::order_book::dob_tap::SharedSeqCounter,
+    registry: Arc<tokio::sync::RwLock<crate::instruments::RegistryState>>,
+    mktdata_seq: SharedMktdataSeq,
+    mut priority_rx: DobSnapshotRequestReceiver,
+) -> std::io::Result<()> {
+    use std::collections::VecDeque;
+    use std::sync::atomic::Ordering;
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    let mut priority_queue: VecDeque<DobSnapshotRequest> = VecDeque::new();
+
+    loop {
+        // 1. Drain any pending priority requests (non-blocking).
+        loop {
+            match priority_rx.try_recv() {
+                Ok(req) => priority_queue.push_back(req),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+
+        // 2. Service one priority request per loop iteration.
+        if let Some(DobSnapshotRequest::Priority { instrument_id, anchor_seq }) =
+            priority_queue.pop_front()
+        {
+            let Some(coin) = lookup_coin_for_instrument(&registry, instrument_id).await else {
+                log::warn!(
+                    "dob_snapshot: priority request for unknown instrument_id {instrument_id}, skipping"
+                );
+                continue;
+            };
+            // Read last_instrument_seq BEFORE cloning orders. Between this read and
+            // the clone, more deltas may be applied (apply tap holds neither lock).
+            // last_instrument_seq <= snapshot view is safe — subscribers may replay a
+            // few deltas already reflected in the snapshot. The reverse ordering
+            // would let them skip deltas, which is unsafe.
+            let last_instrument_seq = seq_counter
+                .lock()
+                .expect("seq mutex poisoned")
+                .last(instrument_id);
+            let orders = listener
+                .lock()
+                .await
+                .clone_coin_orders(&coin)
+                .unwrap_or_default();
+            emitter
+                .emit_snapshot(instrument_id, anchor_seq, last_instrument_seq, orders)
+                .await?;
+            continue;
+        }
+
+        // 3. No priority work: do one round-robin slot per active instrument.
+        let active = list_active_instruments(&registry).await;
+        if active.is_empty() {
+            // Nothing to do — sleep briefly before re-checking.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        let active_len = u32::try_from(active.len()).unwrap_or(u32::MAX).max(1);
+        let slot_budget = emitter.config.round_duration / active_len;
+
+        for (instrument_id, coin) in active {
+            // Re-check the priority queue between slots so a recovery snapshot
+            // does not have to wait a full cycle.
+            loop {
+                match priority_rx.try_recv() {
+                    Ok(req) => priority_queue.push_back(req),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return Ok(()),
+                }
+            }
+            if !priority_queue.is_empty() {
+                // Break out of the round-robin so the outer loop services it.
+                break;
+            }
+
+            let anchor_seq = mktdata_seq.load(Ordering::Relaxed);
+            // Read last_instrument_seq BEFORE cloning orders. Between this read and
+            // the clone, more deltas may be applied (apply tap holds neither lock).
+            // last_instrument_seq <= snapshot view is safe — subscribers may replay a
+            // few deltas already reflected in the snapshot. The reverse ordering
+            // would let them skip deltas, which is unsafe.
+            let last_instrument_seq = seq_counter
+                .lock()
+                .expect("seq mutex poisoned")
+                .last(instrument_id);
+            let orders = listener
+                .lock()
+                .await
+                .clone_coin_orders(&coin)
+                .unwrap_or_default();
+
+            let emit_start = std::time::Instant::now();
+            emitter
+                .emit_snapshot(instrument_id, anchor_seq, last_instrument_seq, orders)
+                .await?;
+            let elapsed = emit_start.elapsed();
+            if elapsed < slot_budget {
+                tokio::time::sleep(slot_budget - elapsed).await;
+            }
+        }
+    }
+}
+
+/// Linear-scan lookup of `instrument_id -> Coin` against the active instrument
+/// set. Used by the priority path; cost is fine because priority requests are
+/// rare (only on validation mismatch via `apply_recovery`).
+async fn lookup_coin_for_instrument(
+    registry: &Arc<tokio::sync::RwLock<crate::instruments::RegistryState>>,
+    instrument_id: u32,
+) -> Option<crate::order_book::Coin> {
+    let state = registry.read().await;
+    state
+        .active
+        .iter()
+        .find(|(_coin, info)| info.instrument_id == instrument_id)
+        .map(|(coin, _info)| crate::order_book::Coin::new(coin))
+}
+
+/// Snapshot of the active instrument set as `(instrument_id, Coin)` pairs.
+/// The scheduler iterates this once per round; if the set changes mid-cycle
+/// we'll pick up the change on the next round.
+async fn list_active_instruments(
+    registry: &Arc<tokio::sync::RwLock<crate::instruments::RegistryState>>,
+) -> Vec<(u32, crate::order_book::Coin)> {
+    let state = registry.read().await;
+    state
+        .active
+        .iter()
+        .map(|(coin, info)| (info.instrument_id, crate::order_book::Coin::new(coin)))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // DoB Refdata task — Task 13
 // ---------------------------------------------------------------------------
 
@@ -250,7 +653,7 @@ pub async fn run_dob_refdata_task(
     // Bind the UDP socket and point it at the multicast group.
     let socket = UdpSocket::bind(SocketAddrV4::new(config.bind_addr, 0)).await?;
     socket.set_multicast_loop_v4(false)?;
-    socket.set_multicast_ttl_v4(1)?;
+    socket.set_multicast_ttl_v4(64)?;
     socket.connect(SocketAddrV4::new(config.group_addr, config.port)).await?;
 
     let mut seq: u64 = 0;
@@ -533,5 +936,155 @@ mod emitter_tests {
         assert_eq!(n, FRAME_HEADER_SIZE + ORDER_ADD_SIZE);
         assert_eq!(&rxbuf[0..2], &[0x44, 0x44], "DoB magic on wire");
         assert_eq!(rxbuf[FRAME_HEADER_SIZE], 0x10, "OrderAdd type");
+    }
+}
+
+#[cfg(test)]
+mod snapshot_anchor_tests {
+    //! Anchor-seq integrity test: `SnapshotBegin` must carry the `anchor_seq`
+    //! from the priority request and the per-instrument seq's `last()` value
+    //! at the moment the per-coin clone is taken.
+    //!
+    //! This is the Phase 2 task 10 anchor-seq test from the plan
+    //! (`docs/superpowers/plans/2026-04-25-depth-of-book-publisher-phase-2.md`).
+    //! The plan template directed the test to `server/tests/dob_snapshot_anchor_seq.rs`,
+    //! but the integration-test target can only see `pub` items, and
+    //! exposing `OrderBookListener`, `Snapshots<InnerL4Order>`, `InnerL4Order`,
+    //! `DobSnapshotEmitter`, and `run_dob_snapshot_task` solely for an
+    //! external test fixture would expand the public API far beyond what's
+    //! warranted. Keeping the test as a unit test here exercises the same
+    //! priority-path code (`run_dob_snapshot_task` → `emit_snapshot` →
+    //! `encode_snapshot_begin`) and asserts the exact same invariants.
+    use super::*;
+    use crate::listeners::order_book::OrderBookListener;
+    use crate::order_book::PerInstrumentSeqCounter;
+    use crate::protocol::dob::constants::{
+        DEFAULT_MTU, FRAME_HEADER_SIZE, MSG_TYPE_SNAPSHOT_BEGIN,
+    };
+    use crate::test_fixtures::{build_one_coin_snapshot, build_registry_with_one_instrument};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::net::UdpSocket;
+
+    #[tokio::test]
+    async fn snapshot_anchor_matches_request_and_last_instrument_seq() {
+        // 1. Bind a collector socket on a random loopback port. This stands
+        //    in for the snapshot-port subscriber.
+        let collector =
+            UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let collector_addr = match collector.local_addr().unwrap() {
+            std::net::SocketAddr::V4(a) => a,
+            _ => unreachable!(),
+        };
+
+        // 2. Pre-populate shared state with known sentinel values. The mktdata
+        //    seq is set to 99 (NOT 42) so we can verify the priority path
+        //    threads the request's anchor_seq=42 through to the wire — not the
+        //    live mktdata_seq value (which the round-robin path would use).
+        let mktdata_seq = Arc::new(AtomicU64::new(0));
+        mktdata_seq.store(99, Ordering::Relaxed);
+
+        let seq_counter = Arc::new(std::sync::Mutex::new(PerInstrumentSeqCounter::new()));
+        {
+            let mut g = seq_counter.lock().unwrap();
+            for _ in 0..7 {
+                g.next(0);
+            }
+            assert_eq!(g.last(0), 7, "fixture pre-populated last(0) to 7");
+        }
+
+        // 3. Build a listener pre-seeded with one coin's resting orders.
+        let coin_str = "BTC";
+        let listener = OrderBookListener::for_test_with_snapshot(
+            build_one_coin_snapshot(coin_str, 3, /* oid_offset = */ 0),
+            /* height = */ 1,
+        );
+        let listener = Arc::new(tokio::sync::Mutex::new(listener));
+
+        // 4. Bind the snapshot emitter at the collector address.
+        //    60s round_duration => 60s per-slot pacing sleep (one instrument).
+        //    This guarantees the round-robin path cannot complete an emission
+        //    within the test's 2-second recv timeout, so the assertions below
+        //    can only see the priority-path frame.
+        let emitter = DobSnapshotEmitter::bind(DobSnapshotConfig {
+            group_addr: *collector_addr.ip(),
+            port: collector_addr.port(),
+            bind_addr: Ipv4Addr::LOCALHOST,
+            channel_id: 0,
+            mtu: DEFAULT_MTU,
+            round_duration: Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+
+        // 5. Build the registry with one instrument (id=0 for BTC).
+        let registry = build_registry_with_one_instrument(coin_str, 0);
+
+        // 6. Send the priority request BEFORE spawning the task so the test
+        //    doesn't rely on tokio's current-thread-runtime scheduler ordering.
+        //    The channel buffers the request; the task picks it up on its
+        //    first try_recv.
+        let (req_tx, req_rx) = snapshot_request_channel(8);
+        req_tx
+            .send(DobSnapshotRequest::Priority { instrument_id: 0, anchor_seq: 42 })
+            .await
+            .unwrap();
+
+        // 7. Spawn the snapshot task. Its first iteration will see the
+        //    already-buffered Priority request and preempt any round-robin
+        //    work.
+        let handle = tokio::spawn(run_dob_snapshot_task(
+            emitter,
+            listener.clone(),
+            seq_counter.clone(),
+            registry.clone(),
+            mktdata_seq.clone(),
+            req_rx,
+        ));
+
+        // 8. Read the first datagram off the collector (timeout-bounded).
+        let mut buf = [0u8; 2048];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), collector.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for SnapshotBegin frame")
+            .expect("recv error");
+
+        // 9. Validate frame magic and the SnapshotBegin app message.
+        //    Frame header at [0..FRAME_HEADER_SIZE]; SnapshotBegin starts at
+        //    FRAME_HEADER_SIZE. SnapshotBegin layout (36 bytes):
+        //       msg_type(1) + flags(1) + reserved(2)   = app header (4)
+        //       instrument_id(4)                       offset 4..8
+        //       anchor_seq(8)                          offset 8..16
+        //       total_orders(4)                        offset 16..20
+        //       snapshot_id(4)                         offset 20..24
+        //       last_instrument_seq(4)                 offset 24..28
+        //       timestamp(8)                           offset 28..36
+        assert!(
+            n >= FRAME_HEADER_SIZE + SNAPSHOT_BEGIN_SIZE,
+            "expected at least one full SnapshotBegin in the datagram (got {n} bytes)",
+        );
+        assert_eq!(&buf[0..2], &[0x44, 0x44], "DoB magic on wire");
+        assert_eq!(
+            buf[FRAME_HEADER_SIZE], MSG_TYPE_SNAPSHOT_BEGIN,
+            "first message must be SnapshotBegin",
+        );
+
+        let body = &buf[FRAME_HEADER_SIZE..];
+        let instrument_id = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        let anchor_seq = u64::from_le_bytes(body[8..16].try_into().unwrap());
+        // 24..28 is last_instrument_seq (NOT 20..24 — that's snapshot_id).
+        let last_instrument_seq = u32::from_le_bytes(body[24..28].try_into().unwrap());
+
+        assert_eq!(instrument_id, 0, "instrument_id from request");
+        assert_eq!(
+            anchor_seq, 42,
+            "anchor_seq must come from the priority request, not mktdata_seq.load()",
+        );
+        assert_eq!(
+            last_instrument_seq, 7,
+            "last_instrument_seq must equal seq_counter.last(0) at clone time",
+        );
+
+        handle.abort();
     }
 }
