@@ -1,8 +1,14 @@
 use crate::{
+    instruments::RegistryState,
     listeners::order_book::{
-        InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
+        InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, dob_tap::DobApplyTap,
+        hl_listen,
     },
-    multicast::{config::MulticastConfig, publisher::MulticastPublisher},
+    multicast::{
+        config::{DobConfig, MulticastConfig},
+        dob::{DobEmitter, DobEvent, DobMktdataConfig, DobRefdataConfig, channel as dob_channel, run_dob_emitter, run_dob_refdata_task},
+        publisher::MulticastPublisher,
+    },
     order_book::{Coin, Snapshot},
     prelude::*,
     types::{
@@ -24,22 +30,25 @@ use tokio::select;
 use tokio::{
     net::TcpListener,
     sync::{
-        Mutex,
+        Mutex, RwLock,
         broadcast::{Sender, channel},
     },
 };
 use yawc::{FrameView, OpCode, WebSocket};
 
-/// Starts the WebSocket server and, optionally, a UDP multicast publisher.
+/// Starts the WebSocket server and, optionally, TOB and/or DoB UDP multicast publishers.
 ///
-/// When `multicast_config` is `Some`, a background task is spawned that
-/// subscribes to the internal broadcast channel and re-publishes selected
-/// market data as UDP multicast datagrams.
+/// When `multicast_config` is `Some`, a background task is spawned that publishes
+/// top-of-book market data as UDP multicast datagrams.  When `dob_config` is `Some`,
+/// separate tasks are spawned for the DoB mktdata, refdata, and heartbeat channels.
+/// Both channels share a single instrument registry, bootstrapped from the HL API URL
+/// in `multicast_config` when available.
 pub async fn run_websocket_server(
     address: &str,
     ignore_spot: bool,
     compression_level: u32,
     multicast_config: Option<MulticastConfig>,
+    dob_config: Option<DobConfig>,
 ) -> Result<()> {
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(100);
 
@@ -60,41 +69,45 @@ pub async fn run_websocket_server(
         });
     }
 
+    // Bootstrap a shared instrument registry when any multicast channel is enabled.
+    // If only DoB is enabled (no TOB), the registry starts empty (no HL API URL available).
+    let registry: Option<Arc<RwLock<RegistryState>>> = if let Some(ref cfg) = multicast_config {
+        let universe = match crate::instruments::hyperliquid::fetch_universe(&cfg.hl_api_url).await {
+            Ok(u) => u,
+            Err(err) => {
+                log::error!("failed to bootstrap instrument registry: {err}");
+                std::process::exit(3);
+            }
+        };
+        let state = Arc::new(RwLock::new(RegistryState::new(universe)));
+        {
+            let guard = state.read().await;
+            info!(
+                "instrument registry loaded: {} active ({} in universe), manifest_seq={}",
+                guard.active.len(),
+                guard.universe.len(),
+                guard.manifest_seq
+            );
+        }
+        {
+            let refresh_state = Arc::clone(&state);
+            let api_url = cfg.hl_api_url.clone();
+            let interval = cfg.instruments_refresh_interval;
+            tokio::spawn(async move {
+                crate::instruments::hyperliquid::refresh_task(api_url, refresh_state, interval).await;
+            });
+        }
+        Some(state)
+    } else if dob_config.is_some() {
+        Some(Arc::new(RwLock::new(RegistryState::empty())))
+    } else {
+        None
+    };
+
     if let Some(mcast_config) = multicast_config {
+        let registry = registry.clone().expect("registry was created above");
         let mcast_rx = internal_message_tx.subscribe();
         tokio::spawn(async move {
-            use std::sync::Arc;
-            use tokio::sync::RwLock;
-
-            // Bootstrap instrument registry from HL API
-            let universe = match crate::instruments::hyperliquid::fetch_universe(&mcast_config.hl_api_url).await {
-                Ok(u) => u,
-                Err(err) => {
-                    log::error!("failed to bootstrap instrument registry: {err}");
-                    std::process::exit(3);
-                }
-            };
-            let state = Arc::new(RwLock::new(crate::instruments::RegistryState::new(universe)));
-            {
-                let guard = state.read().await;
-                info!(
-                    "instrument registry loaded: {} active ({} in universe), manifest_seq={}",
-                    guard.active.len(),
-                    guard.universe.len(),
-                    guard.manifest_seq
-                );
-            }
-
-            // Spawn refresh task
-            {
-                let refresh_state = Arc::clone(&state);
-                let api_url = mcast_config.hl_api_url.clone();
-                let interval = mcast_config.instruments_refresh_interval;
-                tokio::spawn(async move {
-                    crate::instruments::hyperliquid::refresh_task(api_url, refresh_state, interval).await;
-                });
-            }
-
             let bind_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(mcast_config.bind_addr), 0);
             match tokio::net::UdpSocket::bind(bind_addr).await {
                 Ok(socket) => {
@@ -102,12 +115,72 @@ pub async fn run_websocket_server(
                         log::error!("failed to set multicast TTL: {err}");
                         std::process::exit(3);
                     }
-                    let publisher = MulticastPublisher::new(socket, mcast_config, state);
+                    let publisher = MulticastPublisher::new(socket, mcast_config, registry);
                     publisher.run(mcast_rx).await;
                 }
                 Err(err) => {
                     log::error!("failed to bind multicast UDP socket to {bind_addr}: {err}");
                     std::process::exit(3);
+                }
+            }
+        });
+    }
+
+    if let Some(cfg) = dob_config {
+        let registry = registry.clone().expect("registry was created above");
+
+        let (dob_tx, dob_rx) = dob_channel(cfg.channel_bound);
+
+        // Coin resolver: non-blocking try_read() so it is safe to call from the
+        // sync apply_updates path without risk of blocking a tokio worker.
+        let coin_resolver: Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync> = {
+            let reg = Arc::clone(&registry);
+            Box::new(move |coin: &Coin| reg.try_read().ok()?.active.get(&coin.value()).map(|info| info.instrument_id))
+        };
+        let tap = DobApplyTap::new(dob_tx.clone(), cfg.source_id, cfg.channel_id, coin_resolver);
+        listener.lock().await.set_dob_tap(tap);
+
+        let mktdata_cfg = DobMktdataConfig {
+            group_addr: cfg.group_addr,
+            port: cfg.mktdata_port,
+            bind_addr: cfg.bind_addr,
+            channel_id: cfg.channel_id,
+            mtu: cfg.mtu,
+            heartbeat_interval: cfg.heartbeat_interval,
+        };
+        let emitter = match DobEmitter::bind(mktdata_cfg).await {
+            Ok(e) => e,
+            Err(err) => {
+                log::error!("failed to bind DoB mktdata socket: {err}");
+                std::process::exit(3);
+            }
+        };
+        tokio::spawn(run_dob_emitter(emitter, dob_rx));
+
+        tokio::spawn(run_dob_refdata_task(
+            DobRefdataConfig {
+                group_addr: cfg.group_addr,
+                port: cfg.refdata_port,
+                bind_addr: cfg.bind_addr,
+                channel_id: cfg.channel_id,
+                mtu: cfg.mtu,
+                definition_cycle: cfg.definition_cycle,
+                manifest_cadence: cfg.manifest_cadence,
+            },
+            crate::instruments::InstrumentRegistry::from_arc(registry),
+        ));
+
+        // Drive the DoB heartbeat via HeartbeatTick events on the MPSC channel.
+        // The emitter task converts each tick into a Heartbeat frame on the wire.
+        let hb_tx = dob_tx;
+        let hb_int = cfg.heartbeat_interval;
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(hb_int);
+            t.tick().await; // skip the first immediate tick
+            loop {
+                t.tick().await;
+                if hb_tx.send(DobEvent::HeartbeatTick).await.is_err() {
+                    break;
                 }
             }
         });

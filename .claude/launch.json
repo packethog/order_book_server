@@ -2,9 +2,9 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "websocket-server",
+      "name": "dz-hl-publisher",
       "runtimeExecutable": "cargo",
-      "runtimeArgs": ["run", "--release", "--bin", "websocket_server", "--", "--address", "0.0.0.0", "--port", "8000"],
+      "runtimeArgs": ["run", "--release", "--bin", "dz_hl_publisher", "--", "--address", "0.0.0.0", "--port", "8000"],
       "port": 8000
     }
   ]

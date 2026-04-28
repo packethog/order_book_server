@@ -54,6 +54,11 @@ impl Oid {
     pub(crate) const fn new(value: u64) -> Self {
         Self(value)
     }
+
+    /// Returns the inner `u64` value.
+    pub(crate) const fn into_inner(self) -> u64 {
+        self.0
+    }
 }
 
 pub(crate) trait InnerOrder: Clone {

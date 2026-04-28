@@ -1,5 +1,5 @@
 use crate::{
-    order_book::{Coin, InnerOrder, Oid, OrderBook, Snapshot, Sz},
+    order_book::{Coin, InnerOrder, Oid, OrderBook, Px, Snapshot, Sz},
     prelude::*,
 };
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -67,9 +67,10 @@ impl<O: InnerOrder> OrderBooks<O> {
         self.order_books.get_mut(&coin).is_some_and(|book| book.cancel_order(oid))
     }
 
-    // change size to reflect how much gets matched during the block
-    pub(crate) fn modify_sz(&mut self, oid: Oid, coin: Coin, sz: Sz) -> bool {
-        self.order_books.get_mut(&coin).is_some_and(|book| book.modify_sz(oid, sz))
+    /// Changes size to reflect how much gets matched during the block.
+    /// Returns `Some((old_sz, px))` on success, `None` if the order is not found.
+    pub(crate) fn modify_sz(&mut self, oid: Oid, coin: Coin, sz: Sz) -> Option<(Sz, Px)> {
+        self.order_books.get_mut(&coin).and_then(|book| book.modify_sz(oid, sz))
     }
 }
 

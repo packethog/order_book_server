@@ -6,9 +6,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub(crate) mod levels;
 mod linked_list;
 pub(crate) mod multi_book;
+pub mod per_instrument_seq;
 pub(crate) mod types;
 
 pub(crate) use types::{Coin, InnerOrder, Oid, Px, Side, Sz};
+pub use per_instrument_seq::PerInstrumentSeqCounter;
 
 #[derive(Clone, Default)]
 pub(crate) struct OrderBook<O> {
@@ -92,23 +94,27 @@ impl<O: InnerOrder> OrderBook<O> {
         false
     }
 
-    pub(crate) fn modify_sz(&mut self, oid: Oid, sz: Sz) -> bool {
+    /// Modifies the size of an order in the book.
+    /// Returns `Some((old_sz, px))` on success, `None` if the order is not found.
+    pub(crate) fn modify_sz(&mut self, oid: Oid, sz: Sz) -> Option<(Sz, Px)> {
         if let Some((side, px)) = self.oid_to_side_px.get(&oid) {
+            let px = *px;
             let map = match side {
                 Side::Ask => &mut self.asks,
                 Side::Bid => &mut self.bids,
             };
-            let list = map.get_mut(px);
+            let list = map.get_mut(&px);
             if let Some(list) = list {
                 let old_order = list.node_value_mut(&oid);
                 if let Some(old_order) = old_order {
+                    let old_sz = old_order.sz();
                     old_order.modify_sz(sz);
-                    return true;
+                    return Some((old_sz, px));
                 }
-                return false;
+                return None;
             }
         }
-        false
+        None
     }
 
     // we go by the convention that prioritized orders go first in the vector; this makes aggregation step later easier.

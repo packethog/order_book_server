@@ -31,7 +31,7 @@ The `l4book` subscription first sends a snapshot of the entire book and then for
 2. Then run this local server:
 
 ```bash
-cargo run --release --bin websocket_server -- --address 0.0.0.0 --port 8000
+cargo run --release --bin dz_hl_publisher -- --address 0.0.0.0 --port 8000
 ```
 
 If this local server does not detect the node writing down any new events, it will automatically exit after some amount of time (currently set to 5 seconds).
@@ -50,7 +50,7 @@ The server can optionally publish market data as UDP multicast datagrams alongsi
 Pass `--multicast-group` to enable multicast publishing:
 
 ```bash
-cargo run --release --bin websocket_server -- \
+cargo run --release --bin dz_hl_publisher -- \
   --address 0.0.0.0 --port 8000 \
   --multicast-group 239.0.0.1 \
   --multicast-bind-addr 0.0.0.0
@@ -103,6 +103,21 @@ cargo run --release --bin example_multicast_subscriber -- \
 ```
 
 This joins the multicast group and prints received datagrams to stdout.
+
+## Wireshark dissectors
+
+Lua dissectors for DZ-TOB and DZ-DoB live under `spec/`. To install:
+
+```bash
+mkdir -p ~/.local/lib/wireshark/plugins
+cp spec/dz_topofbook.lua spec/dz_depthofbook.lua ~/.local/lib/wireshark/plugins/
+```
+
+Then open a capture. The DZ-TOB dissector triggers on frame magic `0x445A`; the DZ-DoB dissector triggers on `0x4444`. Both support preference-based port registration (Edit → Preferences → Protocols → DZ-TOB / DZ-DoB) and ad-hoc loading:
+
+```bash
+tshark -X lua_script:spec/dz_depthofbook.lua -f "udp port 6000" -i lo
+```
 
 ## Caveats
 

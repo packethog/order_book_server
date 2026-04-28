@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use clap::Parser;
-use server::{MulticastConfig, Result, run_websocket_server};
+use server::{DobConfig, MulticastConfig, Result, run_websocket_server};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -67,6 +67,42 @@ struct Args {
     /// ManifestSummary cadence (seconds).
     #[arg(long, default_value_t = 1)]
     manifest_cadence: u64,
+
+    /// DoB multicast group address (e.g., 239.0.0.2). Enables DoB emission when set.
+    #[arg(long)]
+    dob_group: Option<Ipv4Addr>,
+
+    /// UDP port for DoB mktdata traffic.
+    #[arg(long, default_value_t = 6000)]
+    dob_mktdata_port: u16,
+
+    /// UDP port for DoB refdata traffic.
+    #[arg(long, default_value_t = 6001)]
+    dob_refdata_port: u16,
+
+    /// UDP port for DoB snapshot traffic (phase 2).
+    #[arg(long, default_value_t = 6002)]
+    dob_snapshot_port: u16,
+
+    /// Local interface for DoB multicast socket.
+    #[arg(long)]
+    dob_bind_addr: Option<Ipv4Addr>,
+
+    /// DoB channel ID.
+    #[arg(long, default_value_t = 0)]
+    dob_channel_id: u8,
+
+    /// DoB source ID (must match the Source ID Registry entry).
+    #[arg(long, default_value_t = 1)]
+    dob_source_id: u16,
+
+    /// DoB max frame size (default 1232 per DoB spec).
+    #[arg(long, default_value_t = 1232)]
+    dob_mtu: u16,
+
+    /// Bound on the MPSC channel between L4 apply and the DoB emitter.
+    #[arg(long, default_value_t = 4096)]
+    dob_channel_bound: usize,
 }
 
 #[tokio::main]
@@ -103,7 +139,25 @@ async fn main() -> Result<()> {
         None
     };
 
-    run_websocket_server(&full_address, true, compression_level, multicast_config).await?;
+    let dob_config = args.dob_group.map(|group_addr| {
+        let bind_addr = args.dob_bind_addr.or(args.multicast_bind_addr).unwrap_or(Ipv4Addr::UNSPECIFIED);
+        DobConfig {
+            group_addr,
+            mktdata_port: args.dob_mktdata_port,
+            refdata_port: args.dob_refdata_port,
+            snapshot_port: args.dob_snapshot_port,
+            bind_addr,
+            channel_id: args.dob_channel_id,
+            source_id: args.dob_source_id,
+            mtu: args.dob_mtu,
+            heartbeat_interval: Duration::from_secs(args.heartbeat_interval),
+            definition_cycle: Duration::from_secs(args.definition_cycle),
+            manifest_cadence: Duration::from_secs(args.manifest_cadence),
+            channel_bound: args.dob_channel_bound,
+        }
+    });
+
+    run_websocket_server(&full_address, true, compression_level, multicast_config, dob_config).await?;
 
     Ok(())
 }
