@@ -491,7 +491,7 @@ pub(crate) async fn run_dob_snapshot_task(
     mut emitter: DobSnapshotEmitter,
     listener: Arc<tokio::sync::Mutex<crate::listeners::order_book::OrderBookListener>>,
     seq_counter: crate::listeners::order_book::dob_tap::SharedSeqCounter,
-    registry: Arc<tokio::sync::RwLock<crate::instruments::RegistryState>>,
+    registry: crate::instruments::SharedRegistry,
     mktdata_seq: SharedMktdataSeq,
     mut priority_rx: DobSnapshotRequestReceiver,
 ) -> std::io::Result<()> {
@@ -516,7 +516,7 @@ pub(crate) async fn run_dob_snapshot_task(
             priority_queue.pop_front()
         {
             let Some((coin, qty_exponent)) =
-                lookup_coin_for_instrument(&registry, instrument_id).await
+                lookup_coin_for_instrument(&registry, instrument_id)
             else {
                 log::warn!(
                     "dob_snapshot: priority request for unknown instrument_id {instrument_id}, skipping"
@@ -544,7 +544,7 @@ pub(crate) async fn run_dob_snapshot_task(
         }
 
         // 3. No priority work: do one round-robin slot per active instrument.
-        let active = list_active_instruments(&registry).await;
+        let active = list_active_instruments(&registry);
         if active.is_empty() {
             // Nothing to do — sleep briefly before re-checking.
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -599,11 +599,11 @@ pub(crate) async fn run_dob_snapshot_task(
 /// Linear-scan lookup of `instrument_id -> (Coin, qty_exponent)` against the
 /// active instrument set. Used by the priority path; cost is fine because
 /// priority requests are rare (only on validation mismatch via `apply_recovery`).
-async fn lookup_coin_for_instrument(
-    registry: &Arc<tokio::sync::RwLock<crate::instruments::RegistryState>>,
+fn lookup_coin_for_instrument(
+    registry: &crate::instruments::SharedRegistry,
     instrument_id: u32,
 ) -> Option<(crate::order_book::Coin, i8)> {
-    let state = registry.read().await;
+    let state = registry.load();
     state
         .active
         .iter()
@@ -614,10 +614,10 @@ async fn lookup_coin_for_instrument(
 /// Snapshot of the active instrument set as `(instrument_id, Coin, qty_exponent)`
 /// triples. The scheduler iterates this once per round; if the set changes
 /// mid-cycle we'll pick up the change on the next round.
-async fn list_active_instruments(
-    registry: &Arc<tokio::sync::RwLock<crate::instruments::RegistryState>>,
+fn list_active_instruments(
+    registry: &crate::instruments::SharedRegistry,
 ) -> Vec<(u32, crate::order_book::Coin, i8)> {
-    let state = registry.read().await;
+    let state = registry.load();
     state
         .active
         .iter()
@@ -679,10 +679,10 @@ pub async fn run_dob_refdata_task(
     loop {
         tokio::select! {
             _ = definition_ticker.tick() => {
-                // Take a single read-lock snapshot of all active instruments.
+                // Snapshot the active instruments lock-free via ArcSwap.
                 let (snapshot, manifest_seq) = {
                     let guard = registry.shared();
-                    let state = guard.read().await;
+                    let state = guard.load();
                     let snap: Vec<(String, crate::instruments::InstrumentInfo)> =
                         state.active.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                     let seq_tag = state.manifest_seq;
@@ -732,10 +732,10 @@ pub async fn run_dob_refdata_task(
             }
 
             _ = manifest_ticker.tick() => {
-                // Collect stats under a single short read-lock.
+                // Collect stats lock-free.
                 let (manifest_seq, instrument_count) = {
                     let guard = registry.shared();
-                    let state = guard.read().await;
+                    let state = guard.load();
                     let seq_tag = state.manifest_seq;
                     let count = u32::try_from(state.active.len()).unwrap_or(u32::MAX);
                     (seq_tag, count)

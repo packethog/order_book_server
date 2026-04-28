@@ -3,9 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::{error, info, warn};
-use tokio::sync::RwLock;
 
-use super::{InstrumentInfo, RegistryState, UniverseEntry, make_symbol};
+use super::{InstrumentInfo, RegistryState, SharedRegistry, UniverseEntry, make_symbol};
 
 /// Fetches perpetual, spot, and builder-DEX metadata from the Hyperliquid REST API
 /// and builds a full `UniverseEntry` list keyed by index (including delisted entries).
@@ -184,7 +183,7 @@ fn derive_price_exponent(asset: &serde_json::Value) -> i8 {
 /// 3. If checks pass and the data changed, bumps `manifest_seq` and replaces the state
 /// 4. If checks fail, logs an error and keeps the current state (fail-safe)
 /// 5. If the HL API is unreachable, logs a warning and retries next cycle
-pub async fn refresh_task(api_url: String, state: Arc<RwLock<RegistryState>>, interval: Duration) {
+pub async fn refresh_task(api_url: String, state: SharedRegistry, interval: Duration) {
     info!("instruments: refresh task started (interval={:?})", interval);
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await; // consume immediate first tick
@@ -200,29 +199,34 @@ pub async fn refresh_task(api_url: String, state: Arc<RwLock<RegistryState>>, in
             }
         };
 
-        // Lock for the diff + integrity checks + possible swap.
-        let mut guard = state.write().await;
+        // Snapshot the current state lock-free for the integrity / equality checks.
+        // ArcSwap reads return a Guard that doesn't block any reader or any other
+        // writer; as the only writer in the system, we can read+compare freely
+        // and only emit a store on a real change.
+        let current = state.load();
 
-        if let Err(violation) = check_integrity(&guard.universe, &new_universe) {
+        if let Err(violation) = check_integrity(&current.universe, &new_universe) {
             error!("instruments: integrity check failed, rejecting refresh: {violation}");
             continue;
         }
 
-        if new_universe == guard.universe {
+        if new_universe == current.universe {
             // No change — don't bump seq
             continue;
         }
 
-        let old_seq = guard.manifest_seq;
-        let diff = summarize_diff(&guard.universe, &new_universe);
-
+        let old_seq = current.manifest_seq;
+        let diff = summarize_diff(&current.universe, &new_universe);
         let new_seq = next_manifest_seq(old_seq);
         let new_state = RegistryState {
             active: new_universe.iter().filter(|e| !e.is_delisted).map(|e| (e.coin.clone(), e.info.clone())).collect(),
             universe: new_universe,
             manifest_seq: new_seq,
         };
-        *guard = new_state;
+        // Drop the read snapshot before the store so the Arc backing `current`
+        // can be reclaimed promptly once no other reader holds it.
+        drop(current);
+        state.store(Arc::new(new_state));
 
         info!("instruments: manifest_seq {old_seq} -> {new_seq}: {diff}");
     }
