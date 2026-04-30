@@ -41,6 +41,8 @@ use tokio::{
 };
 use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
 
+#[cfg(test)]
+mod block_mode_multicast_e2e;
 pub(crate) mod dob_tap;
 pub(crate) mod latency;
 #[cfg(test)]
@@ -742,10 +744,11 @@ impl DirectoryListener for OrderBookListener {
                 Ok(data) => data,
                 Err(err) => {
                     // if we run into a serialization error (hitting EOF), just return to last line.
+                    let preview: String = line.chars().take(100).collect();
                     error!(
                         "{event_source} serialization error {err}, height: {:?}, line: {:?}",
                         self.order_book_state.as_ref().map(OrderBookState::height),
-                        &line[..100],
+                        preview,
                     );
                     #[allow(clippy::unwrap_used)]
                     let total_len: i64 = total_len.try_into().unwrap();

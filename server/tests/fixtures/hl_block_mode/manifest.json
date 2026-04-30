@@ -1,0 +1,70 @@
+{
+  "counts": {
+    "diffs": {
+      "bytes": 1238458,
+      "events": 8417,
+      "first_block": 978995377,
+      "last_block": 978995416,
+      "lines": 40
+    },
+    "fills": {
+      "bytes": 61112,
+      "events": 132,
+      "first_block": 978995377,
+      "last_block": 978995416,
+      "lines": 40
+    },
+    "statuses": {
+      "bytes": 9690245,
+      "events": 20224,
+      "first_block": 978995377,
+      "last_block": 978995416,
+      "lines": 40
+    }
+  },
+  "counts_after_coin_filter": {
+    "diffs": {
+      "bytes": 25496,
+      "events": 140,
+      "lines": 40
+    },
+    "fills": {
+      "bytes": 6734,
+      "events": 4,
+      "lines": 40
+    },
+    "statuses": {
+      "bytes": 3698622,
+      "events": 7769,
+      "lines": 40
+    }
+  },
+  "fixture_block_end": 978995416,
+  "fixture_block_start": 978995377,
+  "fixture_coin_filter": [
+    "BTC"
+  ],
+  "fixture_files": {
+    "diffs": "hl/data/node_raw_book_diffs_by_block/hourly/20260430/20",
+    "fills": "hl/data/node_fills_by_block/hourly/20260430/20",
+    "statuses": "hl/data/node_order_statuses_by_block/hourly/20260430/20"
+  },
+  "generated_at_utc": "2026-04-30T20:47:22Z",
+  "notes": "Reduced from real Hyperliquid by-block output. Source files were sampled with tail -n 2000 to avoid scanning large hourly files. Further filtered locally to BTC for CI-sized deterministic replay and stable refdata ordering.",
+  "snapshot_coin_count": 256,
+  "snapshot_coin_count_after_coin_filter": 1,
+  "snapshot_height": 978995376,
+  "source_archive": {
+    "path": "source/hl_block_mode_unfiltered.tar.gz",
+    "sha256": "b425ef6a4dece25bcdc1879033e0d391ed275c62473c3e1a04ee5a03acb9d459"
+  },
+  "source_data_base": "/data/hl-data",
+  "source_files": {
+    "diffs": "node_raw_book_diffs_by_block/hourly/20260430/20",
+    "fills": "node_fills_by_block/hourly/20260430/20",
+    "statuses": "node_order_statuses_by_block/hourly/20260430/20"
+  },
+  "source_host": "ubuntu@tyo-hl-node",
+  "source_snapshot": "/home/ubuntu/out.json",
+  "touched_coin_count": 256
+}

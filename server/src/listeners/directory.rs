@@ -35,7 +35,7 @@ mod tests {
     use notify::{RecursiveMode, Watcher, recommended_watcher};
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use std::{
-        io::{Seek, SeekFrom},
+        io::{Read, Seek, SeekFrom},
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
         time::Duration,
@@ -177,6 +177,7 @@ mod tests {
     // will listen to file events and collect their results in the history field
     struct TestListener {
         file: Option<File>,
+        path: Option<PathBuf>,
         history: Arc<Mutex<String>>,
     }
 
@@ -189,9 +190,16 @@ mod tests {
             &mut self.file
         }
 
-        fn on_file_creation(&mut self, new_file: PathBuf, _event_source: EventSource) -> Result<()> {
-            let file = File::open(new_file)?;
+        fn on_file_creation(&mut self, new_file: PathBuf, event_source: EventSource) -> Result<()> {
+            if self.path.as_ref() == Some(&new_file) {
+                return Ok(());
+            }
+            let mut file = File::open(&new_file)?;
+            let mut buf = String::new();
+            file.read_to_string(&mut buf)?;
+            self.process_data(buf, event_source)?;
             self.file = Some(file);
+            self.path = Some(new_file);
             Ok(())
         }
 
@@ -205,7 +213,7 @@ mod tests {
 
     impl TestListener {
         fn new(history: Arc<Mutex<String>>) -> Self {
-            Self { file: None, history }
+            Self { file: None, path: None, history }
         }
     }
 

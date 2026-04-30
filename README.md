@@ -135,6 +135,24 @@ Then open a capture. The DZ-TOB dissector triggers on frame magic `0x445A`; the 
 tshark -X lua_script:spec/dz_depthofbook.lua -f "udp port 6000" -i lo
 ```
 
+## Test fixtures
+
+`server/tests/fixtures/hl_block_mode/` contains a reduced real Hyperliquid
+by-block replay fixture used by the multicast e2e tests. The test replays the
+fixture through the block-mode listener, captures TOB/DoB UDP output on
+loopback sockets, normalizes runtime-only fields, and compares each stream to
+golden packet files. The reduced unfiltered source extracts are versioned beside
+the fixture, so the BTC-only replay inputs can be regenerated without fetching
+from the validator again. The same fixture directory also includes a host-fetch
+script for refreshing the source archive and goldens from an SSH-accessible HL
+node. See `server/tests/fixtures/hl_block_mode/regenerate.md` for source paths
+and regeneration commands.
+
+## CI
+
+GitHub Actions runs `cargo clippy --workspace --all-targets` and
+`cargo test --workspace` on pushes to `main` and on pull requests.
+
 ## Caveats
 
 - This server does **not** show untriggered trigger orders.
