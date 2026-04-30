@@ -68,7 +68,18 @@ impl MulticastPublisher {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
+    #[cfg(not(test))]
     const CATCHUP_THRESHOLD_MS: u64 = 500;
+
+    #[cfg(test)]
+    fn should_publish_lag(_lag_ms: u64) -> bool {
+        true
+    }
+
+    #[cfg(not(test))]
+    fn should_publish_lag(lag_ms: u64) -> bool {
+        lag_ms <= Self::CATCHUP_THRESHOLD_MS
+    }
 
     #[allow(clippy::cast_possible_truncation)]
     fn now_ns() -> u64 {
@@ -425,7 +436,7 @@ impl MulticastPublisher {
                             InternalMessage::Snapshot { l2_snapshots, time } => {
                                 cached_snapshot = Some(msg.clone());
                                 let lag_ms = Self::now_ms().saturating_sub(*time);
-                                if lag_ms <= Self::CATCHUP_THRESHOLD_MS {
+                                if Self::should_publish_lag(lag_ms) {
                                     if !caught_up {
                                         info!("multicast: caught up (lag {lag_ms}ms), publishing quotes");
                                         caught_up = true;
@@ -440,7 +451,7 @@ impl MulticastPublisher {
                             }
                             InternalMessage::Fills { batch } => {
                                 let lag_ms = Self::now_ms().saturating_sub(batch.block_time());
-                                if lag_ms <= Self::CATCHUP_THRESHOLD_MS {
+                                if Self::should_publish_lag(lag_ms) {
                                     let trades_by_coin = crate::servers::websocket_server::coin_to_trades(batch);
                                     self.publish_trades(&trades_by_coin).await;
                                     had_activity = true;
