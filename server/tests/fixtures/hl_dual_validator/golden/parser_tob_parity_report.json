@@ -1,0 +1,21 @@
+{
+  "block": {
+    "quote_count": 52,
+    "record_count": 67,
+    "refdata_count": 4
+  },
+  "edge_multicast_ref": {
+    "commit": "fa98eb78255f9d8492902db4b04c23aa04b074b8",
+    "repo": "https://github.com/malbeclabs/edge-multicast-ref.git"
+  },
+  "parity": {
+    "block_end_quote_count": 52,
+    "matched_end_quote_count": 50,
+    "stream_end_quote_count": 50
+  },
+  "stream": {
+    "quote_count": 1333,
+    "record_count": 1337,
+    "refdata_count": 4
+  }
+}

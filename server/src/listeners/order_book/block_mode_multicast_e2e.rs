@@ -1106,10 +1106,15 @@ async fn run_edge_tob_parser_replay(
         out
     });
 
+    let (marketdata_resets, marketdata_body) =
+        partition_tob_packets_by_msg_type(marketdata_packets, tob_const::MSG_TYPE_CHANNEL_RESET);
+
     sleep(Duration::from_millis(1500)).await;
+    send_multicast_packets(group, marketdata_port, &marketdata_resets).await;
+    sleep(Duration::from_millis(250)).await;
     send_multicast_packets(group, refdata_port, refdata_packets).await;
     sleep(Duration::from_millis(500)).await;
-    send_multicast_packets(group, marketdata_port, marketdata_packets).await;
+    send_multicast_packets(group, marketdata_port, &marketdata_body).await;
     sleep(Duration::from_millis(1500)).await;
 
     terminate_child(&mut child).await;
@@ -1131,8 +1136,44 @@ async fn run_edge_tob_parser_replay(
 
 async fn terminate_child(child: &mut tokio::process::Child) {
     let pid = child.id().expect("child has pid");
-    let status = Command::new("kill").arg("-TERM").arg(pid.to_string()).status().expect("send SIGTERM");
+    let status = Command::new("sh").arg("-c").arg(format!("kill -TERM {pid}")).status().expect("send SIGTERM");
     assert!(status.success(), "SIGTERM sent to edge parser pid {pid}");
+}
+
+fn partition_tob_packets_by_msg_type(packets: &[Vec<u8>], msg_type: u8) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let mut matching = Vec::new();
+    let mut rest = Vec::new();
+    for packet in packets {
+        if packet_contains_msg_type(packet, msg_type) {
+            matching.push(packet.clone());
+        } else {
+            rest.push(packet.clone());
+        }
+    }
+    (matching, rest)
+}
+
+fn packet_contains_msg_type(packet: &[u8], msg_type: u8) -> bool {
+    if packet.len() < 24 {
+        return false;
+    }
+    let msg_count = packet[20] as usize;
+    let mut offset = 24;
+    for _ in 0..msg_count {
+        if offset + 4 > packet.len() {
+            return false;
+        }
+        let current_type = packet[offset];
+        let msg_len = packet[offset + 1] as usize;
+        if current_type == msg_type {
+            return true;
+        }
+        offset += 4 + msg_len;
+        if offset > packet.len() {
+            return false;
+        }
+    }
+    false
 }
 
 async fn send_multicast_packets(group: Ipv4Addr, port: u16, packets: &[Vec<u8>]) {
@@ -1180,6 +1221,8 @@ fn normalize_parser_record(value: &mut serde_json::Value) {
     object.remove("recv_ts");
     object.remove("parser_kernel_recv_ts_ns");
     object.remove("recv_ts_kind");
+    object.remove("multicast_group");
+    object.remove("port");
 }
 
 fn parser_records_by_type(records: &[serde_json::Value], record_type: &str) -> Vec<serde_json::Value> {

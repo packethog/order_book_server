@@ -20,6 +20,8 @@ docker build \
 
 docker run --rm \
   --user "$(id -u):$(id -g)" \
+  -e CARGO_INCREMENTAL=0 \
+  -e CARGO_TARGET_DIR=/tmp/order-book-target \
   -e EDGE_MULTICAST_REF_DIR=/edge-multicast-ref \
   -e HL_DUAL_VALIDATOR_REGENERATE="${HL_DUAL_VALIDATOR_REGENERATE:-}" \
   -v "${REPO_ROOT}:/workspace" \

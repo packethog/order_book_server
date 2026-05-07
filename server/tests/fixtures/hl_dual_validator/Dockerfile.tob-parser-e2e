@@ -3,11 +3,16 @@ FROM rust:1.90-slim-bookworm
 ARG GO_VERSION=1.25.0
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git pkg-config build-essential \
+    && apt-get install -y --no-install-recommends ca-certificates curl git pkg-config build-essential libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
-    | tar -C /usr/local -xz
+RUN go_arch="$(dpkg --print-architecture)" \
+    && case "${go_arch}" in \
+        amd64|arm64) ;; \
+        *) echo "unsupported Go architecture: ${go_arch}" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${go_arch}.tar.gz" \
+        | tar -C /usr/local -xz
 
 ENV PATH="/usr/local/go/bin:${PATH}"
 ENV CARGO_HOME=/tmp/cargo
