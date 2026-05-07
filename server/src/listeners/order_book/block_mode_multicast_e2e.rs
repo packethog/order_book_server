@@ -1183,11 +1183,7 @@ fn normalize_parser_record(value: &mut serde_json::Value) {
 }
 
 fn parser_records_by_type(records: &[serde_json::Value], record_type: &str) -> Vec<serde_json::Value> {
-    records
-        .iter()
-        .filter(|record| record["type"].as_str() == Some(record_type))
-        .cloned()
-        .collect()
+    records.iter().filter(|record| record["type"].as_str() == Some(record_type)).cloned().collect()
 }
 
 fn parser_records_by_types(records: &[serde_json::Value], record_types: &[&str]) -> Vec<serde_json::Value> {
@@ -1214,9 +1210,9 @@ fn assert_parser_stream_end_quotes_match_block(
 ) -> Vec<serde_json::Value> {
     let mut matched = Vec::new();
     for (timestamp, stream_quote) in stream {
-        let block_quote = block
-            .get(timestamp)
-            .unwrap_or_else(|| panic!("parsed streaming end-of-block quote timestamp {timestamp} missing from block replay"));
+        let block_quote = block.get(timestamp).unwrap_or_else(|| {
+            panic!("parsed streaming end-of-block quote timestamp {timestamp} missing from block replay")
+        });
         assert_eq!(block_quote, stream_quote, "parsed TOB end-of-block quote at source timestamp {timestamp}");
         matched.push(stream_quote.clone());
     }

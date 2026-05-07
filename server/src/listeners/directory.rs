@@ -38,11 +38,15 @@ mod tests {
         io::{Read, Seek, SeekFrom},
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
-        time::Duration,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
-    use tokio::{fs::File as TokioFile, io::AsyncWriteExt, sync::mpsc::unbounded_channel, time::sleep};
+    use tokio::{
+        fs::File as TokioFile,
+        io::AsyncWriteExt,
+        sync::{mpsc::unbounded_channel, oneshot},
+        time::sleep,
+    };
 
-    const MOCK_HL_DIR: &str = "tmp/ws_listener_test";
     const DATA: [&str; 2] = [
         r#"{"coin":"@151","side":"A","time":"2025-06-24T02:56:36.172847427","px":"2393.9","sz":"0.1539","hash":"0x2b21750229be769650b604261eaac1018c00c45812652efbbdd35fe0ecb201a1","trade_dir_override":"Na","side_info":[{"user":"0xecb63caa47c7c4e77f60f1ce858cf28dc2b82b00","start_pos":"1166.565307356","oid":105686971733,"twap_id":null,"cloid":"0x1070fff92506b3ab5e5aec135e5a5ddd"},{"user":"0xb65117c1e1006e7b2413fa90e96fcbe3fa83ed75","start_pos":"0.153928559","oid":105686976226,"twap_id":null,"cloid":null}]}
 {"coin":"@166","side":"A","time":"2025-06-24T02:56:36.172847427","px":"1.0003","sz":"184.11","hash":"0x0ffc6896b2147680820e04261eaac1018c0101735014e44b56f038478b13ad8f","trade_dir_override":"Na","side_info":[{"user":"0x107332a1729ba0bcf6171117815a87b72a7e6082","start_pos":"36301.55539655","oid":105686050113,"twap_id":null,"cloid":null},{"user":"0xb65117c1e1006e7b2413fa90e96fcbe3fa83ed75","start_pos":"184.12704003","oid":105686976227,"twap_id":null,"cloid":null}]}
@@ -73,7 +77,12 @@ mod tests {
 "#,
     ];
 
-    async fn listen<L: DirectoryListener>(listener: &mut L, event_source: EventSource, dir: &Path) -> Result<()> {
+    async fn listen<L: DirectoryListener>(
+        listener: &mut L,
+        event_source: EventSource,
+        dir: &Path,
+        ready_tx: oneshot::Sender<()>,
+    ) -> Result<()> {
         let event_source_dir = event_source.event_source_dir(dir).canonicalize()?;
         info!("Monitoring directory: {}", event_source_dir.display());
         // monitoring the directory via the notify crate (gives file system events)
@@ -86,6 +95,7 @@ mod tests {
         })?;
 
         watcher.watch(&event_source_dir, RecursiveMode::Recursive)?;
+        let _unused = ready_tx.send(());
         loop {
             match fs_event_rx.recv().await {
                 Some(Ok(event)) => {
@@ -147,13 +157,9 @@ mod tests {
     }
 
     async fn create_mock_data(event_source: EventSource, mock_dir: &Path) -> Result<String> {
-        // set up so that the directory is initially empty
         let mut res = String::new();
-        sleep(Duration::from_millis(100)).await;
         let mut rng = StdRng::from_seed([42; 32]);
-        let mock_dir = event_source.event_source_dir(mock_dir).canonicalize()?;
-        clear_dir_contents(&mock_dir)?;
-        let mock_dir = mock_dir.join("hourly/20250624");
+        let mock_dir = event_source.event_source_dir(mock_dir).join("hourly/20250624");
         create_dir_all(&mock_dir)?;
 
         // test that it works when we transition across files
@@ -217,29 +223,40 @@ mod tests {
         }
     }
 
+    fn unique_mock_path() -> PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_nanos());
+        std::env::temp_dir().join(format!("ws_listener_test-{}-{nanos}", std::process::id()))
+    }
+
     #[allow(clippy::unwrap_used)]
     #[allow(clippy::significant_drop_tightening)]
     #[tokio::test]
     async fn test_trade_listener() -> Result<()> {
-        let mock_path = PathBuf::from(MOCK_HL_DIR);
+        let mock_path = unique_mock_path();
         let event_source = EventSource::Fills;
-        create_dir_all(event_source.event_source_dir(&mock_path))?;
+        create_dir_all(event_source.event_source_dir(&mock_path).join("hourly/20250624"))?;
+        clear_dir_contents(&event_source.event_source_dir(&mock_path))?;
+        create_dir_all(event_source.event_source_dir(&mock_path).join("hourly/20250624"))?;
         let history = Arc::new(Mutex::new(String::new()));
         let mut test_listener = TestListener::new(history.clone());
-        {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let listener_task = {
             let mock_path = mock_path.clone();
             tokio::spawn(async move {
-                if let Err(err) = listen(&mut test_listener, event_source, &mock_path).await {
+                if let Err(err) = listen(&mut test_listener, event_source, &mock_path, ready_tx).await {
                     error!("Listener error: {err}");
                 }
-            });
-        }
+            })
+        };
+        ready_rx.await?;
 
         // get desired output
         let expected = create_mock_data(event_source, &mock_path).await?;
         sleep(Duration::from_secs(2)).await;
         let history = history.lock().unwrap();
         assert_eq!(*history, expected);
+        listener_task.abort();
+        remove_dir_all(&mock_path)?;
         Ok(())
     }
 }
