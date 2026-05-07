@@ -68,7 +68,7 @@ pub async fn run_websocket_server(
     let hl_data_root = hl_data_root.unwrap_or_else(|| home_dir.join("hl/data"));
     let listener = {
         let internal_message_tx = internal_message_tx.clone();
-        OrderBookListener::new(Some(internal_message_tx), ignore_spot)
+        OrderBookListener::new_with_ingest_mode(Some(internal_message_tx), ignore_spot, ingest_mode)
     };
     let listener = Arc::new(Mutex::new(listener));
     {
