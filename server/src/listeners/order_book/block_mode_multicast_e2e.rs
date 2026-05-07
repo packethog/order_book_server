@@ -68,7 +68,7 @@ async fn real_block_mode_fixture_publishes_expected_multicast_packets() {
     let registry = new_shared_registry(test_registry_state());
     let (internal_tx, _) = broadcast_channel::<Arc<InternalMessage>>(512);
 
-    let mut listener = OrderBookListener::new(Some(internal_tx.clone()), true);
+    let mut listener = OrderBookListener::new_with_ingest_mode(Some(internal_tx.clone()), true, IngestMode::Block);
     listener.init_from_snapshot(snapshot, snapshot_height);
 
     let (dob_tx, dob_rx) = dob_channel(8192);
@@ -586,7 +586,7 @@ async fn streaming_fixture_matches_block_fixture_final_books() {
         .await
         .expect("fixture snapshot loads twice");
 
-    let mut block_listener = OrderBookListener::new(None, true);
+    let mut block_listener = OrderBookListener::new_with_ingest_mode(None, true, IngestMode::Block);
     block_listener.init_from_snapshot(snapshot_a, snapshot_height);
     let block_listener = Arc::new(Mutex::new(block_listener));
     replay_fixture_blocks(&root, &block_listener).await;
@@ -615,7 +615,7 @@ async fn streaming_fixture_matches_block_fixture_final_books() {
 
 #[test]
 fn partial_trailing_json_line_is_deferred_without_panic() {
-    let mut listener = OrderBookListener::new(None, true);
+    let mut listener = OrderBookListener::new_with_ingest_mode(None, true, IngestMode::Block);
     let partial = "{\"local_time\":\"2026-04-30T20:00:00\",\"block_time\":\"2026-04-30T20:00:00\"";
     listener.process_data(partial.to_string(), EventSource::OrderDiffs).expect("partial line should be deferred");
     assert!(listener.order_book_state.is_none());
@@ -656,7 +656,55 @@ async fn streaming_unresolved_new_order_fails_when_forced_to_finalize() {
 }
 
 #[tokio::test]
-async fn streaming_late_data_for_finalized_block_is_rejected() {
+async fn init_from_snapshot_prunes_stale_pre_snapshot_streaming_blocks() {
+    // The streaming file watcher races ahead of the snapshot fetch — so by the
+    // time `init_from_snapshot` runs, `streaming_state.blocks` typically holds
+    // events for heights at or below the snapshot's height. Replaying those
+    // would either dup orders (New) or be rejected by `apply_stream_diff`'s
+    // `block_number < self.height` check (which would set order_book_state
+    // back to None and leave the publisher unable to emit deltas). The
+    // listener must drop pre-snapshot blocks before draining.
+    let root = fixture_root();
+    let (snapshot_height, snapshot) =
+        load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&root.join("out.json"))
+            .await
+            .expect("fixture snapshot loads");
+    let mut listener = OrderBookListener::new_with_ingest_mode(None, true, IngestMode::Stream);
+
+    // Inject a pair of streaming events at a height strictly below the
+    // snapshot, mimicking what the file watcher accumulates pre-snapshot.
+    let (status_batch, diff_batch) = first_streaming_new_diff_and_status();
+    let stale_height = snapshot_height.saturating_sub(1);
+    let stale_block_time = diff_batch.block_time().saturating_sub(1_000);
+    let stale_status_batch = Batch::new_for_test(stale_height, stale_block_time, status_batch.events_ref().to_vec());
+    let stale_diff_batch = Batch::new_for_test(stale_height, stale_block_time, diff_batch.events_ref().to_vec());
+    listener.receive_batch(EventBatch::Orders(stale_status_batch)).unwrap();
+    listener.receive_batch(EventBatch::BookDiffs(stale_diff_batch)).unwrap();
+
+    // Now run init_from_snapshot. Without the prune step, this would call
+    // drain_streaming_blocks which would feed apply_stream_diff a stale block
+    // at height < self.height, triggering "Received finalized streaming
+    // block ..." and leaving order_book_state = None.
+    listener.init_from_snapshot(snapshot, snapshot_height);
+
+    assert!(
+        listener.is_ready(),
+        "order_book_state must be Some after init_from_snapshot — pre-snapshot streaming events should have been pruned",
+    );
+    assert_eq!(
+        listener.compute_snapshot().unwrap().height,
+        snapshot_height,
+        "book height matches snapshot height; the stale pre-snapshot stream events were not applied",
+    );
+}
+
+#[tokio::test]
+async fn streaming_late_data_for_finalized_block_is_dropped() {
+    // hl-node writes the streaming statuses, diffs, and fills files concurrently;
+    // they're delivered through one notify channel. If a later block's diffs
+    // arrive and finalize an earlier block before that earlier block's statuses/
+    // diffs from another file land, the listener must drop the late events with
+    // a warn log rather than crash. This test simulates that race.
     let (mut listener, _snapshot_height) = stream_listener_from_fixture().await;
     let (status_batch, diff_batch) = first_streaming_new_diff_and_status();
     let next_empty_batch = Batch::new_for_test(
@@ -669,8 +717,9 @@ async fn streaming_late_data_for_finalized_block_is_rejected() {
     listener.receive_batch(EventBatch::BookDiffs(diff_batch.clone())).unwrap();
     listener.receive_batch(EventBatch::BookDiffs(next_empty_batch)).unwrap();
 
-    let err = listener.receive_batch(EventBatch::BookDiffs(diff_batch)).unwrap_err().to_string();
-    assert!(err.contains("late streaming data"), "{err}");
+    // Replay the now-finalized block's diff: must be dropped silently (Ok),
+    // not propagated as a fatal error that would tear down the listener.
+    listener.receive_batch(EventBatch::BookDiffs(diff_batch)).expect("late events drop, do not crash");
 }
 
 async fn stream_listener_from_fixture() -> (OrderBookListener, u64) {

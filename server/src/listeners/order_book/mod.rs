@@ -340,10 +340,12 @@ pub(crate) struct OrderBookListener {
 }
 
 impl OrderBookListener {
-    pub(crate) fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
-        Self::new_with_ingest_mode(internal_message_tx, ignore_spot, IngestMode::Block)
-    }
-
+    /// Constructs a listener with the given ingest mode. There is intentionally
+    /// no default-ingest-mode convenience constructor: every call site must
+    /// state which mode it wants. A previous default-to-Block constructor
+    /// silently created Block-mode listeners in the streaming code path,
+    /// breaking the streaming pipeline (file watcher pointed at streaming dirs
+    /// but events routed to receive_block_batch).
     pub(crate) fn new_with_ingest_mode(
         internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
         ignore_spot: bool,
@@ -573,7 +575,18 @@ impl OrderBookListener {
 
     fn receive_stream_statuses(&mut self, batch: Batch<NodeDataOrderStatus>) -> Result<()> {
         let height = batch.block_number();
-        self.ensure_stream_block_not_finalized(height)?;
+        // hl-node writes the three streaming files (statuses, diffs, fills)
+        // concurrently. They're delivered to us through one notify channel,
+        // but cross-file ordering can lag — e.g. drain_streaming_blocks may
+        // already have finalized block N (because we saw block N+1's diffs)
+        // when block N's statuses arrive. Drop these late events rather than
+        // crashing the listener.
+        if self.streaming_state.finalized_height.is_some_and(|finalized| height <= finalized) {
+            log::warn!(
+                "dropping late streaming statuses for finalized block {height} (cross-file ordering)"
+            );
+            return Ok(());
+        }
         self.last_batch_block_time_ms = Some(batch.block_time());
         self.last_batch_local_time_ms = Some(batch.local_time_ms());
 
@@ -590,7 +603,13 @@ impl OrderBookListener {
 
     fn receive_stream_diffs(&mut self, batch: Batch<NodeDataOrderDiff>) -> Result<()> {
         let height = batch.block_number();
-        self.ensure_stream_block_not_finalized(height)?;
+        // See receive_stream_statuses for the cross-file race rationale.
+        if self.streaming_state.finalized_height.is_some_and(|finalized| height <= finalized) {
+            log::warn!(
+                "dropping late streaming diffs for finalized block {height} (cross-file ordering)"
+            );
+            return Ok(());
+        }
         self.last_batch_block_time_ms = Some(batch.block_time());
         self.last_batch_local_time_ms = Some(batch.local_time_ms());
 
@@ -599,13 +618,6 @@ impl OrderBookListener {
         block.local_time_ms = Some(batch.local_time_ms());
         for diff in batch.events_ref() {
             block.diffs.push_back(batch.with_events(vec![diff.clone()]));
-        }
-        Ok(())
-    }
-
-    fn ensure_stream_block_not_finalized(&self, height: u64) -> Result<()> {
-        if self.streaming_state.finalized_height.is_some_and(|finalized| height <= finalized) {
-            return Err(format!("received late streaming data for finalized block {height}").into());
         }
         Ok(())
     }
@@ -656,7 +668,11 @@ impl OrderBookListener {
                         status,
                     )?;
                     self.publish_l4_update(diff_batch, status_batch);
-                    self.publish_l2_snapshot();
+                    // L2 snapshot publishing is intentionally NOT done per-diff: it
+                    // recomputes top-of-book for every instrument and was the dominant
+                    // cost in stream mode (per-block compute scaled with diffs/block).
+                    // process_data calls l2_snapshots(true) once at the end of every
+                    // file-read chunk, which is the same cadence block-mode uses.
                 }
             }
 
@@ -680,19 +696,6 @@ impl OrderBookListener {
             tokio::spawn(async move {
                 let updates = Arc::new(InternalMessage::L4BookUpdates { diff_batch, status_batch });
                 let _unused = tx.send(updates);
-            });
-        }
-    }
-
-    fn publish_l2_snapshot(&mut self) {
-        let snapshot = self.l2_snapshots(true);
-        if let Some(snapshot) = snapshot
-            && let Some(tx) = &self.internal_message_tx
-        {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
-                let _unused = tx.send(snapshot);
             });
         }
     }
@@ -800,7 +803,7 @@ impl OrderBookListener {
     /// `init_from_snapshot` makes during normal startup.
     #[cfg(test)]
     pub(crate) fn for_test_with_snapshot(snapshot: Snapshots<InnerL4Order>, height: u64) -> Self {
-        let mut listener = Self::new(None, false);
+        let mut listener = Self::new_with_ingest_mode(None, false, IngestMode::Block);
         listener.init_from_snapshot(snapshot, height);
         listener
     }
