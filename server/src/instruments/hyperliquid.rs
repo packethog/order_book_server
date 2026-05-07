@@ -55,12 +55,7 @@ pub async fn fetch_universe(api_url: &str) -> Result<Vec<UniverseEntry>, Box<dyn
 
     // Fetch builder-DEX perps. Failures here are non-fatal: we log and return
     // whatever we've already collected so core perps stay on the air.
-    match client
-        .post(format!("{api_url}/info"))
-        .json(&serde_json::json!({"type": "perpDexs"}))
-        .send()
-        .await
-    {
+    match client.post(format!("{api_url}/info")).json(&serde_json::json!({"type": "perpDexs"})).send().await {
         Ok(resp) => match resp.json::<serde_json::Value>().await {
             Ok(value) => {
                 if let Some(dexs) = value.as_array() {

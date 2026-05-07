@@ -12,7 +12,9 @@ use std::collections::HashMap;
 
 use alloy::primitives::Address;
 
-use crate::instruments::{InstrumentInfo, RegistryState, SharedRegistry, UniverseEntry, make_symbol, new_shared_registry};
+use crate::instruments::{
+    InstrumentInfo, RegistryState, SharedRegistry, UniverseEntry, make_symbol, new_shared_registry,
+};
 use crate::order_book::multi_book::Snapshots;
 use crate::order_book::{Coin, OrderBook, Px, Side, Snapshot, Sz};
 use crate::types::inner::InnerL4Order;
@@ -47,29 +49,13 @@ pub(crate) fn make_order(coin: &Coin, oid: u64, side: Side, px: u64, sz: u64) ->
 /// (so the order-book validator's content check sees them as different),
 /// while keeping price levels identical.  Pass `0` if you don't need the
 /// distinction.
-pub(crate) fn build_one_coin_snapshot(
-    coin_str: &str,
-    num_orders: usize,
-    oid_offset: u64,
-) -> Snapshots<InnerL4Order> {
+pub(crate) fn build_one_coin_snapshot(coin_str: &str, num_orders: usize, oid_offset: u64) -> Snapshots<InnerL4Order> {
     let coin = Coin::new(coin_str);
     let mut book: OrderBook<InnerL4Order> = OrderBook::new();
     for i in 0..num_orders {
         // Distinct, non-crossing bid/ask prices.
-        book.add_order(make_order(
-            &coin,
-            oid_offset + 1000 + i as u64,
-            Side::Bid,
-            100 - i as u64,
-            10,
-        ));
-        book.add_order(make_order(
-            &coin,
-            oid_offset + 2000 + i as u64,
-            Side::Ask,
-            200 + i as u64,
-            10,
-        ));
+        book.add_order(make_order(&coin, oid_offset + 1000 + i as u64, Side::Bid, 100 - i as u64, 10));
+        book.add_order(make_order(&coin, oid_offset + 2000 + i as u64, Side::Ask, 200 + i as u64, 10));
     }
     let mut map: HashMap<Coin, Snapshot<InnerL4Order>> = HashMap::new();
     map.insert(coin, book.to_snapshot());
@@ -78,19 +64,11 @@ pub(crate) fn build_one_coin_snapshot(
 
 /// Build a `SharedRegistry` with a single instrument entry suitable for tests
 /// that need a registry to look up one coin.
-pub(crate) fn build_registry_with_one_instrument(
-    coin_str: &str,
-    instrument_id: u32,
-) -> SharedRegistry {
+pub(crate) fn build_registry_with_one_instrument(coin_str: &str, instrument_id: u32) -> SharedRegistry {
     new_shared_registry(RegistryState::new(vec![UniverseEntry {
         instrument_id,
         coin: coin_str.to_string(),
         is_delisted: false,
-        info: InstrumentInfo {
-            instrument_id,
-            price_exponent: -1,
-            qty_exponent: -5,
-            symbol: make_symbol(coin_str),
-        },
+        info: InstrumentInfo { instrument_id, price_exponent: -1, qty_exponent: -5, symbol: make_symbol(coin_str) },
     }]))
 }

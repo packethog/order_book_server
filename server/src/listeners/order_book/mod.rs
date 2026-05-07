@@ -1,36 +1,17 @@
-use crate::{
-    HL_NODE,
-    listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
-    multicast::dob::{
-        DobEvent, DobEventSender, DobSnapshotRequest, DobSnapshotRequestSender, SharedMktdataSeq,
-    },
-    order_book::{
-        Coin, Snapshot,
-        multi_book::{Snapshots, load_snapshots_from_json},
-    },
-    prelude::*,
-    protocol::dob::{
-        constants::RESET_REASON_PUBLISHER_INCONSISTENCY, messages::InstrumentReset,
-    },
-    types::{
-        L4Order,
-        inner::{InnerL4Order, InnerLevel},
-        node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
-    },
-};
-use alloy::primitives::Address;
-use fs::File;
-use latency::LatencyStats;
-use log::{error, info};
-use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use alloy::primitives::Address;
+use fs::File;
+use latency::LatencyStats;
+use log::{error, info};
+use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use tokio::{
     sync::{
         Mutex,
@@ -40,6 +21,23 @@ use tokio::{
     time::{Instant, interval_at},
 };
 use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
+
+use crate::{
+    HL_NODE,
+    listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
+    multicast::dob::{DobEvent, DobEventSender, DobSnapshotRequest, DobSnapshotRequestSender, SharedMktdataSeq},
+    order_book::{
+        Coin, Oid, Snapshot,
+        multi_book::{Snapshots, load_snapshots_from_json},
+    },
+    prelude::*,
+    protocol::dob::{constants::RESET_REASON_PUBLISHER_INCONSISTENCY, messages::InstrumentReset},
+    types::{
+        L4Order, OrderDiff,
+        inner::{InnerL4Order, InnerLevel},
+        node_data::{Batch, EventSource, IngestMode, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+    },
+};
 
 #[cfg(test)]
 mod block_mode_multicast_e2e;
@@ -55,18 +53,21 @@ mod utils;
 /// `InstrumentReset.timestamp_ns` without crossing a privacy boundary.
 #[inline]
 fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
 }
 
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
 // if there are scripts running, this may not work as intended
-pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: PathBuf) -> Result<()> {
-    let order_statuses_dir = EventSource::OrderStatuses.event_source_dir(&dir).canonicalize()?;
-    let fills_dir = EventSource::Fills.event_source_dir(&dir).canonicalize()?;
-    let order_diffs_dir = EventSource::OrderDiffs.event_source_dir(&dir).canonicalize()?;
+pub(crate) async fn hl_listen(
+    listener: Arc<Mutex<OrderBookListener>>,
+    snapshot_dir: PathBuf,
+    hl_data_root: PathBuf,
+    ingest_mode: IngestMode,
+) -> Result<()> {
+    let order_statuses_dir =
+        EventSource::OrderStatuses.event_source_dir_for(&hl_data_root, ingest_mode).canonicalize()?;
+    let fills_dir = EventSource::Fills.event_source_dir_for(&hl_data_root, ingest_mode).canonicalize()?;
+    let order_diffs_dir = EventSource::OrderDiffs.event_source_dir_for(&hl_data_root, ingest_mode).canonicalize()?;
     info!("Monitoring order status directory: {}", order_statuses_dir.display());
     info!("Monitoring order diffs directory: {}", order_diffs_dir.display());
     info!("Monitoring fills directory: {}", fills_dir.display());
@@ -201,7 +202,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
 
                 let listener = listener.clone();
                 let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
+                fetch_snapshot(snapshot_dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
             }
         }
     }
@@ -228,9 +229,7 @@ fn fetch_snapshot(
                         // cycle (we'll catch the next one).
                         let mut guard = listener.lock().await;
                         if guard.is_ready() {
-                            let our_height = guard.order_book_state.as_ref()
-                                .map(|s| s.height())
-                                .unwrap_or(0);
+                            let our_height = guard.order_book_state.as_ref().map(|s| s.height()).unwrap_or(0);
                             if our_height < height {
                                 // We haven't reached the snapshot height yet;
                                 // skip — we'll validate on a future cycle.
@@ -246,13 +245,12 @@ fn fetch_snapshot(
                                 // so we don't block the hot path. If divergence
                                 // is found, re-lock and apply surgical per-coin
                                 // recovery rather than tearing down the feed.
-                                let state = guard.order_book_state
-                                    .clone()
-                                    .expect("is_ready checked above");
+                                let state = guard.order_book_state.clone().expect("is_ready checked above");
                                 drop(guard);
                                 let stored_snapshot = state.compute_snapshot().snapshot;
                                 info!("Validating snapshot at height {height}");
-                                let report = validate_snapshot_consistency(&stored_snapshot, &expected_snapshot, ignore_spot);
+                                let report =
+                                    validate_snapshot_consistency(&stored_snapshot, &expected_snapshot, ignore_spot);
                                 if report.is_clean() {
                                     Ok(())
                                 } else {
@@ -300,7 +298,23 @@ pub(crate) struct DobReplayTaps {
     pub(crate) instrument_id_for: Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync>,
 }
 
+#[derive(Default)]
+struct StreamingBlock {
+    block_time_ms: Option<u64>,
+    local_time_ms: Option<u64>,
+    statuses: HashMap<Oid, NodeDataOrderStatus>,
+    diffs: VecDeque<Batch<NodeDataOrderDiff>>,
+    boundary_open: bool,
+}
+
+#[derive(Default)]
+struct StreamingState {
+    blocks: BTreeMap<u64, StreamingBlock>,
+    finalized_height: Option<u64>,
+}
+
 pub(crate) struct OrderBookListener {
+    ingest_mode: IngestMode,
     ignore_spot: bool,
     fill_status_file: Option<File>,
     order_status_file: Option<File>,
@@ -322,11 +336,21 @@ pub(crate) struct OrderBookListener {
     // `InstrumentReset` and schedule priority snapshots. `None` until
     // `attach_dob_replay_taps` is called; recovery still runs without it.
     dob_replay_taps: Option<DobReplayTaps>,
+    streaming_state: StreamingState,
 }
 
 impl OrderBookListener {
-    pub(crate) const fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
+    pub(crate) fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
+        Self::new_with_ingest_mode(internal_message_tx, ignore_spot, IngestMode::Block)
+    }
+
+    pub(crate) fn new_with_ingest_mode(
+        internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+        ignore_spot: bool,
+        ingest_mode: IngestMode,
+    ) -> Self {
         Self {
+            ingest_mode,
             ignore_spot,
             fill_status_file: None,
             order_status_file: None,
@@ -341,6 +365,7 @@ impl OrderBookListener {
             last_batch_local_time_ms: None,
             pending_dob_tap: None,
             dob_replay_taps: None,
+            streaming_state: StreamingState::default(),
         }
     }
 
@@ -432,19 +457,13 @@ impl OrderBookListener {
         };
 
         if let Err(err) = taps.mktdata_tx.try_send(DobEvent::InstrumentReset(msg)) {
-            log::warn!(
-                "dob taps: dropped InstrumentReset for {}: {err}",
-                coin.value()
-            );
+            log::warn!("dob taps: dropped InstrumentReset for {}: {err}", coin.value());
         }
-        if let Err(err) = taps.snapshot_request_tx.try_send(DobSnapshotRequest::Priority {
-            instrument_id,
-            anchor_seq: new_anchor_seq,
-        }) {
-            log::warn!(
-                "dob taps: dropped priority snapshot request for {}: {err}",
-                coin.value()
-            );
+        if let Err(err) = taps
+            .snapshot_request_tx
+            .try_send(DobSnapshotRequest::Priority { instrument_id, anchor_seq: new_anchor_seq })
+        {
+            log::warn!("dob taps: dropped priority snapshot request for {}: {err}", coin.value());
         }
     }
 
@@ -476,6 +495,13 @@ impl OrderBookListener {
     }
 
     fn receive_batch(&mut self, updates: EventBatch) -> Result<()> {
+        match self.ingest_mode {
+            IngestMode::Block => self.receive_block_batch(updates),
+            IngestMode::Stream => self.receive_stream_batch(updates),
+        }
+    }
+
+    fn receive_block_batch(&mut self, updates: EventBatch) -> Result<()> {
         match updates {
             EventBatch::Orders(batch) => {
                 self.order_status_cache.push(batch);
@@ -518,6 +544,157 @@ impl OrderBookListener {
             }
         }
         Ok(())
+    }
+
+    fn receive_stream_batch(&mut self, updates: EventBatch) -> Result<()> {
+        match updates {
+            EventBatch::Fills(batch) => self.publish_fills(batch),
+            EventBatch::Orders(batch) => {
+                self.receive_stream_statuses(batch)?;
+                self.drain_streaming_blocks()
+            }
+            EventBatch::BookDiffs(batch) => {
+                self.receive_stream_diffs(batch)?;
+                self.drain_streaming_blocks()
+            }
+        }
+    }
+
+    fn publish_fills(&mut self, batch: Batch<NodeDataFill>) -> Result<()> {
+        if let Some(tx) = &self.internal_message_tx {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let snapshot = Arc::new(InternalMessage::Fills { batch });
+                let _unused = tx.send(snapshot);
+            });
+        }
+        Ok(())
+    }
+
+    fn receive_stream_statuses(&mut self, batch: Batch<NodeDataOrderStatus>) -> Result<()> {
+        let height = batch.block_number();
+        self.ensure_stream_block_not_finalized(height)?;
+        self.last_batch_block_time_ms = Some(batch.block_time());
+        self.last_batch_local_time_ms = Some(batch.local_time_ms());
+
+        let block = self.streaming_state.blocks.entry(height).or_default();
+        block.block_time_ms.get_or_insert(batch.block_time());
+        block.local_time_ms = Some(batch.local_time_ms());
+        for status in batch.events() {
+            if status.is_inserted_into_book() {
+                block.statuses.insert(Oid::new(status.order.oid), status);
+            }
+        }
+        Ok(())
+    }
+
+    fn receive_stream_diffs(&mut self, batch: Batch<NodeDataOrderDiff>) -> Result<()> {
+        let height = batch.block_number();
+        self.ensure_stream_block_not_finalized(height)?;
+        self.last_batch_block_time_ms = Some(batch.block_time());
+        self.last_batch_local_time_ms = Some(batch.local_time_ms());
+
+        let block = self.streaming_state.blocks.entry(height).or_default();
+        block.block_time_ms.get_or_insert(batch.block_time());
+        block.local_time_ms = Some(batch.local_time_ms());
+        for diff in batch.events_ref() {
+            block.diffs.push_back(batch.with_events(vec![diff.clone()]));
+        }
+        Ok(())
+    }
+
+    fn ensure_stream_block_not_finalized(&self, height: u64) -> Result<()> {
+        if self.streaming_state.finalized_height.is_some_and(|finalized| height <= finalized) {
+            return Err(format!("received late streaming data for finalized block {height}").into());
+        }
+        Ok(())
+    }
+
+    fn drain_streaming_blocks(&mut self) -> Result<()> {
+        loop {
+            let Some((&height, _)) = self.streaming_state.blocks.iter().next() else {
+                return Ok(());
+            };
+            let later_block_seen = self.streaming_state.blocks.range((height + 1)..).next().is_some();
+            let mut block = self.streaming_state.blocks.remove(&height).expect("block key exists");
+            if !self.is_ready() {
+                self.streaming_state.blocks.insert(height, block);
+                return Ok(());
+            }
+
+            while let Some(diff_batch) = block.diffs.front() {
+                let diff = diff_batch.events_ref().first().expect("stream diff batch has one event");
+                let needs_status =
+                    matches!(diff.raw_book_diff, OrderDiff::New { .. }) && !(diff.coin().is_spot() && self.ignore_spot);
+                let status = if needs_status {
+                    let oid = diff.oid();
+                    let Some(status) = block.statuses.remove(&oid) else {
+                        break;
+                    };
+                    Some(status)
+                } else {
+                    None
+                };
+
+                let diff_batch = block.diffs.pop_front().expect("front diff exists");
+                let diff = diff_batch.events_ref().first().expect("stream diff batch has one event").clone();
+                let block_time_ms = diff_batch.block_time();
+
+                if self.is_ready() {
+                    if !block.boundary_open && !(diff.coin().is_spot() && self.ignore_spot) {
+                        if let Some(state) = self.order_book_state.as_mut() {
+                            state.emit_batch_boundary(0, height, block_time_ms);
+                        }
+                        block.boundary_open = true;
+                    }
+
+                    let status_batch = diff_batch.with_events(status.iter().cloned().collect());
+                    self.order_book_state.as_mut().ok_or("streaming order book state not ready")?.apply_stream_diff(
+                        height,
+                        block_time_ms,
+                        diff,
+                        status,
+                    )?;
+                    self.publish_l4_update(diff_batch, status_batch);
+                    self.publish_l2_snapshot();
+                }
+            }
+
+            if block.diffs.is_empty() && later_block_seen {
+                if block.boundary_open
+                    && let (Some(state), Some(block_time_ms)) = (self.order_book_state.as_mut(), block.block_time_ms)
+                {
+                    state.emit_batch_boundary(1, height, block_time_ms);
+                }
+                self.streaming_state.finalized_height = Some(height);
+            } else {
+                self.streaming_state.blocks.insert(height, block);
+                return Ok(());
+            }
+        }
+    }
+
+    fn publish_l4_update(&self, diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus>) {
+        if let Some(tx) = &self.internal_message_tx {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let updates = Arc::new(InternalMessage::L4BookUpdates { diff_batch, status_batch });
+                let _unused = tx.send(updates);
+            });
+        }
+    }
+
+    fn publish_l2_snapshot(&mut self) {
+        let snapshot = self.l2_snapshots(true);
+        if let Some(snapshot) = snapshot
+            && let Some(tx) = &self.internal_message_tx
+        {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
+                let _unused = tx.send(snapshot);
+            });
+        }
     }
 
     /// Applies surgical per-coin recovery based on a `ValidationReport`.
@@ -593,6 +770,13 @@ impl OrderBookListener {
                 new_order_book.attach_dob_tap(tap);
             }
             self.order_book_state = Some(new_order_book);
+            if self.ingest_mode == IngestMode::Stream
+                && let Err(err) = self.drain_streaming_blocks()
+            {
+                error!("Failed to apply cached streaming updates after snapshot: {err}");
+                self.order_book_state = None;
+                return;
+            }
             info!("Order book ready");
         }
     }
@@ -629,8 +813,26 @@ impl OrderBookListener {
     /// can derive what the TOB publisher would emit without spinning up the
     /// full publisher loop.
     #[cfg(test)]
-    pub(crate) fn l2_snapshots_for_test(&mut self) -> Option<(u64, L2Snapshots)> {
-        self.l2_snapshots(false)
+    pub(crate) fn l2_snapshots_for_test(&self) -> Option<(u64, L2Snapshots)> {
+        self.order_book_state.as_ref().map(|o| o.compute_l2_snapshots_for_test())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finalize_streaming_for_test(&mut self) -> Result<()> {
+        self.drain_streaming_blocks()?;
+        while let Some((&height, _)) = self.streaming_state.blocks.iter().next() {
+            let block = self.streaming_state.blocks.remove(&height).expect("block key exists");
+            if !block.diffs.is_empty() {
+                return Err(format!("streaming block {height} still has unresolved diffs").into());
+            }
+            if block.boundary_open
+                && let (Some(state), Some(block_time_ms)) = (self.order_book_state.as_mut(), block.block_time_ms)
+            {
+                state.emit_batch_boundary(1, height, block_time_ms);
+            }
+            self.streaming_state.finalized_height = Some(height);
+        }
+        Ok(())
     }
 
     // forcibly grab current snapshot
@@ -801,7 +1003,7 @@ pub(crate) enum InternalMessage {
     L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
 }
 
-#[derive(Eq, PartialEq, Hash)]
+#[derive(Debug, Eq, PartialEq, Hash)]
 pub(crate) struct L2SnapshotParams {
     n_sig_figs: Option<u32>,
     mantissa: Option<u64>,
@@ -826,24 +1028,28 @@ mod instrument_reset_recovery_tests {
     //! This test wires the real recovery path (no mocks beyond the UDP
     //! collectors and a synchronous instrument resolver) and asserts all
     //! three observable contract clauses on the wire / shared counter.
+    use std::{
+        net::{Ipv4Addr, SocketAddrV4},
+        sync::{Mutex as StdMutex, atomic::AtomicU64},
+        time::Duration,
+    };
+
+    use tokio::{net::UdpSocket, time::Instant};
+
     use super::*;
-    use crate::listeners::order_book::dob_tap::SharedSeqCounter;
-    use crate::multicast::dob::{
-        DobMktdataConfig, DobSnapshotConfig, DobSnapshotEmitter, DobEmitter, channel,
-        run_dob_emitter, run_dob_snapshot_task, snapshot_request_channel,
+    use crate::{
+        listeners::order_book::dob_tap::SharedSeqCounter,
+        multicast::dob::{
+            DobEmitter, DobMktdataConfig, DobSnapshotConfig, DobSnapshotEmitter, channel, run_dob_emitter,
+            run_dob_snapshot_task, snapshot_request_channel,
+        },
+        order_book::{Coin, PerInstrumentSeqCounter},
+        protocol::dob::constants::{
+            DEFAULT_MTU, FRAME_HEADER_SIZE, INSTRUMENT_RESET_SIZE, MSG_TYPE_HEARTBEAT, MSG_TYPE_INSTRUMENT_RESET,
+            MSG_TYPE_SNAPSHOT_BEGIN, RESET_REASON_PUBLISHER_INCONSISTENCY, SNAPSHOT_BEGIN_SIZE,
+        },
+        test_fixtures::{build_one_coin_snapshot, build_registry_with_one_instrument},
     };
-    use crate::order_book::{Coin, PerInstrumentSeqCounter};
-    use crate::protocol::dob::constants::{
-        DEFAULT_MTU, FRAME_HEADER_SIZE, INSTRUMENT_RESET_SIZE, MSG_TYPE_HEARTBEAT,
-        MSG_TYPE_INSTRUMENT_RESET, MSG_TYPE_SNAPSHOT_BEGIN, RESET_REASON_PUBLISHER_INCONSISTENCY,
-        SNAPSHOT_BEGIN_SIZE,
-    };
-    use crate::test_fixtures::{build_one_coin_snapshot, build_registry_with_one_instrument};
-    use std::net::{Ipv4Addr, SocketAddrV4};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex as StdMutex;
-    use std::time::Duration;
-    use tokio::net::UdpSocket;
 
     async fn bind_collector() -> (UdpSocket, SocketAddrV4) {
         let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -865,22 +1071,16 @@ mod instrument_reset_recovery_tests {
         skip_types: &[u8],
         timeout: Duration,
     ) -> Vec<u8> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         let mut buf = [0u8; 2048];
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            assert!(
-                !remaining.is_zero(),
-                "timed out waiting for msg_type 0x{target_type:02X}",
-            );
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for msg_type 0x{target_type:02X}",);
             let (n, _) = tokio::time::timeout(remaining, sock.recv_from(&mut buf))
                 .await
                 .expect("recv timed out")
                 .expect("recv error");
-            assert!(
-                n >= FRAME_HEADER_SIZE + 1,
-                "frame too short to contain a message type byte",
-            );
+            assert!(n > FRAME_HEADER_SIZE, "frame too short to contain a message type byte",);
             assert_eq!(&buf[0..2], &[0x44, 0x44], "DoB magic on wire");
             let msg_type = buf[FRAME_HEADER_SIZE];
             if msg_type == target_type {
@@ -896,8 +1096,7 @@ mod instrument_reset_recovery_tests {
     }
 
     #[tokio::test]
-    async fn instrument_reset_emits_on_mktdata_then_priority_snapshot_then_resumes_with_continuing_seq()
-    {
+    async fn instrument_reset_emits_on_mktdata_then_priority_snapshot_then_resumes_with_continuing_seq() {
         // 1. Two collector sockets standing in for the mktdata and snapshot
         //    multicast subscribers.
         let (mktdata_collector, mktdata_addr) = bind_collector().await;
@@ -926,7 +1125,7 @@ mod instrument_reset_recovery_tests {
         let coin = Coin::new(coin_str);
         let initial = build_one_coin_snapshot(coin_str, 3, /* oid_offset = */ 0);
         let listener = OrderBookListener::for_test_with_snapshot(initial, /* height = */ 1);
-        let listener = Arc::new(tokio::sync::Mutex::new(listener));
+        let listener = Arc::new(Mutex::new(listener));
 
         // 4. Mktdata pipeline: bounded mpsc -> run_dob_emitter -> mktdata UDP
         //    socket. The emitter shares the same SharedMktdataSeq atomic as
@@ -989,9 +1188,7 @@ mod instrument_reset_recovery_tests {
                 mktdata_tx: mkt_tx.clone(),
                 snapshot_request_tx: snap_tx.clone(),
                 mktdata_seq: mktdata_seq.clone(),
-                instrument_id_for: Box::new(|c: &Coin| {
-                    if c.value() == "BTC" { Some(0) } else { None }
-                }),
+                instrument_id_for: Box::new(|c: &Coin| if c.value() == "BTC" { Some(0) } else { None }),
             });
 
             let mut report = utils::ValidationReport::default();
@@ -1029,23 +1226,12 @@ mod instrument_reset_recovery_tests {
         let reason = body[8];
         let new_anchor_seq = u64::from_le_bytes(body[12..20].try_into().unwrap());
         assert_eq!(instrument_id, 0, "instrument_id from coin resolver");
-        assert_eq!(
-            reason, RESET_REASON_PUBLISHER_INCONSISTENCY,
-            "reason byte must be 1 (publisher-inconsistency)",
-        );
-        assert_eq!(
-            new_anchor_seq, 101,
-            "new_anchor_seq must be the pre-mismatch mktdata_seq + 1 (100 + 1)",
-        );
+        assert_eq!(reason, RESET_REASON_PUBLISHER_INCONSISTENCY, "reason byte must be 1 (publisher-inconsistency)",);
+        assert_eq!(new_anchor_seq, 101, "new_anchor_seq must be the pre-mismatch mktdata_seq + 1 (100 + 1)",);
 
         // 8. Snapshot port: expect a SnapshotBegin with anchor_seq == 101.
-        let frame = recv_first_with_msg_type(
-            &snapshot_collector,
-            MSG_TYPE_SNAPSHOT_BEGIN,
-            &[],
-            Duration::from_secs(2),
-        )
-        .await;
+        let frame =
+            recv_first_with_msg_type(&snapshot_collector, MSG_TYPE_SNAPSHOT_BEGIN, &[], Duration::from_secs(2)).await;
         assert!(
             frame.len() >= FRAME_HEADER_SIZE + SNAPSHOT_BEGIN_SIZE,
             "snapshot frame too short for SnapshotBegin (got {} bytes)",
@@ -1055,23 +1241,17 @@ mod instrument_reset_recovery_tests {
         let snap_instrument_id = u32::from_le_bytes(body[4..8].try_into().unwrap());
         let snap_anchor_seq = u64::from_le_bytes(body[8..16].try_into().unwrap());
         assert_eq!(snap_instrument_id, 0, "SnapshotBegin instrument_id");
-        assert_eq!(
-            snap_anchor_seq, 101,
-            "SnapshotBegin anchor_seq must match the InstrumentReset new_anchor_seq",
-        );
+        assert_eq!(snap_anchor_seq, 101, "SnapshotBegin anchor_seq must match the InstrumentReset new_anchor_seq",);
 
         // 9. Wire-spec invariant: per-instrument seq is NOT reset on
         //    InstrumentReset. The next delta must carry seq = 6 (not 1).
         let next = seq_counter.lock().unwrap().next(0);
-        assert_eq!(
-            next, 6,
-            "post-recovery per-instrument seq must continue from pre-mismatch baseline (5 + 1)",
-        );
+        assert_eq!(next, 6, "post-recovery per-instrument seq must continue from pre-mismatch baseline (5 + 1)",);
 
         // Clean shutdown: drop senders so the emitter loop exits, then abort
         // the snapshot task (which sleeps in its round-robin path).
         drop(mkt_tx);
-        let _ = tokio::time::timeout(Duration::from_secs(1), mkt_handle).await;
+        drop(tokio::time::timeout(Duration::from_secs(1), mkt_handle).await);
         snap_handle.abort();
     }
 }

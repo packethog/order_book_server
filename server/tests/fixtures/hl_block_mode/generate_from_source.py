@@ -20,6 +20,12 @@ EVENT_FILES = {
     "statuses": "hl/data/node_order_statuses_by_block/hourly/20260430/20",
 }
 
+STREAMING_EVENT_FILES = {
+    "diffs": "hl/data/node_raw_book_diffs_streaming/hourly/20260430/20",
+    "fills": "hl/data/node_fills_streaming/hourly/20260430/20",
+    "statuses": "hl/data/node_order_statuses_streaming/hourly/20260430/20",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -99,6 +105,39 @@ def filter_events(source_root: Path, coins: set[str]) -> dict:
     return counts
 
 
+def split_events_for_streaming(name: str, events: list) -> list[list]:
+    if name == "fills":
+        # The publisher's trade conversion currently expects buy/sell fill
+        # pairs in one batch, so keep fill pairs together while still emitting
+        # multiple streaming lines for active blocks.
+        return [events[idx : idx + 2] for idx in range(0, len(events), 2)]
+    return [[event] for event in events]
+
+
+def derive_streaming_events() -> dict:
+    counts = {}
+    for name, block_relative in EVENT_FILES.items():
+        streaming_relative = STREAMING_EVENT_FILES[name]
+        rows = []
+        with (ROOT / block_relative).open() as handle:
+            for line in handle:
+                data = json.loads(line)
+                events = data.get("events", [])
+                if not events:
+                    row = copy.deepcopy(data)
+                    row["events"] = []
+                    rows.append(row)
+                    continue
+                for group in split_events_for_streaming(name, events):
+                    row = copy.deepcopy(data)
+                    row["events"] = group
+                    rows.append(row)
+        output_path = ROOT / streaming_relative
+        write_compact_jsonl(output_path, rows)
+        counts[name] = count_events(output_path)
+    return counts
+
+
 def filter_snapshot(source_root: Path, coins: set[str]) -> int:
     snapshot = json.loads((source_root / "out.json").read_text())
     snapshot[1] = [entry for entry in snapshot[1] if entry[0] in coins]
@@ -114,9 +153,24 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def write_manifest(source_root: Path, archive: Path, coins: list[str], counts_after: dict, snapshot_coin_count: int) -> None:
+def write_manifest(
+    source_root: Path,
+    archive: Path,
+    coins: list[str],
+    counts_after: dict,
+    streaming_counts: dict,
+    snapshot_coin_count: int,
+) -> None:
     manifest = copy.deepcopy(json.loads((source_root / "manifest.json").read_text()))
     manifest["counts_after_coin_filter"] = counts_after
+    manifest["streaming_fixture"] = {
+        "generation": "derived from filtered by-block fixture",
+        "files": STREAMING_EVENT_FILES,
+        "counts": streaming_counts,
+        "fills_grouping": "pairs preserved for trade reconstruction",
+        "diffs_grouping": "one event per line",
+        "statuses_grouping": "one event per line",
+    }
     manifest["fixture_coin_filter"] = coins
     manifest["snapshot_coin_count_after_coin_filter"] = snapshot_coin_count
     manifest["source_archive"] = {
@@ -137,8 +191,9 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         source_root = safe_extract(archive, Path(tmp))
         counts_after = filter_events(source_root, set(coins))
+        streaming_counts = derive_streaming_events()
         snapshot_coin_count = filter_snapshot(source_root, set(coins))
-        write_manifest(source_root, archive, coins, counts_after, snapshot_coin_count)
+        write_manifest(source_root, archive, coins, counts_after, streaming_counts, snapshot_coin_count)
 
 
 if __name__ == "__main__":

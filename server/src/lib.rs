@@ -15,5 +15,6 @@ mod types;
 pub use multicast::config::{DobConfig, MulticastConfig};
 pub use prelude::Result;
 pub use servers::websocket_server::run_websocket_server;
+pub use types::node_data::IngestMode;
 
 pub const HL_NODE: &str = "hl-node";

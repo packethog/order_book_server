@@ -1,15 +1,35 @@
+use std::{
+    collections::{HashMap, HashSet},
+    env::home_dir,
+    path::PathBuf,
+    sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, atomic::AtomicU64},
+};
+
+use axum::{Router, response::IntoResponse, routing::get};
+use futures_util::{SinkExt, StreamExt};
+use log::{error, info};
+use tokio::{
+    net::TcpListener,
+    select,
+    sync::{
+        Mutex,
+        broadcast::{Sender, channel},
+    },
+};
+use yawc::{FrameView, OpCode, WebSocket};
+
 use crate::{
     instruments::{RegistryState, SharedRegistry},
     listeners::order_book::{
-        DobReplayTaps, InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener,
-        TimedSnapshots, dob_tap::DobApplyTap, hl_listen,
+        DobReplayTaps, InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots,
+        dob_tap::DobApplyTap, hl_listen,
     },
     multicast::{
         config::{DobConfig, MulticastConfig},
         dob::{
-            DobEmitter, DobEvent, DobMktdataConfig, DobRefdataConfig, DobSnapshotConfig,
-            DobSnapshotEmitter, channel as dob_channel, run_dob_emitter, run_dob_refdata_task,
-            run_dob_snapshot_task, snapshot_request_channel,
+            DobEmitter, DobEvent, DobMktdataConfig, DobRefdataConfig, DobSnapshotConfig, DobSnapshotEmitter,
+            channel as dob_channel, run_dob_emitter, run_dob_refdata_task, run_dob_snapshot_task,
+            snapshot_request_channel,
         },
         publisher::MulticastPublisher,
     },
@@ -18,27 +38,10 @@ use crate::{
     types::{
         L2Book, L4Book, L4BookUpdates, L4Order, Trade,
         inner::InnerLevel,
-        node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+        node_data::{Batch, IngestMode, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::{ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager},
     },
 };
-use axum::{Router, response::IntoResponse, routing::get};
-use futures_util::{SinkExt, StreamExt};
-use log::{error, info};
-use std::{
-    collections::{HashMap, HashSet},
-    env::home_dir,
-    sync::{Arc, RwLock as StdRwLock, atomic::AtomicU64},
-};
-use tokio::select;
-use tokio::{
-    net::TcpListener,
-    sync::{
-        Mutex,
-        broadcast::{Sender, channel},
-    },
-};
-use yawc::{FrameView, OpCode, WebSocket};
 
 /// Starts the WebSocket server and, optionally, TOB and/or DoB UDP multicast publishers.
 ///
@@ -53,11 +56,16 @@ pub async fn run_websocket_server(
     compression_level: u32,
     multicast_config: Option<MulticastConfig>,
     dob_config: Option<DobConfig>,
+    ingest_mode: IngestMode,
+    hl_data_root: Option<PathBuf>,
 ) -> Result<()> {
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(100);
 
-    // Central task: listen to messages and forward them for distribution
+    // Central task: listen to messages and forward them for distribution.
+    // Keep snapshots under $HOME/out.json for default compatibility while
+    // allowing event files to live under /data/hl-data on production nodes.
     let home_dir = home_dir().ok_or("Could not find home directory")?;
+    let hl_data_root = hl_data_root.unwrap_or_else(|| home_dir.join("hl/data"));
     let listener = {
         let internal_message_tx = internal_message_tx.clone();
         OrderBookListener::new(Some(internal_message_tx), ignore_spot)
@@ -66,7 +74,7 @@ pub async fn run_websocket_server(
     {
         let listener = listener.clone();
         tokio::spawn(async move {
-            if let Err(err) = hl_listen(listener, home_dir).await {
+            if let Err(err) = hl_listen(listener, home_dir, hl_data_root, ingest_mode).await {
                 error!("Listener fatal error: {err}");
                 std::process::exit(1);
             }
@@ -161,16 +169,8 @@ pub async fn run_websocket_server(
         };
         // Shared per-instrument seq counter: bumped by the apply tap, read by
         // the snapshot emitter when populating SnapshotBegin.last_instrument_seq.
-        let seq_counter = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::order_book::PerInstrumentSeqCounter::new(),
-        ));
-        let tap = DobApplyTap::new(
-            dob_tx.clone(),
-            cfg.source_id,
-            cfg.channel_id,
-            seq_counter.clone(),
-            coin_resolver,
-        );
+        let seq_counter = Arc::new(StdMutex::new(crate::order_book::PerInstrumentSeqCounter::new()));
+        let tap = DobApplyTap::new(dob_tx.clone(), cfg.source_id, cfg.channel_id, seq_counter.clone(), coin_resolver);
         listener.lock().await.set_dob_tap(tap);
 
         // Synchronous instrument-id cache for the recovery path. The
@@ -199,9 +199,7 @@ pub async fn run_websocket_server(
         };
         let instrument_id_for: Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync> = {
             let cache = instrument_id_cache.clone();
-            Box::new(move |coin: &Coin| -> Option<u32> {
-                cache.read().ok()?.get(coin).copied()
-            })
+            Box::new(move |coin: &Coin| -> Option<u32> { cache.read().ok()?.get(coin).copied() })
         };
 
         let dob_replay_taps = DobReplayTaps {

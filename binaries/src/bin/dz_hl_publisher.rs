@@ -1,9 +1,23 @@
 #![allow(unused_crate_dependencies)]
-use std::net::Ipv4Addr;
-use std::time::Duration;
+use std::{net::Ipv4Addr, path::PathBuf, time::Duration};
 
-use clap::Parser;
-use server::{DobConfig, MulticastConfig, Result, run_websocket_server};
+use clap::{Parser, ValueEnum};
+use server::{DobConfig, IngestMode, MulticastConfig, Result, run_websocket_server};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliIngestMode {
+    Block,
+    Stream,
+}
+
+impl From<CliIngestMode> for IngestMode {
+    fn from(value: CliIngestMode) -> Self {
+        match value {
+            CliIngestMode::Block => Self::Block,
+            CliIngestMode::Stream => Self::Stream,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -19,6 +33,14 @@ struct Args {
     /// Compression level for WebSocket connections (0-9, default 1).
     #[arg(long)]
     websocket_compression_level: Option<u32>,
+
+    /// Ingest mode for hl-node disk output.
+    #[arg(long, value_enum, default_value_t = CliIngestMode::Block)]
+    ingest_mode: CliIngestMode,
+
+    /// Root containing hl-node node_* output directories. Defaults to $HOME/hl/data.
+    #[arg(long)]
+    hl_data_root: Option<PathBuf>,
 
     /// Multicast group address (e.g., 239.0.0.1). Enables multicast when set.
     #[arg(long)]
@@ -168,7 +190,16 @@ async fn main() -> Result<()> {
         }
     });
 
-    run_websocket_server(&full_address, true, compression_level, multicast_config, dob_config).await?;
+    run_websocket_server(
+        &full_address,
+        true,
+        compression_level,
+        multicast_config,
+        dob_config,
+        args.ingest_mode.into(),
+        args.hl_data_root,
+    )
+    .await?;
 
     Ok(())
 }

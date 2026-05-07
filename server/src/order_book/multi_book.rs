@@ -434,8 +434,7 @@ mod tests {
 
     #[test]
     fn clone_coin_orders_returns_none_for_unknown_coin() {
-        let books: OrderBooks<InnerL4Order> =
-            OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), false);
+        let books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), false);
         assert!(books.clone_coin_orders(&Coin::new("NOPE")).is_none());
     }
 }

@@ -1,0 +1,28 @@
+{
+  "block_height": 985148232,
+  "dob": {
+    "block_boundary_count": 94,
+    "boundary_delta": 4,
+    "order_event_count": 1332,
+    "order_event_type_counts": {
+      "16": 653,
+      "17": 668,
+      "18": 11
+    },
+    "stream_boundary_count": 98
+  },
+  "fixture": {
+    "coin": "BTC",
+    "first_block": 985148182,
+    "last_block": 985148232,
+    "snapshot_height": 985148181
+  },
+  "stream_height": 985148232,
+  "tob": {
+    "block_end_quote_count": 52,
+    "block_marketdata_packets": 64,
+    "matched_end_quote_count": 50,
+    "stream_end_quote_count": 50,
+    "stream_marketdata_packets": 1334
+  }
+}

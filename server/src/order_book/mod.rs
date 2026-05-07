@@ -9,8 +9,8 @@ pub(crate) mod multi_book;
 pub mod per_instrument_seq;
 pub(crate) mod types;
 
-pub(crate) use types::{Coin, InnerOrder, Oid, Px, Side, Sz, sz_to_fixed};
 pub use per_instrument_seq::PerInstrumentSeqCounter;
+pub(crate) use types::{Coin, InnerOrder, Oid, Px, Side, Sz, sz_to_fixed};
 
 #[derive(Clone, Default)]
 pub(crate) struct OrderBook<O> {

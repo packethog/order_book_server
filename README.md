@@ -26,13 +26,24 @@ The `l4book` subscription first sends a snapshot of the entire book and then for
 
 ## Setup
 
-1. Run a non-validating node (from [`hyperliquid-dex/node`](https://github.com/hyperliquid-dex/node)). Requires batching by block. Requires recording fills, order statuses, and raw book diffs.
+1. Run a non-validating node (from [`hyperliquid-dex/node`](https://github.com/hyperliquid-dex/node)). Block ingest requires batching by block and recording fills, order statuses, and raw book diffs. Streaming ingest requires `--stream-with-block-info --disable-output-file-buffering` and the same three outputs.
 
 2. Then run this local server:
 
 ```bash
 cargo run --release --bin dz_hl_publisher -- --address 0.0.0.0 --port 8000
 ```
+
+By default the server reads `$HOME/hl/data/node_*_by_block`. To opt into streaming disk ingest, use:
+
+```bash
+cargo run --release --bin dz_hl_publisher -- \
+  --address 0.0.0.0 --port 8000 \
+  --ingest-mode stream \
+  --hl-data-root /data/hl-data
+```
+
+`--hl-data-root` is the directory containing the `node_*` output directories; it defaults to `$HOME/hl/data`. Block mode reads `node_fills_by_block`, `node_order_statuses_by_block`, and `node_raw_book_diffs_by_block`. Streaming mode reads `node_fills_streaming`, `node_order_statuses_streaming`, and `node_raw_book_diffs_streaming`. Snapshot validation output still defaults to `$HOME/out.json`.
 
 If this local server does not detect the node writing down any new events, it will automatically exit after some amount of time (currently set to 5 seconds).
 In addition, the local server periodically fetches order book snapshots from the node, and compares to its own internal state. If a difference is detected, it will exit.
@@ -138,15 +149,24 @@ tshark -X lua_script:spec/dz_depthofbook.lua -f "udp port 6000" -i lo
 ## Test fixtures
 
 `server/tests/fixtures/hl_block_mode/` contains a reduced real Hyperliquid
-by-block replay fixture used by the multicast e2e tests. The test replays the
-fixture through the block-mode listener, captures TOB/DoB UDP output on
-loopback sockets, normalizes runtime-only fields, and compares each stream to
-golden packet files. The reduced unfiltered source extracts are versioned beside
-the fixture, so the BTC-only replay inputs can be regenerated without fetching
-from the validator again. The same fixture directory also includes a host-fetch
-script for refreshing the source archive and goldens from an SSH-accessible HL
-node. See `server/tests/fixtures/hl_block_mode/regenerate.md` for source paths
-and regeneration commands.
+by-block replay fixture used by the multicast e2e tests. The tests replay the
+fixture through block ingest and a generated streaming-ingest equivalent,
+capture TOB/DoB UDP output on loopback sockets, normalize runtime-only fields,
+and compare each stream to golden packet files. They also assert final L4/L2
+book parity between block and streaming replay.
+
+The reduced unfiltered source extracts are versioned beside the fixture, so the
+BTC-only block fixture and derived `_streaming` fixture can be regenerated
+without fetching from the validator again. The same fixture directory also
+includes a host-fetch script for refreshing the source archive and goldens from
+an SSH-accessible HL node. See
+`server/tests/fixtures/hl_block_mode/regenerate.md` for source paths and
+regeneration commands.
+
+`server/tests/fixtures/hl_dual_validator/` contains a compact BTC-only
+dual-validator fixture with compressed source archives from matching by-block
+and streaming validators, normalized multicast goldens, and semantic parity
+goldens for block-vs-stream correctness checks.
 
 ## CI
 
@@ -157,4 +177,4 @@ GitHub Actions runs `cargo clippy --workspace --all-targets` and
 
 - This server does **not** show untriggered trigger orders.
 - It currently **does not** support spot order books.
-- The current implementation batches node outputs by block, making the order book a few milliseconds slower than a streaming implementation.
+- Block ingest remains the default rollout mode. Streaming ingest is opt-in while parity coverage hardens.

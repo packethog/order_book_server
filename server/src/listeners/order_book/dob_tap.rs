@@ -9,10 +9,7 @@
 
 use crate::{
     multicast::dob::{DobEvent, DobEventSender},
-    order_book::{
-        Coin, Oid, Px, Side, Sz, sz_to_fixed,
-        per_instrument_seq::PerInstrumentSeqCounter,
-    },
+    order_book::{Coin, Oid, Px, Side, Sz, per_instrument_seq::PerInstrumentSeqCounter, sz_to_fixed},
     protocol::dob::{
         constants::{AGGRESSOR_UNKNOWN, CANCEL_REASON_UNKNOWN, SIDE_ASK, SIDE_BID},
         messages::{BatchBoundary, OrderAdd, OrderCancel, OrderExecute},
@@ -323,13 +320,7 @@ mod tests {
     async fn emit_batch_boundary_sends_event() {
         let (tx, mut rx) = channel(4);
         let seq = Arc::new(Mutex::new(PerInstrumentSeqCounter::new()));
-        let mut tap = DobApplyTap::new(
-            tx,
-            /* source_id */ 1,
-            /* channel_id */ 7,
-            seq,
-            btc_resolver(),
-        );
+        let mut tap = DobApplyTap::new(tx, /* source_id */ 1, /* channel_id */ 7, seq, btc_resolver());
         tap.emit_batch_boundary(0, 999, 1_700_000_000_000_000_000);
         match rx.recv().await.unwrap() {
             DobEvent::BatchBoundary(msg) => {
@@ -405,13 +396,7 @@ mod tests {
         let mut tap = DobApplyTap::new(tx, 1, 0, seq, btc_resolver_with_qty_exponent(-3));
         let exec_quantity = Sz::parse_from_str("1.234").unwrap();
 
-        tap.emit_order_execute(
-            &btc_coin(),
-            Oid::new(77),
-            Px::parse_from_str("100").unwrap(),
-            exec_quantity,
-            2_000,
-        );
+        tap.emit_order_execute(&btc_coin(), Oid::new(77), Px::parse_from_str("100").unwrap(), exec_quantity, 2_000);
 
         match rx.recv().await.unwrap() {
             DobEvent::OrderExecute(msg) => {
