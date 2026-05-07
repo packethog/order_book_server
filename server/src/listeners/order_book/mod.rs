@@ -755,6 +755,20 @@ impl OrderBookListener {
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
         info!("No existing snapshot");
         let mut new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
+        // In stream mode, drop any buffered stream events at heights <= snapshot
+        // height — those are already reflected in the snapshot. Replaying them
+        // would either dup orders (New) or get rejected by apply_stream_diff's
+        // `block_number < self.height` check (Update/Remove). The streaming file
+        // watcher races ahead of the snapshot fetch, so this queue is non-empty
+        // on every cold start.
+        if self.ingest_mode == IngestMode::Stream {
+            let before = self.streaming_state.blocks.len();
+            self.streaming_state.blocks.retain(|&h, _| h > height);
+            let dropped = before - self.streaming_state.blocks.len();
+            if dropped > 0 {
+                info!("init_from_snapshot: dropped {dropped} stale streaming block(s) at height <= {height}");
+            }
+        }
         let mut retry = false;
         while let Some((order_statuses, order_diffs)) = self.pop_cache() {
             if new_order_book.apply_updates(order_statuses, order_diffs).is_err() {
