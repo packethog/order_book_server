@@ -699,6 +699,50 @@ async fn init_from_snapshot_prunes_stale_pre_snapshot_streaming_blocks() {
 }
 
 #[tokio::test]
+async fn missing_order_remove_is_skipped_in_both_modes() {
+    // The venue can produce Update/Remove diffs for orders that aren't on
+    // our internal book — typically a transient race against snapshot fetch
+    // in either mode. Both modes should warn-and-skip rather than tear down
+    // the listener; periodic snapshot validation will detect any divergence
+    // and apply surgical recovery. Crashing here would turn a recoverable
+    // transient into a hard restart cycle.
+    let root = fixture_root();
+    let snapshot_path = root.join("out.json");
+
+    // -- Block mode --
+    let (snapshot_height, snapshot) =
+        load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&snapshot_path).await.unwrap();
+    let mut block_listener = OrderBookListener::new_with_ingest_mode(None, true, IngestMode::Block);
+    block_listener.init_from_snapshot(snapshot, snapshot_height);
+    // Build a Remove diff for an oid we know isn't on the book.
+    let phantom_remove = NodeDataOrderDiff::new_for_test(
+        Address::new([0; 20]),
+        u64::MAX, // an oid the snapshot definitely does not have
+        "1.0".to_string(),
+        "BTC".to_string(),
+        OrderDiff::Remove,
+    );
+    let next_height = snapshot_height + 1;
+    let block_status_batch = Batch::new_for_test(next_height, 1_700_000_000_000, Vec::<NodeDataOrderStatus>::new());
+    let block_diff_batch = Batch::new_for_test(next_height, 1_700_000_000_000, vec![phantom_remove.clone()]);
+    block_listener.receive_batch(EventBatch::Orders(block_status_batch)).expect("block: status batch");
+    block_listener
+        .receive_batch(EventBatch::BookDiffs(block_diff_batch))
+        .expect("block: phantom Remove must be skipped, not error");
+    assert!(block_listener.is_ready(), "block: listener still healthy after phantom Remove");
+
+    // -- Stream mode --
+    let (_, snapshot2) = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&snapshot_path).await.unwrap();
+    let mut stream_listener = OrderBookListener::new_with_ingest_mode(None, true, IngestMode::Stream);
+    stream_listener.init_from_snapshot(snapshot2, snapshot_height);
+    let stream_diff_batch = Batch::new_for_test(next_height, 1_700_000_000_000, vec![phantom_remove]);
+    stream_listener
+        .receive_batch(EventBatch::BookDiffs(stream_diff_batch))
+        .expect("stream: phantom Remove must be skipped, not error");
+    assert!(stream_listener.is_ready(), "stream: listener still healthy after phantom Remove");
+}
+
+#[tokio::test]
 async fn streaming_late_data_for_finalized_block_is_dropped() {
     // hl-node writes the streaming statuses, diffs, and fills files concurrently;
     // they're delivered through one notify channel. If a later block's diffs

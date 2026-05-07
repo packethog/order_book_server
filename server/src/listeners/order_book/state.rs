@@ -206,12 +206,13 @@ impl OrderBookState {
                             }
                         }
                         None => {
-                            if emittable_count >= 2 {
-                                if let Some(tap) = self.dob_tap.as_mut() {
-                                    tap.emit_batch_boundary(1 /* close */, height, time_ns);
-                                }
-                            }
-                            return Err(format!("Unable to find order on the book {diff:?}").into());
+                            // Soft-tolerance: the order isn't on our book, but the venue
+                            // has an Update for it. Snapshot validation runs every 60s
+                            // and applies surgical recovery on divergence; missing this
+                            // event won't permanently corrupt state. Crashing here would
+                            // turn what's likely a transient ordering race into a hard
+                            // failure cycle.
+                            log::warn!("apply_updates: Update for missing order, skipping {diff:?}");
                         }
                     }
                 }
@@ -221,12 +222,8 @@ impl OrderBookState {
                             tap.emit_order_cancel(&coin, oid, time_ns);
                         }
                     } else {
-                        if emittable_count >= 2 {
-                            if let Some(tap) = self.dob_tap.as_mut() {
-                                tap.emit_batch_boundary(1 /* close */, height, time_ns);
-                            }
-                        }
-                        return Err(format!("Unable to find order on the book {diff:?}").into());
+                        // Soft-tolerance — see Update branch above.
+                        log::warn!("apply_updates: Remove for missing order, skipping {diff:?}");
                     }
                 }
             }
@@ -296,7 +293,8 @@ impl OrderBookState {
                     }
                 }
                 None => {
-                    return Err(format!("Unable to find order on the book {diff:?}").into());
+                    // Soft-tolerance: see apply_updates' matching branch.
+                    log::warn!("apply_stream_diff: Update for missing order, skipping {diff:?}");
                 }
             },
             InnerOrderDiff::Remove => {
@@ -305,7 +303,8 @@ impl OrderBookState {
                         tap.emit_order_cancel(&coin, oid, time_ns);
                     }
                 } else {
-                    return Err(format!("Unable to find order on the book {diff:?}").into());
+                    // Soft-tolerance — see apply_updates.
+                    log::warn!("apply_stream_diff: Remove for missing order, skipping {diff:?}");
                 }
             }
         }
