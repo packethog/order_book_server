@@ -152,7 +152,15 @@ fn parse_builder_dex_asset(asset: &serde_json::Value, dex: &str, id: u32) -> Opt
     let price_exponent = derive_price_exponent(asset);
     let is_delisted = asset.get("isDelisted").and_then(serde_json::Value::as_bool).unwrap_or(false);
 
-    let coin = format!("{dex}:{name}");
+    // The HL `meta {dex}` endpoint already returns names prefixed with the dex
+    // (e.g. `"xyz:XYZ100"`, `"cash:USA500"`) — that's the format hl-node also
+    // writes into the streaming/by-block files. Re-prefixing here would
+    // double-up (`"xyz:xyz:XYZ100"`) and the resolver would never match the
+    // wire form, silently dropping every event for that dex. Use the API
+    // name as-is, but defend against an API change by prefixing only if the
+    // name doesn't already start with `<dex>:`.
+    let prefix = format!("{dex}:");
+    let coin = if name.starts_with(&prefix) { name.to_string() } else { format!("{prefix}{name}") };
     let info = InstrumentInfo { instrument_id: id, price_exponent, qty_exponent, symbol: make_symbol(&coin) };
 
     Some(UniverseEntry { instrument_id: id, coin, is_delisted, info })
@@ -396,6 +404,32 @@ mod tests {
     fn parse_builder_dex_asset_missing_fields() {
         assert!(parse_builder_dex_asset(&serde_json::json!({"szDecimals": 3}), "xyz", 20_000).is_none());
         assert!(parse_builder_dex_asset(&serde_json::json!({"name": "CL"}), "xyz", 20_000).is_none());
+    }
+
+    /// The actual HL `meta {dex}` endpoint returns `name` already prefixed
+    /// with `<dex>:` (verified against `xyz`, `cash`, `hyna`, `km`, `flx`,
+    /// `vntl`, `para` on mainnet 2026-05-08). hl-node also writes coin names
+    /// with that prefix into the streaming/by-block files. So the registry
+    /// `coin` key MUST equal the API name verbatim — no extra prefix layer.
+    /// Without this, every event for a builder-dex coin silently fails the
+    /// resolver (584 unknown-coin warns/sec on mainnet pre-fix).
+    #[test]
+    fn parse_builder_dex_asset_uses_api_prefixed_name_verbatim() {
+        let asset = serde_json::json!({"name": "xyz:XYZ100", "szDecimals": 4, "maxDecimals": 2});
+        let e = parse_builder_dex_asset(&asset, "xyz", 21_000).unwrap();
+        // Critical invariant: the registry key matches what hl-node writes
+        // on the wire (`xyz:XYZ100`), NOT a doubled `xyz:xyz:XYZ100`.
+        assert_eq!(e.coin, "xyz:XYZ100");
+    }
+
+    /// Defensive: should the API ever return an unprefixed name (it does not
+    /// today), we still produce the correctly-prefixed registry key so the
+    /// resolver continues to work.
+    #[test]
+    fn parse_builder_dex_asset_prefixes_unprefixed_name_defensively() {
+        let asset = serde_json::json!({"name": "BAREONLY", "szDecimals": 3});
+        let e = parse_builder_dex_asset(&asset, "newdex", 22_000).unwrap();
+        assert_eq!(e.coin, "newdex:BAREONLY");
     }
 
     #[test]
