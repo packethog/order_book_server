@@ -525,9 +525,16 @@ pub(crate) fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec
                 let mut fills = HashMap::new();
                 fills.insert(f1.1.side, f1);
                 fills.insert(f2.1.side, f2);
-                let trade = Trade::from_fills(fills);
-                let coin = trade.coin.clone();
-                trades.entry(coin).or_insert_with(Vec::new).push(trade);
+                // from_fills returns None if the pair has two same-side fills
+                // (one overwrites the other in the HashMap by Side key) or if
+                // coin/tid don't match across the pair. Log and skip the pair —
+                // upstream the pair-up by adjacent batch order is best-effort.
+                if let Some(trade) = Trade::from_fills(fills) {
+                    let coin = trade.coin.clone();
+                    trades.entry(coin).or_insert_with(Vec::new).push(trade);
+                } else {
+                    log::warn!("coin_to_trades: skipping malformed fill pair (duplicate side or coin/tid mismatch)");
+                }
             }
         }
     }
