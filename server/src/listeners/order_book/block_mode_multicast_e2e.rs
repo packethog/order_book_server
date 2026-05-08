@@ -699,6 +699,42 @@ async fn init_from_snapshot_prunes_stale_pre_snapshot_streaming_blocks() {
 }
 
 #[tokio::test]
+async fn new_diff_without_opening_status_is_skipped_in_block_mode() {
+    // The block-mode `apply_updates` path needs an entry in the
+    // order_statuses batch (filtered by `is_inserted_into_book`) for every
+    // New diff. Production race: hl-node writes a transient order whose
+    // status doesn't end up in the batch (e.g. immediately filled before
+    // resting). Without soft-tolerance the listener tears down on the next
+    // batch that contains such a New diff. With soft-tolerance the diff is
+    // logged and skipped; snapshot validation reconciles the coin's book
+    // within 60s.
+    let root = fixture_root();
+    let snapshot_path = root.join("out.json");
+    let (snapshot_height, snapshot) =
+        load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&snapshot_path).await.unwrap();
+    let mut listener = OrderBookListener::new_with_ingest_mode(None, true, IngestMode::Block);
+    listener.init_from_snapshot(snapshot, snapshot_height);
+
+    let next_height = snapshot_height + 1;
+    let phantom_new_diff = NodeDataOrderDiff::new_for_test(
+        Address::new([0; 20]),
+        u64::MAX, // an oid no order_status references
+        "1.0".to_string(),
+        "BTC".to_string(),
+        OrderDiff::New { sz: "1.0".to_string() },
+    );
+    // Empty order_statuses batch — order_map is empty, so the New diff has
+    // no matching opening status. This is exactly the production error mode.
+    let status_batch = Batch::new_for_test(next_height, 1_700_000_000_000, Vec::<NodeDataOrderStatus>::new());
+    let diff_batch = Batch::new_for_test(next_height, 1_700_000_000_000, vec![phantom_new_diff]);
+    listener.receive_batch(EventBatch::Orders(status_batch)).expect("status batch");
+    listener
+        .receive_batch(EventBatch::BookDiffs(diff_batch))
+        .expect("New-without-status must be skipped, not error");
+    assert!(listener.is_ready(), "listener still healthy after phantom New");
+}
+
+#[tokio::test]
 async fn missing_order_remove_is_skipped_in_both_modes() {
     // The venue can produce Update/Remove diffs for orders that aren't on
     // our internal book — typically a transient race against snapshot fetch

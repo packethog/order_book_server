@@ -187,12 +187,11 @@ impl OrderBookState {
                             tap.emit_order_add(&coin, &order_for_tap, time_ns);
                         }
                     } else {
-                        if emittable_count >= 2 {
-                            if let Some(tap) = self.dob_tap.as_mut() {
-                                tap.emit_batch_boundary(1 /* close */, height, time_ns);
-                            }
-                        }
-                        return Err(format!("Unable to find order opening status {diff:?}").into());
+                        // Soft-tolerance: New diff without matching opening status.
+                        // We can't add the order without the user/time/cloid info from
+                        // the status, so skip and let snapshot validation reconcile.
+                        // Same shape as the Update/Remove missing-order branches below.
+                        log::warn!("apply_updates: New diff without matching opening status, skipping {diff:?}");
                     }
                 }
                 InnerOrderDiff::Update { new_sz, .. } => {
@@ -272,7 +271,16 @@ impl OrderBookState {
         let inner_diff = diff.diff().try_into()?;
         match inner_diff {
             InnerOrderDiff::New { sz } => {
-                let order = order_status.ok_or_else(|| format!("Unable to find order opening status {diff:?}"))?;
+                let Some(order) = order_status else {
+                    // Soft-tolerance: New diff without matching opening status.
+                    // Snapshot validation will reconcile. Advance height anyway so
+                    // we don't replay this diff and so subsequent diffs apply.
+                    log::warn!("apply_stream_diff: New diff without matching opening status, skipping {diff:?}");
+                    self.height = self.height.max(block_number);
+                    self.time = block_time_ms;
+                    self.snapped = false;
+                    return Ok(false);
+                };
                 let time = order.time.and_utc().timestamp_millis();
                 let mut inner_order: InnerL4Order = order.try_into()?;
                 inner_order.modify_sz(sz);
