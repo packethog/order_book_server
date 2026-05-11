@@ -10,7 +10,7 @@ use std::{
 use alloy::primitives::Address;
 use fs::File;
 use latency::LatencyStats;
-use log::{error, info};
+use log::{debug, error, info};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use tokio::{
     sync::{
@@ -39,12 +39,15 @@ use crate::{
     },
 };
 
+use self::progress::IngestProgress;
+
 #[cfg(test)]
 mod block_mode_multicast_e2e;
 pub(crate) mod dob_tap;
 pub(crate) mod latency;
 #[cfg(test)]
 mod parity_tests;
+mod progress;
 mod state;
 mod utils;
 
@@ -209,6 +212,7 @@ pub(crate) async fn hl_listen(
                 }
 
                 latency_stats.report();
+                listener.lock().await.progress.report();
 
                 let listener = listener.clone();
                 let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
@@ -243,11 +247,11 @@ fn fetch_snapshot(
                             if our_height < height {
                                 // We haven't reached the snapshot height yet;
                                 // skip — we'll validate on a future cycle.
-                                info!("Validation skipped: our height {our_height} < snapshot height {height}");
+                                debug!("Validation skipped: our height {our_height} < snapshot height {height}");
                                 Ok(())
                             } else if our_height > height {
                                 // We've moved past — snapshot is stale, skip.
-                                info!("Validation skipped: our height {our_height} > snapshot height {height}");
+                                debug!("Validation skipped: our height {our_height} > snapshot height {height}");
                                 Ok(())
                             } else {
                                 // Heights match — clone state under lock, then
@@ -359,6 +363,7 @@ pub(crate) struct OrderBookListener {
     dob_replay_taps: Option<DobReplayTaps>,
     streaming_state: StreamingState,
     last_unresolved_stream_new: Option<UnresolvedStreamNewDebug>,
+    progress: IngestProgress,
     #[cfg(test)]
     stream_block_finalize_grace: Duration,
 }
@@ -394,6 +399,7 @@ impl OrderBookListener {
             dob_replay_taps: None,
             streaming_state: StreamingState::default(),
             last_unresolved_stream_new: None,
+            progress: IngestProgress::new(),
             #[cfg(test)]
             stream_block_finalize_grace: DEFAULT_STREAM_BLOCK_FINALIZE_GRACE,
         }
@@ -1056,6 +1062,7 @@ impl DirectoryListener for OrderBookListener {
 
     fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()> {
         let total_len = data.len();
+        self.progress.record_read(event_source, total_len);
         let lines = data.lines();
         for line in lines {
             if line.is_empty() {
@@ -1086,8 +1093,9 @@ impl DirectoryListener for OrderBookListener {
                 Err(err) => {
                     // if we run into a serialization error (hitting EOF), just return to last line.
                     let preview: String = line.chars().take(100).collect();
-                    error!(
-                        "{event_source} serialization error {err}, height: {:?}, line: {:?}",
+                    self.progress.record_jsonl_deferral(event_source);
+                    debug!(
+                        "{event_source} JSONL deferral after serialization error {err}, height: {:?}, line: {:?}",
                         self.order_book_state.as_ref().map(OrderBookState::height),
                         preview,
                     );
@@ -1099,13 +1107,12 @@ impl DirectoryListener for OrderBookListener {
             };
             self.last_batch_block_time_ms = Some(block_time_ms);
             self.last_batch_local_time_ms = Some(local_time_ms);
-            if height % 100 == 0 {
-                info!("{event_source} block: {height}");
-            }
+            self.progress.record_row(event_source, height);
             if let Err(err) = self.receive_batch(event_batch) {
                 self.order_book_state = None;
                 return Err(err);
             }
+            let _reported = self.progress.report_if_due();
         }
         let snapshot = self.l2_snapshots(true);
         if let Some(snapshot) = snapshot {
