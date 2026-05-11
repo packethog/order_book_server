@@ -10,11 +10,12 @@ use super::{InstrumentInfo, RegistryState, SharedRegistry, UniverseEntry, make_s
 /// and builds a full `UniverseEntry` list keyed by index (including delisted entries).
 ///
 /// Instrument id ranges:
-/// - Core perps: array index (0..~230)
-/// - Spot: 10_000 + array index
-/// - Builder-DEX perps: 20_000 + dex_idx * 1_000 + asset_idx
-///   (dex_idx = position in `perpDexs` response; coin name is prefixed `<dex>:<name>`
-///    to match what hl-node writes in the block files)
+/// - Core perps: array index (`0..~230`)
+/// - Spot: `10_000 + array_index`
+/// - Spot token aliases: `100_000 + token_index` (`#<token_index>` in hl-node files)
+/// - Builder-DEX perps: `20_000 + dex_idx * 1_000 + asset_idx`
+///   (`dex_idx` = position in `perpDexs` response; coin name matches what hl-node
+///   writes in the block files)
 pub async fn fetch_universe(api_url: &str) -> Result<Vec<UniverseEntry>, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
     let mut universe = Vec::new();
@@ -48,6 +49,13 @@ pub async fn fetch_universe(api_url: &str) -> Result<Vec<UniverseEntry>, Box<dyn
     if let Some(arr) = spot_resp.get("universe").and_then(serde_json::Value::as_array) {
         for (idx, asset) in arr.iter().enumerate() {
             if let Some(entry) = parse_spot_asset(asset, u32::try_from(idx).unwrap_or(u32::MAX)) {
+                universe.push(entry);
+            }
+        }
+    }
+    if let Some(arr) = spot_resp.get("tokens").and_then(serde_json::Value::as_array) {
+        for token in arr {
+            if let Some(entry) = parse_spot_token_alias(token) {
                 universe.push(entry);
             }
         }
@@ -152,7 +160,22 @@ fn parse_builder_dex_asset(asset: &serde_json::Value, dex: &str, id: u32) -> Opt
     let price_exponent = derive_price_exponent(asset);
     let is_delisted = asset.get("isDelisted").and_then(serde_json::Value::as_bool).unwrap_or(false);
 
-    let coin = format!("{dex}:{name}");
+    let coin = if name.contains(':') { name.to_string() } else { format!("{dex}:{name}") };
+    let info = InstrumentInfo { instrument_id: id, price_exponent, qty_exponent, symbol: make_symbol(&coin) };
+
+    Some(UniverseEntry { instrument_id: id, coin, is_delisted, info })
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn parse_spot_token_alias(token: &serde_json::Value) -> Option<UniverseEntry> {
+    let index = token.get("index")?.as_u64()?;
+    let sz_decimals = token.get("szDecimals")?.as_u64()?;
+    let id = 100_000 + u32::try_from(index).ok()?;
+    let coin = format!("#{index}");
+    let qty_exponent = -(sz_decimals as i8);
+    let price_exponent = derive_price_exponent(token);
+    let is_delisted = token.get("isDelisted").and_then(serde_json::Value::as_bool).unwrap_or(false);
+
     let info = InstrumentInfo { instrument_id: id, price_exponent, qty_exponent, symbol: make_symbol(&coin) };
 
     Some(UniverseEntry { instrument_id: id, coin, is_delisted, info })
@@ -374,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_builder_dex_asset_prefixes_coin() {
+    fn parse_builder_dex_asset_prefixes_unprefixed_coin() {
         let asset = serde_json::json!({"name": "CL", "szDecimals": 3, "maxDecimals": 2});
         let e = parse_builder_dex_asset(&asset, "xyz", 21_000).unwrap();
         assert_eq!(e.coin, "xyz:CL");
@@ -382,6 +405,28 @@ mod tests {
         assert_eq!(e.info.qty_exponent, -3);
         assert_eq!(e.info.price_exponent, -2);
         assert!(!e.is_delisted);
+    }
+
+    #[test]
+    fn parse_builder_dex_asset_keeps_prefixed_coin() {
+        let asset = serde_json::json!({"name": "xyz:NATGAS", "szDecimals": 1, "maxDecimals": 4});
+        let e = parse_builder_dex_asset(&asset, "xyz", 21_031).unwrap();
+        assert_eq!(e.coin, "xyz:NATGAS");
+        assert_eq!(e.instrument_id, 21_031);
+        assert_eq!(e.info.qty_exponent, -1);
+        assert_eq!(e.info.price_exponent, -4);
+        assert_eq!(&e.info.symbol[..10], b"xyz:NATGAS");
+    }
+
+    #[test]
+    fn parse_spot_token_alias_uses_hash_index_coin() {
+        let token = serde_json::json!({"name": "CATH", "index": 250, "szDecimals": 2});
+        let e = parse_spot_token_alias(&token).unwrap();
+        assert_eq!(e.coin, "#250");
+        assert_eq!(e.instrument_id, 100_250);
+        assert_eq!(e.info.qty_exponent, -2);
+        assert_eq!(e.info.price_exponent, -8);
+        assert_eq!(&e.info.symbol[..4], b"#250");
     }
 
     #[test]
@@ -396,6 +441,12 @@ mod tests {
     fn parse_builder_dex_asset_missing_fields() {
         assert!(parse_builder_dex_asset(&serde_json::json!({"szDecimals": 3}), "xyz", 20_000).is_none());
         assert!(parse_builder_dex_asset(&serde_json::json!({"name": "CL"}), "xyz", 20_000).is_none());
+    }
+
+    #[test]
+    fn parse_spot_token_alias_missing_fields() {
+        assert!(parse_spot_token_alias(&serde_json::json!({"index": 250})).is_none());
+        assert!(parse_spot_token_alias(&serde_json::json!({"szDecimals": 2})).is_none());
     }
 
     #[test]
