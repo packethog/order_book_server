@@ -347,6 +347,7 @@ pub(crate) struct OrderBookListener {
     // Only Some when we want it to collect updates
     fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+    l4_message_tx: Option<Sender<Arc<InternalMessage>>>,
     // Timestamps from the most recently deserialized batch (for latency tracking)
     last_batch_block_time_ms: Option<u64>,
     last_batch_local_time_ms: Option<u64>,
@@ -384,6 +385,7 @@ impl OrderBookListener {
             last_fill: None,
             fetched_snapshot_cache: None,
             internal_message_tx,
+            l4_message_tx: None,
             order_diff_cache: BatchQueue::new(),
             order_status_cache: BatchQueue::new(),
             last_batch_block_time_ms: None,
@@ -425,6 +427,14 @@ impl OrderBookListener {
 
     pub(crate) const fn is_ready(&self) -> bool {
         self.order_book_state.is_some()
+    }
+
+    pub(crate) fn set_l4_message_tx(&mut self, tx: Sender<Arc<InternalMessage>>) {
+        self.l4_message_tx = Some(tx);
+    }
+
+    fn l4_message_tx(&self) -> Option<&Sender<Arc<InternalMessage>>> {
+        self.l4_message_tx.as_ref().or(self.internal_message_tx.as_ref())
     }
 
     pub(crate) fn universe(&self) -> HashSet<Coin> {
@@ -574,7 +584,7 @@ impl OrderBookListener {
                 if let Some(cache) = &mut self.fetched_snapshot_cache {
                     cache.push_back((order_statuses.clone(), order_diffs.clone()));
                 }
-                if let Some(tx) = &self.internal_message_tx {
+                if let Some(tx) = self.l4_message_tx() {
                     let tx = tx.clone();
                     tokio::spawn(async move {
                         let updates = Arc::new(InternalMessage::L4BookUpdates {
@@ -803,7 +813,7 @@ impl OrderBookListener {
     }
 
     fn publish_l4_update(&self, diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus>) {
-        if let Some(tx) = &self.internal_message_tx {
+        if let Some(tx) = self.l4_message_tx() {
             let tx = tx.clone();
             tokio::spawn(async move {
                 let updates = Arc::new(InternalMessage::L4BookUpdates { diff_batch, status_batch });

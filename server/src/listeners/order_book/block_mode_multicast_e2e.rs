@@ -288,6 +288,41 @@ async fn streaming_fixture_publishes_expected_multicast_packets() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streaming_l4_flood_does_not_starve_tob_marketdata() {
+    let root = fixture_root();
+    let snapshot_path = root.join("out.json");
+    let (snapshot_height, snapshot) = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&snapshot_path)
+        .await
+        .expect("fixture snapshot loads");
+
+    let registry = new_shared_registry(test_registry_state());
+    let (market_tx, _) = broadcast_channel::<Arc<InternalMessage>>(8);
+    let (l4_tx, _) = broadcast_channel::<Arc<InternalMessage>>(2);
+    let mut lagging_l4_rx = l4_tx.subscribe();
+
+    let mut listener = OrderBookListener::new_with_ingest_mode(Some(market_tx.clone()), true, IngestMode::Stream);
+    listener.set_l4_message_tx(l4_tx);
+    listener.init_from_snapshot(snapshot, snapshot_height);
+    let listener = Arc::new(Mutex::new(listener));
+
+    let tob_market = UdpCollector::bind().await;
+    let tob_refdata = UdpCollector::bind().await;
+    let tob_handle =
+        spawn_tob_publisher(market_tx.subscribe(), registry.clone(), tob_market.port(), tob_refdata.port()).await;
+
+    replay_fixture_streams(&root, &listener).await;
+    sleep(Duration::from_millis(700)).await;
+    tob_handle.abort();
+
+    let tob_quote_packets = normalize_tob(tob_market.finish());
+    let l4_lagged = matches!(lagging_l4_rx.recv().await, Err(tokio::sync::broadcast::error::RecvError::Lagged(_)));
+
+    assert!(l4_lagged, "test fixture should overflow the tiny L4-only channel");
+    assert_has_msg_type(&tob_quote_packets, tob_const::MSG_TYPE_QUOTE, "TOB quote under L4 flood");
+    assert_has_msg_type(&tob_quote_packets, tob_const::MSG_TYPE_TRADE, "TOB trade under L4 flood");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires HL_STREAM_CAPTURE_ROOT pointing at a real hl-node _streaming capture"]
 async fn live_stream_capture_replays_expected_multicast_packets() {
     let root = PathBuf::from(

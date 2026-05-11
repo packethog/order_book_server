@@ -7,7 +7,7 @@ use std::{
 
 use axum::{Router, response::IntoResponse, routing::get};
 use futures_util::{SinkExt, StreamExt};
-use log::{error, info};
+use log::{error, info, warn};
 use tokio::{
     net::TcpListener,
     select,
@@ -59,7 +59,8 @@ pub async fn run_websocket_server(
     ingest_mode: IngestMode,
     hl_data_root: Option<PathBuf>,
 ) -> Result<()> {
-    let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(100);
+    let (market_message_tx, _) = channel::<Arc<InternalMessage>>(100);
+    let (l4_message_tx, _) = channel::<Arc<InternalMessage>>(4096);
 
     // Central task: listen to messages and forward them for distribution.
     // Keep snapshots under $HOME/out.json for default compatibility while
@@ -67,8 +68,10 @@ pub async fn run_websocket_server(
     let home_dir = home_dir().ok_or("Could not find home directory")?;
     let hl_data_root = hl_data_root.unwrap_or_else(|| home_dir.join("hl/data"));
     let listener = {
-        let internal_message_tx = internal_message_tx.clone();
-        OrderBookListener::new_with_ingest_mode(Some(internal_message_tx), ignore_spot, ingest_mode)
+        let market_message_tx = market_message_tx.clone();
+        let mut listener = OrderBookListener::new_with_ingest_mode(Some(market_message_tx), ignore_spot, ingest_mode);
+        listener.set_l4_message_tx(l4_message_tx.clone());
+        listener
     };
     let listener = Arc::new(Mutex::new(listener));
     {
@@ -118,7 +121,7 @@ pub async fn run_websocket_server(
 
     if let Some(mcast_config) = multicast_config {
         let registry = registry.clone().expect("registry was created above");
-        let mcast_rx = internal_message_tx.subscribe();
+        let mcast_rx = market_message_tx.subscribe();
         tokio::spawn(async move {
             let bind_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(mcast_config.bind_addr), 0);
             match tokio::net::UdpSocket::bind(bind_addr).await {
@@ -293,9 +296,17 @@ pub async fn run_websocket_server(
     let app = Router::new().route(
         "/ws",
         get({
-            let internal_message_tx = internal_message_tx.clone();
+            let market_message_tx = market_message_tx.clone();
+            let l4_message_tx = l4_message_tx.clone();
             async move |ws_upgrade| {
-                ws_handler(ws_upgrade, internal_message_tx.clone(), listener.clone(), ignore_spot, websocket_opts)
+                ws_handler(
+                    ws_upgrade,
+                    market_message_tx.clone(),
+                    l4_message_tx.clone(),
+                    listener.clone(),
+                    ignore_spot,
+                    websocket_opts,
+                )
             }
         }),
     );
@@ -313,7 +324,8 @@ pub async fn run_websocket_server(
 
 fn ws_handler(
     incoming: yawc::IncomingUpgrade,
-    internal_message_tx: Sender<Arc<InternalMessage>>,
+    market_message_tx: Sender<Arc<InternalMessage>>,
+    l4_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
     ignore_spot: bool,
     websocket_opts: yawc::Options,
@@ -328,7 +340,7 @@ fn ws_handler(
             }
         };
 
-        handle_socket(ws, internal_message_tx, listener, ignore_spot).await
+        handle_socket(ws, market_message_tx, l4_message_tx, listener, ignore_spot).await
     });
 
     resp
@@ -336,11 +348,13 @@ fn ws_handler(
 
 async fn handle_socket(
     mut socket: WebSocket,
-    internal_message_tx: Sender<Arc<InternalMessage>>,
+    market_message_tx: Sender<Arc<InternalMessage>>,
+    l4_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
     ignore_spot: bool,
 ) {
-    let mut internal_message_rx = internal_message_tx.subscribe();
+    let mut market_message_rx = market_message_tx.subscribe();
+    let mut l4_message_rx = l4_message_tx.subscribe();
     let is_ready = listener.lock().await.is_ready();
     let mut manager = SubscriptionManager::default();
     let mut universe = listener.lock().await.universe().into_iter().map(|c| c.value()).collect();
@@ -351,7 +365,7 @@ async fn handle_socket(
     }
     loop {
         select! {
-            recv_result = internal_message_rx.recv() => {
+            recv_result = market_message_rx.recv() => {
                 match recv_result {
                     Ok(msg) => {
                         match msg.as_ref() {
@@ -367,17 +381,35 @@ async fn handle_socket(
                                     send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
                                 }
                             },
-                            InternalMessage::L4BookUpdates{ diff_batch, status_batch } => {
-                                let mut book_updates = coin_to_book_updates(diff_batch, status_batch);
-                                for sub in manager.subscriptions() {
-                                    send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
-                                }
-                            },
+                            InternalMessage::L4BookUpdates{ .. } => {}
                         }
 
                     }
-                    Err(err) => {
-                        error!("Receiver error: {err}");
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("websocket market receiver lagged by {n} messages");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        error!("WebSocket market receiver closed");
+                        return;
+                    }
+                }
+            }
+
+            recv_result = l4_message_rx.recv() => {
+                match recv_result {
+                    Ok(msg) => {
+                        if let InternalMessage::L4BookUpdates{ diff_batch, status_batch } = msg.as_ref() {
+                            let mut book_updates = coin_to_book_updates(diff_batch, status_batch);
+                            for sub in manager.subscriptions() {
+                                send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("websocket l4 receiver lagged by {n} messages");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        error!("WebSocket l4 receiver closed");
                         return;
                     }
                 }
