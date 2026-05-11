@@ -48,6 +48,16 @@ mod parity_tests;
 mod state;
 mod utils;
 
+#[cfg(not(test))]
+const UNRESOLVED_STREAM_NEW_SKIP_AFTER: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const UNRESOLVED_STREAM_NEW_SKIP_AFTER: Duration = Duration::from_millis(0);
+
+#[cfg(not(test))]
+const DEFAULT_STREAM_BLOCK_FINALIZE_GRACE: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const DEFAULT_STREAM_BLOCK_FINALIZE_GRACE: Duration = Duration::from_millis(0);
+
 /// Wall-clock nanoseconds since the Unix epoch. Mirrors the helper in
 /// `multicast::dob` (kept module-local there) so `apply_recovery` can stamp
 /// `InstrumentReset.timestamp_ns` without crossing a privacy boundary.
@@ -302,6 +312,7 @@ pub(crate) struct DobReplayTaps {
 struct StreamingBlock {
     block_time_ms: Option<u64>,
     local_time_ms: Option<u64>,
+    last_received_at: Option<Instant>,
     statuses: HashMap<Oid, NodeDataOrderStatus>,
     diffs: VecDeque<Batch<NodeDataOrderDiff>>,
     boundary_open: bool,
@@ -311,6 +322,15 @@ struct StreamingBlock {
 struct StreamingState {
     blocks: BTreeMap<u64, StreamingBlock>,
     finalized_height: Option<u64>,
+}
+
+struct UnresolvedStreamNewDebug {
+    height: u64,
+    oid: Oid,
+    first_seen_at: Instant,
+    last_logged_at: Instant,
+    last_later_block_seen: bool,
+    max_buffered_blocks_logged: usize,
 }
 
 pub(crate) struct OrderBookListener {
@@ -337,6 +357,9 @@ pub(crate) struct OrderBookListener {
     // `attach_dob_replay_taps` is called; recovery still runs without it.
     dob_replay_taps: Option<DobReplayTaps>,
     streaming_state: StreamingState,
+    last_unresolved_stream_new: Option<UnresolvedStreamNewDebug>,
+    #[cfg(test)]
+    stream_block_finalize_grace: Duration,
 }
 
 impl OrderBookListener {
@@ -368,7 +391,25 @@ impl OrderBookListener {
             pending_dob_tap: None,
             dob_replay_taps: None,
             streaming_state: StreamingState::default(),
+            last_unresolved_stream_new: None,
+            #[cfg(test)]
+            stream_block_finalize_grace: DEFAULT_STREAM_BLOCK_FINALIZE_GRACE,
         }
+    }
+
+    #[cfg(not(test))]
+    const fn stream_block_finalize_grace(&self) -> Duration {
+        DEFAULT_STREAM_BLOCK_FINALIZE_GRACE
+    }
+
+    #[cfg(test)]
+    const fn stream_block_finalize_grace(&self) -> Duration {
+        self.stream_block_finalize_grace
+    }
+
+    #[cfg(test)]
+    fn set_stream_block_finalize_grace_for_test(&mut self, grace: Duration) {
+        self.stream_block_finalize_grace = grace;
     }
 
     /// Returns (block_time_ms, local_time_ms) from the most recently
@@ -582,9 +623,7 @@ impl OrderBookListener {
         // when block N's statuses arrive. Drop these late events rather than
         // crashing the listener.
         if self.streaming_state.finalized_height.is_some_and(|finalized| height <= finalized) {
-            log::warn!(
-                "dropping late streaming statuses for finalized block {height} (cross-file ordering)"
-            );
+            log::warn!("dropping late streaming statuses for finalized block {height} (cross-file ordering)");
             return Ok(());
         }
         self.last_batch_block_time_ms = Some(batch.block_time());
@@ -593,6 +632,7 @@ impl OrderBookListener {
         let block = self.streaming_state.blocks.entry(height).or_default();
         block.block_time_ms.get_or_insert(batch.block_time());
         block.local_time_ms = Some(batch.local_time_ms());
+        block.last_received_at = Some(Instant::now());
         for status in batch.events() {
             if status.is_inserted_into_book() {
                 block.statuses.insert(Oid::new(status.order.oid), status);
@@ -605,9 +645,7 @@ impl OrderBookListener {
         let height = batch.block_number();
         // See receive_stream_statuses for the cross-file race rationale.
         if self.streaming_state.finalized_height.is_some_and(|finalized| height <= finalized) {
-            log::warn!(
-                "dropping late streaming diffs for finalized block {height} (cross-file ordering)"
-            );
+            log::warn!("dropping late streaming diffs for finalized block {height} (cross-file ordering)");
             return Ok(());
         }
         self.last_batch_block_time_ms = Some(batch.block_time());
@@ -616,6 +654,7 @@ impl OrderBookListener {
         let block = self.streaming_state.blocks.entry(height).or_default();
         block.block_time_ms.get_or_insert(batch.block_time());
         block.local_time_ms = Some(batch.local_time_ms());
+        block.last_received_at = Some(Instant::now());
         for diff in batch.events_ref() {
             block.diffs.push_back(batch.with_events(vec![diff.clone()]));
         }
@@ -640,10 +679,80 @@ impl OrderBookListener {
                     matches!(diff.raw_book_diff, OrderDiff::New { .. }) && !(diff.coin().is_spot() && self.ignore_spot);
                 let status = if needs_status {
                     let oid = diff.oid();
-                    let Some(status) = block.statuses.remove(&oid) else {
-                        break;
-                    };
-                    Some(status)
+                    match block.statuses.remove(&oid) {
+                        Some(status) => {
+                            if self
+                                .last_unresolved_stream_new
+                                .as_ref()
+                                .is_some_and(|prev| prev.height == height && prev.oid == oid)
+                            {
+                                self.last_unresolved_stream_new = None;
+                            }
+                            Some(status)
+                        }
+                        None => {
+                            let now = Instant::now();
+                            let buffered_blocks = self.streaming_state.blocks.len() + 1;
+                            let highest_buffered_height =
+                                self.streaming_state.blocks.keys().next_back().copied().unwrap_or(height).max(height);
+                            let (first_seen_at, should_log) = match self.last_unresolved_stream_new.as_ref() {
+                                Some(prev) if prev.height == height && prev.oid == oid => (
+                                    prev.first_seen_at,
+                                    (later_block_seen && !prev.last_later_block_seen)
+                                        || now.duration_since(prev.last_logged_at) >= Duration::from_secs(5)
+                                        || buffered_blocks >= prev.max_buffered_blocks_logged.saturating_add(100),
+                                ),
+                                _ => (now, true),
+                            };
+                            let waited = now.duration_since(first_seen_at);
+
+                            if later_block_seen && waited >= UNRESOLVED_STREAM_NEW_SKIP_AFTER {
+                                log::warn!(
+                                    "streaming drain skipping New diff without matching opening status after timeout: \
+                                     height={height} oid={oid:?} coin={:?} waited_ms={} \
+                                     pending_diffs={} available_statuses={} buffered_blocks={buffered_blocks} \
+                                     highest_buffered_height={highest_buffered_height}",
+                                    diff.coin(),
+                                    waited.as_millis(),
+                                    block.diffs.len(),
+                                    block.statuses.len(),
+                                );
+                                if self
+                                    .last_unresolved_stream_new
+                                    .as_ref()
+                                    .is_some_and(|prev| prev.height == height && prev.oid == oid)
+                                {
+                                    self.last_unresolved_stream_new = None;
+                                }
+                                None
+                            } else {
+                                if should_log {
+                                    let state_height = self.order_book_state.as_ref().map(OrderBookState::height);
+                                    let waited_ms = waited.as_millis();
+                                    log::debug!(
+                                        "streaming drain blocked waiting for New status: height={height} oid={oid:?} coin={:?} \
+                                     waited_ms={waited_ms} \
+                                     pending_diffs={} available_statuses={} later_block_seen={} state_height={state_height:?} \
+                                     finalized_height={:?} buffered_blocks={buffered_blocks} highest_buffered_height={highest_buffered_height}",
+                                        diff.coin(),
+                                        block.diffs.len(),
+                                        block.statuses.len(),
+                                        later_block_seen,
+                                        self.streaming_state.finalized_height,
+                                    );
+                                    self.last_unresolved_stream_new = Some(UnresolvedStreamNewDebug {
+                                        height,
+                                        oid,
+                                        first_seen_at,
+                                        last_logged_at: now,
+                                        last_later_block_seen: later_block_seen,
+                                        max_buffered_blocks_logged: buffered_blocks,
+                                    });
+                                }
+                                break;
+                            }
+                        }
+                    }
                 } else {
                     None
                 };
@@ -676,7 +785,10 @@ impl OrderBookListener {
                 }
             }
 
-            if block.diffs.is_empty() && later_block_seen {
+            let finalize_grace_elapsed = block
+                .last_received_at
+                .is_none_or(|last_received_at| last_received_at.elapsed() >= self.stream_block_finalize_grace());
+            if block.diffs.is_empty() && later_block_seen && finalize_grace_elapsed {
                 if block.boundary_open
                     && let (Some(state), Some(block_time_ms)) = (self.order_book_state.as_mut(), block.block_time_ms)
                 {

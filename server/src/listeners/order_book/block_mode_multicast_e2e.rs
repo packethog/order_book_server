@@ -36,7 +36,10 @@ use crate::{
         },
         publisher::MulticastPublisher,
     },
-    order_book::{Coin, PerInstrumentSeqCounter, multi_book::load_snapshots_from_json},
+    order_book::{
+        Coin, OrderBook, PerInstrumentSeqCounter, Px, Side, Sz,
+        multi_book::{Snapshots, load_snapshots_from_json},
+    },
     protocol::{constants as tob_const, dob::constants as dob_const},
     types::{
         L4Order, OrderDiff,
@@ -656,6 +659,38 @@ async fn streaming_unresolved_new_order_fails_when_forced_to_finalize() {
 }
 
 #[tokio::test]
+async fn streaming_new_without_opening_status_is_skipped_after_later_block() {
+    let (mut listener, snapshot_height) = stream_listener_from_fixture().await;
+    let next_height = snapshot_height + 1;
+    let phantom_new_diff = NodeDataOrderDiff::new_for_test(
+        Address::new([0; 20]),
+        u64::MAX - 1,
+        "1.0".to_string(),
+        "BTC".to_string(),
+        OrderDiff::New { sz: "1.0".to_string() },
+    );
+
+    listener
+        .receive_batch(EventBatch::BookDiffs(Batch::new_for_test(
+            next_height,
+            1_700_000_001_000,
+            vec![phantom_new_diff],
+        )))
+        .unwrap();
+    assert_eq!(listener.compute_snapshot().unwrap().height, snapshot_height);
+
+    listener
+        .receive_batch(EventBatch::BookDiffs(Batch::new_for_test(
+            next_height + 1,
+            1_700_000_002_000,
+            Vec::<NodeDataOrderDiff>::new(),
+        )))
+        .unwrap();
+    assert_eq!(listener.compute_snapshot().unwrap().height, next_height);
+    assert!(listener.is_ready(), "listener remains healthy after skipping unresolved streaming New");
+}
+
+#[tokio::test]
 async fn init_from_snapshot_prunes_stale_pre_snapshot_streaming_blocks() {
     // The streaming file watcher races ahead of the snapshot fetch — so by the
     // time `init_from_snapshot` runs, `streaming_state.blocks` typically holds
@@ -728,9 +763,7 @@ async fn new_diff_without_opening_status_is_skipped_in_block_mode() {
     let status_batch = Batch::new_for_test(next_height, 1_700_000_000_000, Vec::<NodeDataOrderStatus>::new());
     let diff_batch = Batch::new_for_test(next_height, 1_700_000_000_000, vec![phantom_new_diff]);
     listener.receive_batch(EventBatch::Orders(status_batch)).expect("status batch");
-    listener
-        .receive_batch(EventBatch::BookDiffs(diff_batch))
-        .expect("New-without-status must be skipped, not error");
+    listener.receive_batch(EventBatch::BookDiffs(diff_batch)).expect("New-without-status must be skipped, not error");
     assert!(listener.is_ready(), "listener still healthy after phantom New");
 }
 
@@ -779,6 +812,58 @@ async fn missing_order_remove_is_skipped_in_both_modes() {
 }
 
 #[tokio::test]
+async fn block_mode_raw_new_rests_on_crossed_local_book_and_later_updates_apply() {
+    let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Block);
+    listener.init_from_snapshot(crossed_raw_diff_snapshot(), 1);
+
+    let new_oid = 2_000;
+    let status = raw_diff_order_status(new_oid, Side::Ask, "99", "5", 1_700_000_002_000);
+    let new_diff = raw_new_diff(new_oid, "99", "5");
+    listener.receive_batch(EventBatch::Orders(Batch::new_for_test(2, 1_700_000_002_000, vec![status]))).unwrap();
+    listener.receive_batch(EventBatch::BookDiffs(Batch::new_for_test(2, 1_700_000_002_000, vec![new_diff]))).unwrap();
+
+    let order = raw_diff_test_order_in_listener(&mut listener, new_oid).expect("raw New rests despite crossed book");
+    assert_eq!(order.side, Side::Ask);
+    assert_eq!(order.sz.to_str(), "5");
+
+    let update = raw_update_diff(new_oid, "99", "5", "3");
+    listener.receive_batch(EventBatch::Orders(Batch::new_for_test(3, 1_700_000_003_000, vec![]))).unwrap();
+    listener.receive_batch(EventBatch::BookDiffs(Batch::new_for_test(3, 1_700_000_003_000, vec![update]))).unwrap();
+    assert_eq!(raw_diff_test_order_in_listener(&mut listener, new_oid).unwrap().sz.to_str(), "3");
+
+    let remove = raw_remove_diff(new_oid, "99");
+    listener.receive_batch(EventBatch::Orders(Batch::new_for_test(4, 1_700_000_004_000, vec![]))).unwrap();
+    listener.receive_batch(EventBatch::BookDiffs(Batch::new_for_test(4, 1_700_000_004_000, vec![remove]))).unwrap();
+    assert!(raw_diff_test_order_in_listener(&mut listener, new_oid).is_none());
+    assert!(raw_diff_test_order_in_listener(&mut listener, 1_000).is_some());
+}
+
+#[tokio::test]
+async fn streaming_raw_new_rests_on_crossed_local_book_and_later_updates_apply() {
+    let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Stream);
+    listener.init_from_snapshot(crossed_raw_diff_snapshot(), 1);
+
+    let new_oid = 2_001;
+    let status = raw_diff_order_status(new_oid, Side::Ask, "99", "5", 1_700_000_002_000);
+    let new_diff = raw_new_diff(new_oid, "99", "5");
+    listener.receive_batch(EventBatch::Orders(Batch::new_for_test(2, 1_700_000_002_000, vec![status]))).unwrap();
+    listener.receive_batch(EventBatch::BookDiffs(Batch::new_for_test(2, 1_700_000_002_000, vec![new_diff]))).unwrap();
+
+    let order = raw_diff_test_order_in_listener(&mut listener, new_oid).expect("raw New rests despite crossed book");
+    assert_eq!(order.side, Side::Ask);
+    assert_eq!(order.sz.to_str(), "5");
+
+    let update = raw_update_diff(new_oid, "99", "5", "3");
+    listener.receive_batch(EventBatch::BookDiffs(Batch::new_for_test(3, 1_700_000_003_000, vec![update]))).unwrap();
+    assert_eq!(raw_diff_test_order_in_listener(&mut listener, new_oid).unwrap().sz.to_str(), "3");
+
+    let remove = raw_remove_diff(new_oid, "99");
+    listener.receive_batch(EventBatch::BookDiffs(Batch::new_for_test(4, 1_700_000_004_000, vec![remove]))).unwrap();
+    assert!(raw_diff_test_order_in_listener(&mut listener, new_oid).is_none());
+    assert!(raw_diff_test_order_in_listener(&mut listener, 1_000).is_some());
+}
+
+#[tokio::test]
 async fn streaming_late_data_for_finalized_block_is_dropped() {
     // hl-node writes the streaming statuses, diffs, and fills files concurrently;
     // they're delivered through one notify channel. If a later block's diffs
@@ -802,6 +887,37 @@ async fn streaming_late_data_for_finalized_block_is_dropped() {
     listener.receive_batch(EventBatch::BookDiffs(diff_batch)).expect("late events drop, do not crash");
 }
 
+#[tokio::test]
+async fn streaming_finalize_grace_accepts_late_same_block_diffs() {
+    let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Stream);
+    listener.init_from_snapshot(crossed_raw_diff_snapshot(), 1);
+    listener.set_stream_block_finalize_grace_for_test(Duration::from_secs(60));
+
+    listener
+        .receive_batch(EventBatch::BookDiffs(Batch::new_for_test(
+            2,
+            1_700_000_002_000,
+            Vec::<NodeDataOrderDiff>::new(),
+        )))
+        .unwrap();
+    listener
+        .receive_batch(EventBatch::BookDiffs(Batch::new_for_test(
+            3,
+            1_700_000_003_000,
+            Vec::<NodeDataOrderDiff>::new(),
+        )))
+        .unwrap();
+
+    assert!(raw_diff_test_order_in_listener(&mut listener, 1_000).is_some());
+
+    let late_remove = raw_remove_diff(1_000, "100");
+    listener
+        .receive_batch(EventBatch::BookDiffs(Batch::new_for_test(2, 1_700_000_002_000, vec![late_remove])))
+        .expect("same-block diff arriving during finalize grace is still accepted");
+
+    assert!(raw_diff_test_order_in_listener(&mut listener, 1_000).is_none());
+}
+
 async fn stream_listener_from_fixture() -> (OrderBookListener, u64) {
     let root = fixture_root();
     let (snapshot_height, snapshot) =
@@ -811,6 +927,78 @@ async fn stream_listener_from_fixture() -> (OrderBookListener, u64) {
     let mut listener = OrderBookListener::new_with_ingest_mode(None, true, IngestMode::Stream);
     listener.init_from_snapshot(snapshot, snapshot_height);
     (listener, snapshot_height)
+}
+
+fn crossed_raw_diff_snapshot() -> Snapshots<InnerL4Order> {
+    let coin = Coin::new("BTC");
+    let mut book = OrderBook::new();
+    book.add_order(raw_diff_inner_order(1_000, Side::Bid, "100", "10", 1_700_000_001_000));
+    Snapshots::new(HashMap::from([(coin, book.to_snapshot())]))
+}
+
+fn raw_diff_inner_order(oid: u64, side: Side, px: &str, sz: &str, timestamp: u64) -> InnerL4Order {
+    InnerL4Order {
+        user: Address::new([0; 20]),
+        coin: Coin::new("BTC"),
+        side,
+        limit_px: Px::parse_from_str(px).unwrap(),
+        sz: Sz::parse_from_str(sz).unwrap(),
+        oid,
+        timestamp,
+        trigger_condition: String::new(),
+        is_trigger: false,
+        trigger_px: String::new(),
+        is_position_tpsl: false,
+        reduce_only: false,
+        order_type: "Limit".to_string(),
+        tif: Some("Alo".to_string()),
+        cloid: None,
+    }
+}
+
+fn raw_diff_order_status(oid: u64, side: Side, px: &str, sz: &str, block_time_ms: u64) -> NodeDataOrderStatus {
+    let order = raw_diff_inner_order(oid, side, px, sz, block_time_ms);
+    let secs = (block_time_ms / 1_000) as i64;
+    let nsecs = ((block_time_ms % 1_000) * 1_000_000) as u32;
+    let time = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsecs).unwrap().naive_utc();
+    NodeDataOrderStatus { time, user: order.user, status: "open".to_string(), order: order.into() }
+}
+
+fn raw_new_diff(oid: u64, px: &str, sz: &str) -> NodeDataOrderDiff {
+    NodeDataOrderDiff::new_for_test(
+        Address::new([0; 20]),
+        oid,
+        px.to_string(),
+        "BTC".to_string(),
+        OrderDiff::New { sz: sz.to_string() },
+    )
+}
+
+fn raw_update_diff(oid: u64, px: &str, orig_sz: &str, new_sz: &str) -> NodeDataOrderDiff {
+    NodeDataOrderDiff::new_for_test(
+        Address::new([0; 20]),
+        oid,
+        px.to_string(),
+        "BTC".to_string(),
+        OrderDiff::Update { orig_sz: orig_sz.to_string(), new_sz: new_sz.to_string() },
+    )
+}
+
+fn raw_remove_diff(oid: u64, px: &str) -> NodeDataOrderDiff {
+    NodeDataOrderDiff::new_for_test(Address::new([0; 20]), oid, px.to_string(), "BTC".to_string(), OrderDiff::Remove)
+}
+
+fn raw_diff_test_order_in_listener(listener: &mut OrderBookListener, oid: u64) -> Option<InnerL4Order> {
+    listener
+        .compute_snapshot()?
+        .snapshot
+        .as_ref()
+        .get(&Coin::new("BTC"))?
+        .as_ref()
+        .iter()
+        .flatten()
+        .find(|order| order.oid == oid)
+        .cloned()
 }
 
 struct CapturedReplay {

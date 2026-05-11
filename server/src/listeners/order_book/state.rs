@@ -178,11 +178,14 @@ impl OrderBookState {
                         // must replace time with time of entering book, which is the timestamp of the order status update
                         #[allow(clippy::unwrap_used)]
                         inner_order.convert_trigger(time.try_into().unwrap());
-                        // Clone before moving into add_order so we can emit after.
-                        // add_order always succeeds for New (returns ()), so emitting
-                        // after the successful insert is safe and avoids a phantom event.
                         let order_for_tap = inner_order.clone();
-                        self.order_book.add_order(inner_order);
+                        self.order_book.add_resting_order_from_diff(inner_order);
+                        if !self.order_book.contains_order(&oid, &coin) {
+                            log::warn!(
+                                "apply_updates: New order did not rest after raw-diff insert, later updates will be missing; \
+                                 height={height} oid={oid:?} coin={coin:?} order={order_for_tap:?}"
+                            );
+                        }
                         if let Some(tap) = self.dob_tap.as_mut() {
                             tap.emit_order_add(&coin, &order_for_tap, time_ns);
                         }
@@ -211,7 +214,7 @@ impl OrderBookState {
                             // event won't permanently corrupt state. Crashing here would
                             // turn what's likely a transient ordering race into a hard
                             // failure cycle.
-                            log::warn!("apply_updates: Update for missing order, skipping {diff:?}");
+                            log::warn!("apply_updates: Update for missing order at height {height}, skipping {diff:?}");
                         }
                     }
                 }
@@ -222,7 +225,7 @@ impl OrderBookState {
                         }
                     } else {
                         // Soft-tolerance — see Update branch above.
-                        log::warn!("apply_updates: Remove for missing order, skipping {diff:?}");
+                        log::warn!("apply_updates: Remove for missing order at height {height}, skipping {diff:?}");
                     }
                 }
             }
@@ -287,7 +290,13 @@ impl OrderBookState {
                 #[allow(clippy::unwrap_used)]
                 inner_order.convert_trigger(time.try_into().unwrap());
                 let order_for_tap = inner_order.clone();
-                self.order_book.add_order(inner_order);
+                self.order_book.add_resting_order_from_diff(inner_order);
+                if !self.order_book.contains_order(&oid, &coin) {
+                    log::warn!(
+                        "apply_stream_diff: New order did not rest after raw-diff insert, later updates will be missing; \
+                         block_number={block_number} oid={oid:?} coin={coin:?} order={order_for_tap:?}"
+                    );
+                }
                 if let Some(tap) = self.dob_tap.as_mut() {
                     tap.emit_order_add(&coin, &order_for_tap, time_ns);
                 }
@@ -302,7 +311,9 @@ impl OrderBookState {
                 }
                 None => {
                     // Soft-tolerance: see apply_updates' matching branch.
-                    log::warn!("apply_stream_diff: Update for missing order, skipping {diff:?}");
+                    log::warn!(
+                        "apply_stream_diff: Update for missing order at block {block_number}, skipping {diff:?}"
+                    );
                 }
             },
             InnerOrderDiff::Remove => {
@@ -312,7 +323,9 @@ impl OrderBookState {
                     }
                 } else {
                     // Soft-tolerance — see apply_updates.
-                    log::warn!("apply_stream_diff: Remove for missing order, skipping {diff:?}");
+                    log::warn!(
+                        "apply_stream_diff: Remove for missing order at block {block_number}, skipping {diff:?}"
+                    );
                 }
             }
         }
