@@ -141,7 +141,7 @@ impl OrderBookState {
             .events()
             .into_iter()
             .filter_map(|order_status| {
-                if order_status.is_inserted_into_book() {
+                if order_status.is_opening_status_for_raw_diff() {
                     Some((Oid::new(order_status.order.oid), order_status))
                 } else {
                     None

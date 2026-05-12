@@ -650,7 +650,7 @@ impl OrderBookListener {
         block.local_time_ms = Some(batch.local_time_ms());
         block.last_received_at = Some(Instant::now());
         for status in batch.events() {
-            if status.is_inserted_into_book() {
+            if status.is_opening_status_for_raw_diff() {
                 block.statuses.insert(Oid::new(status.order.oid), status);
             }
         }

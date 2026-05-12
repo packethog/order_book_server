@@ -771,7 +771,7 @@ async fn init_from_snapshot_prunes_stale_pre_snapshot_streaming_blocks() {
 #[tokio::test]
 async fn new_diff_without_opening_status_is_skipped_in_block_mode() {
     // The block-mode `apply_updates` path needs an entry in the
-    // order_statuses batch (filtered by `is_inserted_into_book`) for every
+    // order_statuses batch (filtered by `is_opening_status_for_raw_diff`) for every
     // New diff. Production race: hl-node writes a transient order whose
     // status doesn't end up in the batch (e.g. immediately filled before
     // resting). Without soft-tolerance the listener tears down on the next
@@ -874,6 +874,23 @@ async fn block_mode_raw_new_rests_on_crossed_local_book_and_later_updates_apply(
 }
 
 #[tokio::test]
+async fn block_mode_ioc_open_status_matches_raw_new_diff() {
+    let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Block);
+    listener.init_from_snapshot(crossed_raw_diff_snapshot(), 1);
+
+    let new_oid = 2_010;
+    let status = raw_diff_order_status_with_tif(new_oid, Side::Ask, "99", "27", 1_700_000_002_000, "Ioc");
+    let new_diff = raw_new_diff(new_oid, "99", "18");
+    listener.receive_batch(EventBatch::Orders(Batch::new_for_test(2, 1_700_000_002_000, vec![status]))).unwrap();
+    listener.receive_batch(EventBatch::BookDiffs(Batch::new_for_test(2, 1_700_000_002_000, vec![new_diff]))).unwrap();
+
+    let order = raw_diff_test_order_in_listener(&mut listener, new_oid)
+        .expect("raw New uses Ioc open status metadata when validator diff says the order rested");
+    assert_eq!(order.sz.to_str(), "18");
+    assert_eq!(order.tif.as_deref(), Some("Ioc"));
+}
+
+#[tokio::test]
 async fn streaming_raw_new_rests_on_crossed_local_book_and_later_updates_apply() {
     let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Stream);
     listener.init_from_snapshot(crossed_raw_diff_snapshot(), 1);
@@ -896,6 +913,30 @@ async fn streaming_raw_new_rests_on_crossed_local_book_and_later_updates_apply()
     listener.receive_batch(EventBatch::BookDiffs(Batch::new_for_test(4, 1_700_000_004_000, vec![remove]))).unwrap();
     assert!(raw_diff_test_order_in_listener(&mut listener, new_oid).is_none());
     assert!(raw_diff_test_order_in_listener(&mut listener, 1_000).is_some());
+}
+
+#[tokio::test]
+async fn streaming_ioc_open_status_is_not_overwritten_by_same_block_fill_status() {
+    let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Stream);
+    listener.init_from_snapshot(crossed_raw_diff_snapshot(), 1);
+
+    let new_oid = 2_011;
+    let open_status = raw_diff_order_status_with_tif(new_oid, Side::Ask, "99", "27", 1_700_000_002_000, "Ioc");
+    let filled_status = raw_diff_terminal_status(new_oid, Side::Ask, "99", "0", 1_700_000_002_000, "Ioc", "filled");
+    let new_diff = raw_new_diff(new_oid, "99", "18");
+    listener
+        .receive_batch(EventBatch::Orders(Batch::new_for_test(2, 1_700_000_002_000, vec![open_status, filled_status])))
+        .unwrap();
+    listener.receive_batch(EventBatch::BookDiffs(Batch::new_for_test(2, 1_700_000_002_000, vec![new_diff]))).unwrap();
+
+    assert_eq!(raw_diff_test_order_in_listener(&mut listener, new_oid).unwrap().sz.to_str(), "18");
+
+    let update = raw_update_diff(new_oid, "99", "18", "0");
+    let remove = raw_remove_diff(new_oid, "99");
+    listener
+        .receive_batch(EventBatch::BookDiffs(Batch::new_for_test(3, 1_700_000_003_000, vec![update, remove])))
+        .unwrap();
+    assert!(raw_diff_test_order_in_listener(&mut listener, new_oid).is_none());
 }
 
 #[tokio::test]
@@ -992,11 +1033,43 @@ fn raw_diff_inner_order(oid: u64, side: Side, px: &str, sz: &str, timestamp: u64
 }
 
 fn raw_diff_order_status(oid: u64, side: Side, px: &str, sz: &str, block_time_ms: u64) -> NodeDataOrderStatus {
+    raw_diff_order_status_with_tif(oid, side, px, sz, block_time_ms, "Alo")
+}
+
+fn raw_diff_order_status_with_tif(
+    oid: u64,
+    side: Side,
+    px: &str,
+    sz: &str,
+    block_time_ms: u64,
+    tif: &str,
+) -> NodeDataOrderStatus {
     let order = raw_diff_inner_order(oid, side, px, sz, block_time_ms);
     let secs = (block_time_ms / 1_000) as i64;
     let nsecs = ((block_time_ms % 1_000) * 1_000_000) as u32;
     let time = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsecs).unwrap().naive_utc();
-    NodeDataOrderStatus { time, user: order.user, status: "open".to_string(), order: order.into() }
+    let mut order: L4Order = order.into();
+    order.tif = Some(tif.to_string());
+    NodeDataOrderStatus {
+        time,
+        user: order.user.unwrap_or_else(|| Address::new([0; 20])),
+        status: "open".to_string(),
+        order,
+    }
+}
+
+fn raw_diff_terminal_status(
+    oid: u64,
+    side: Side,
+    px: &str,
+    sz: &str,
+    block_time_ms: u64,
+    tif: &str,
+    status: &str,
+) -> NodeDataOrderStatus {
+    let mut order_status = raw_diff_order_status_with_tif(oid, side, px, sz, block_time_ms, tif);
+    order_status.status = status.to_string();
+    order_status
 }
 
 fn raw_new_diff(oid: u64, px: &str, sz: &str) -> NodeDataOrderDiff {
@@ -1144,7 +1217,7 @@ fn first_streaming_new_diff_and_status() -> (Batch<NodeDataOrderStatus>, Batch<N
         let Some(status) = batch.events_ref().first() else {
             continue;
         };
-        if status.is_inserted_into_book() {
+        if status.is_opening_status_for_raw_diff() {
             statuses.insert(status.order.oid, batch);
         }
     }
