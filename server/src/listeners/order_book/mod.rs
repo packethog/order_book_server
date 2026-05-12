@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::{Read, Seek, SeekFrom},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -69,6 +69,19 @@ fn now_ns() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
 }
 
+#[inline]
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+const fn ingest_source_label(source: EventSource) -> &'static str {
+    match source {
+        EventSource::Fills => "fills",
+        EventSource::OrderStatuses => "statuses",
+        EventSource::OrderDiffs => "diffs",
+    }
+}
+
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
 // if there are scripts running, this may not work as intended
 pub(crate) async fn hl_listen(
@@ -115,7 +128,7 @@ pub(crate) async fn hl_listen(
     let mut last_event_time: Option<Instant> = None;
 
     // Classify an fs path into its EventSource (avoids repeating starts_with checks)
-    let classify_path = |path: &std::path::Path| -> Option<EventSource> {
+    let classify_path = |path: &Path| -> Option<EventSource> {
         if path.starts_with(&order_statuses_dir) {
             Some(EventSource::OrderStatuses)
         } else if path.starts_with(&fills_dir) {
@@ -355,6 +368,12 @@ pub(crate) struct OrderBookListener {
     // Timestamps from the most recently deserialized batch (for latency tracking)
     last_batch_block_time_ms: Option<u64>,
     last_batch_local_time_ms: Option<u64>,
+    last_fill_height: Option<u64>,
+    last_status_height: Option<u64>,
+    last_diff_height: Option<u64>,
+    discard_fill_fragment: bool,
+    discard_status_fragment: bool,
+    discard_diff_fragment: bool,
     // Held until the first snapshot is ready, then attached to the state.
     pending_dob_tap: Option<dob_tap::DobApplyTap>,
     // Channels into the DoB pipeline, used by `apply_recovery` to emit
@@ -395,6 +414,12 @@ impl OrderBookListener {
             order_status_cache: BatchQueue::new(),
             last_batch_block_time_ms: None,
             last_batch_local_time_ms: None,
+            last_fill_height: None,
+            last_status_height: None,
+            last_diff_height: None,
+            discard_fill_fragment: false,
+            discard_status_fragment: false,
+            discard_diff_fragment: false,
             pending_dob_tap: None,
             dob_replay_taps: None,
             streaming_state: StreamingState::default(),
@@ -574,7 +599,7 @@ impl OrderBookListener {
                     if let Some(tx) = &self.internal_message_tx {
                         let tx = tx.clone();
                         tokio::spawn(async move {
-                            let snapshot = Arc::new(InternalMessage::Fills { batch });
+                            let snapshot = Arc::new(InternalMessage::Fills { batch, enqueued_at_ms: now_ms() });
                             let _unused = tx.send(snapshot);
                         });
                     }
@@ -623,7 +648,7 @@ impl OrderBookListener {
         if let Some(tx) = &self.internal_message_tx {
             let tx = tx.clone();
             tokio::spawn(async move {
-                let snapshot = Arc::new(InternalMessage::Fills { batch });
+                let snapshot = Arc::new(InternalMessage::Fills { batch, enqueued_at_ms: now_ms() });
                 let _unused = tx.send(snapshot);
             });
         }
@@ -989,10 +1014,56 @@ impl OrderBookListener {
     fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
         self.order_book_state.as_mut().and_then(|o| o.l2_snapshots(prevent_future_snaps))
     }
+
+    const fn ingest_heights(&self) -> IngestHeights {
+        IngestHeights { statuses: self.last_status_height, diffs: self.last_diff_height, fills: self.last_fill_height }
+    }
 }
 
 impl OrderBookListener {
+    fn record_file_mtime_lag(path: &Path, source: EventSource) {
+        let Ok(metadata) = path.metadata() else { return };
+        let Ok(modified) = metadata.modified() else { return };
+        let lag = SystemTime::now().duration_since(modified).unwrap_or_default();
+        crate::metrics::observe_ingest_file_mtime_lag(ingest_source_label(source), lag);
+    }
+
+    fn record_backlog_bytes(&mut self, source: EventSource) -> Result<()> {
+        let Some(file) = self.file_mut(source).as_mut() else {
+            crate::metrics::set_ingest_backlog_bytes(ingest_source_label(source), 0);
+            return Ok(());
+        };
+        let offset = file.stream_position()?;
+        let len = file.metadata()?.len();
+        crate::metrics::set_ingest_backlog_bytes(ingest_source_label(source), len.saturating_sub(offset));
+        Ok(())
+    }
+
+    const fn discard_fragment_mut(&mut self, source: EventSource) -> &mut bool {
+        match source {
+            EventSource::Fills => &mut self.discard_fill_fragment,
+            EventSource::OrderStatuses => &mut self.discard_status_fragment,
+            EventSource::OrderDiffs => &mut self.discard_diff_fragment,
+        }
+    }
+
+    fn discard_initial_fragment_if_needed(&mut self, data: &mut String, source: EventSource) -> bool {
+        if !*self.discard_fragment_mut(source) {
+            return true;
+        }
+
+        let Some(newline) = data.find('\n') else {
+            self.progress.record_jsonl_deferral(source);
+            return false;
+        };
+
+        data.drain(..=newline);
+        *self.discard_fragment_mut(source) = false;
+        true
+    }
+
     fn process_update(&mut self, event: &Event, new_path: &PathBuf, event_source: EventSource) -> Result<()> {
+        Self::record_file_mtime_lag(new_path, event_source);
         if event.kind.is_create() {
             info!("-- Event: {} created --", new_path.display());
             self.on_file_creation(new_path.clone(), event_source)?;
@@ -1006,7 +1077,6 @@ impl OrderBookListener {
                 self.on_file_modification(event_source)?;
             } else {
                 info!("-- Event: {} modified, tracking it now --", new_path.display());
-                let file = self.file_mut(event_source);
                 let mut new_file = File::open(new_path)?;
                 // Seek to end, then back up to the last newline so we start
                 // on a clean line boundary.  Without this, we can land mid-JSON
@@ -1021,10 +1091,14 @@ impl OrderBookListener {
                         // Position right after the last newline
                         let rewind = backtrack - (last_nl as u64) - 1;
                         new_file.seek(SeekFrom::End(-(rewind as i64)))?;
+                        *self.discard_fragment_mut(event_source) = false;
+                    } else {
+                        *self.discard_fragment_mut(event_source) = true;
                     }
                     // else: no newline in last 8KB, stay at end
                 }
-                *file = Some(new_file);
+                *self.file_mut(event_source) = Some(new_file);
+                self.record_backlog_bytes(event_source)?;
             }
         }
         Ok(())
@@ -1054,15 +1128,30 @@ impl DirectoryListener for OrderBookListener {
             file.read_to_string(&mut buf)?;
             if !buf.is_empty() {
                 self.process_data(buf, event_source)?;
+                self.record_backlog_bytes(event_source)?;
             }
         }
         *self.file_mut(event_source) = Some(File::open(new_file)?);
+        self.record_backlog_bytes(event_source)?;
         Ok(())
     }
 
-    fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()> {
+    fn on_file_modification(&mut self, event_source: EventSource) -> Result<()> {
+        let mut buf = String::new();
+        let file = self.file_mut(event_source).as_mut().ok_or("No file being tracked")?;
+        file.read_to_string(&mut buf)?;
+        self.process_data(buf, event_source)?;
+        self.record_backlog_bytes(event_source)?;
+        Ok(())
+    }
+
+    fn process_data(&mut self, mut data: String, event_source: EventSource) -> Result<()> {
         let total_len = data.len();
         self.progress.record_read(event_source, total_len);
+        if !self.discard_initial_fragment_if_needed(&mut data, event_source) {
+            return Ok(());
+        }
+        let mut last_source_times: Option<(u64, u64)> = None;
         let lines = data.lines();
         for line in lines {
             if line.is_empty() {
@@ -1105,8 +1194,23 @@ impl DirectoryListener for OrderBookListener {
                     break;
                 }
             };
+            let source_label = ingest_source_label(event_source);
+            crate::metrics::observe_ingest_source_gossip(
+                source_label,
+                Duration::from_millis(local_time_ms.saturating_sub(block_time_ms)),
+            );
+            crate::metrics::set_ingest_file_tail_lag(
+                source_label,
+                Duration::from_millis(now_ms().saturating_sub(local_time_ms)),
+            );
             self.last_batch_block_time_ms = Some(block_time_ms);
             self.last_batch_local_time_ms = Some(local_time_ms);
+            last_source_times = Some((block_time_ms, local_time_ms));
+            match event_source {
+                EventSource::Fills => self.last_fill_height = Some(height),
+                EventSource::OrderStatuses => self.last_status_height = Some(height),
+                EventSource::OrderDiffs => self.last_diff_height = Some(height),
+            }
             self.progress.record_row(event_source, height);
             if let Err(err) = self.receive_batch(event_batch) {
                 self.order_book_state = None;
@@ -1114,12 +1218,39 @@ impl DirectoryListener for OrderBookListener {
             }
             let _reported = self.progress.report_if_due();
         }
+        let snapshot_source = ingest_source_label(event_source);
+        let snapshot_start = Instant::now();
         let snapshot = self.l2_snapshots(true);
+        crate::metrics::observe_tob_snapshot_compute(snapshot_source, snapshot_start.elapsed());
         if let Some(snapshot) = snapshot {
+            let snapshot_height = self.order_book_state.as_ref().map(OrderBookState::height).unwrap_or(0);
+            let latest_heights = self.ingest_heights();
+            let (source_block_time_ms, source_local_time_ms) = last_source_times.unwrap_or((snapshot.0, snapshot.0));
+            crate::metrics::observe_tob_snapshot_enqueue_lag(
+                snapshot_source,
+                Duration::from_millis(now_ms().saturating_sub(snapshot.0)),
+            );
+            crate::metrics::observe_tob_snapshot_source_block_lag(
+                snapshot_source,
+                Duration::from_millis(source_block_time_ms.saturating_sub(snapshot.0)),
+            );
+            crate::metrics::observe_tob_snapshot_validator_write_lag(
+                snapshot_source,
+                Duration::from_millis(source_local_time_ms.saturating_sub(source_block_time_ms)),
+            );
             if let Some(tx) = &self.internal_message_tx {
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
+                    let snapshot = Arc::new(InternalMessage::Snapshot {
+                        l2_snapshots: snapshot.1,
+                        time: snapshot.0,
+                        height: snapshot_height,
+                        source: snapshot_source,
+                        source_block_time_ms,
+                        source_local_time_ms,
+                        latest_heights,
+                        enqueued_at_ms: now_ms(),
+                    });
                     let _unused = tx.send(snapshot);
                 });
             }
@@ -1142,11 +1273,33 @@ pub(crate) struct TimedSnapshots {
     pub(crate) snapshot: Snapshots<InnerL4Order>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct IngestHeights {
+    pub(crate) statuses: Option<u64>,
+    pub(crate) diffs: Option<u64>,
+    pub(crate) fills: Option<u64>,
+}
+
 // Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
-    Snapshot { l2_snapshots: L2Snapshots, time: u64 },
-    Fills { batch: Batch<NodeDataFill> },
-    L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
+    Snapshot {
+        l2_snapshots: L2Snapshots,
+        time: u64,
+        height: u64,
+        source: &'static str,
+        source_block_time_ms: u64,
+        source_local_time_ms: u64,
+        latest_heights: IngestHeights,
+        enqueued_at_ms: u64,
+    },
+    Fills {
+        batch: Batch<NodeDataFill>,
+        enqueued_at_ms: u64,
+    },
+    L4BookUpdates {
+        diff_batch: Batch<NodeDataOrderDiff>,
+        status_batch: Batch<NodeDataOrderStatus>,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq, Hash)]
@@ -1399,5 +1552,29 @@ mod instrument_reset_recovery_tests {
         drop(mkt_tx);
         drop(tokio::time::timeout(Duration::from_secs(1), mkt_handle).await);
         snap_handle.abort();
+    }
+
+    #[test]
+    fn startup_tail_fragment_is_discarded_until_next_jsonl_boundary() {
+        let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Stream);
+        *listener.discard_fragment_mut(EventSource::OrderStatuses) = true;
+
+        let mut data = "partial status row suffix\n{\"local_time\":\"ok\"}\n".to_string();
+        assert!(listener.discard_initial_fragment_if_needed(&mut data, EventSource::OrderStatuses));
+
+        assert_eq!(data, "{\"local_time\":\"ok\"}\n");
+        assert!(!*listener.discard_fragment_mut(EventSource::OrderStatuses));
+    }
+
+    #[test]
+    fn startup_tail_fragment_without_newline_is_dropped_without_rewind() {
+        let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Stream);
+        *listener.discard_fragment_mut(EventSource::OrderStatuses) = true;
+
+        let mut data = "partial status row suffix".to_string();
+        assert!(!listener.discard_initial_fragment_if_needed(&mut data, EventSource::OrderStatuses));
+
+        assert_eq!(data, "partial status row suffix");
+        assert!(*listener.discard_fragment_mut(EventSource::OrderStatuses));
     }
 }

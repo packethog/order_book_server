@@ -52,6 +52,52 @@ If you want logging, prepend the command with `RUST_LOG=info`.
 
 The WebSocket server comes with compression built-in. The compression ratio can be tuned using the `--websocket-compression-level` flag.
 
+## Metrics
+
+The publisher exposes Prometheus metrics on a separate HTTP listener by default:
+
+```bash
+curl http://127.0.0.1:9090/metrics
+```
+
+Metrics are enabled unless `--disable-metrics` is set. Use `--metrics-address` and `--metrics-port` to move the listener, for example:
+
+```bash
+cargo run --release --bin dz_hl_publisher -- \
+  --address 0.0.0.0 --port 8000 \
+  --metrics-address 0.0.0.0 \
+  --metrics-port 9090
+```
+
+The metric families focus on multicast hot paths: listener latency phases, per-source ingest delay/backlog, TOB queue/source-lag/send timing, TOB packet and suppression counters, DOB queue/encode/send timing, and DOB channel drops. Labels intentionally stay low-cardinality and do not include coins, order IDs, instruments, block heights, or websocket subscriptions.
+
+### Metric reference
+
+All duration metrics are exported in seconds. Log summaries may render the same values in milliseconds or microseconds.
+
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `orderbook_listener_latency_seconds` | `phase=gossip\|hl_to_wake\|process\|e2e` | Listener-side latency measured from parsed HL timestamps and local processing. `gossip` is `local_time - block_time`, `hl_to_wake` is validator row `local_time` to publisher wake-up, `process` is local drain/apply time, and `e2e` is block time through local processing completion. |
+| `orderbook_ingest_source_gossip_seconds` | `source=statuses\|diffs\|fills` | Per-source `local_time - block_time` from the HL JSONL wrapper. If this is high while file mtime lag and backlog are low, the validator is already writing late rows. |
+| `orderbook_ingest_file_tail_lag_seconds` | `source=statuses\|diffs\|fills` | Current wall-clock lag of the newest processed row: `now - local_time`. This answers “how stale is the latest row we have consumed?” |
+| `orderbook_ingest_file_mtime_lag_seconds` | `source=statuses\|diffs\|fills` | Time between the file modification timestamp and publisher processing. High values point at file notification, scheduling, or reader contention after the validator has written the file. |
+| `orderbook_ingest_backlog_bytes` | `source=statuses\|diffs\|fills` | Unread bytes remaining in the tailed file after a drain pass. Sustained non-zero backlog means the publisher is not keeping up with disk output. |
+| `orderbook_tob_snapshot_source_block_lag_seconds` | `source=statuses\|diffs\|fills` | For TOB snapshots, source-row block time minus emitted snapshot block time. High values mean the book snapshot itself is behind the newest ingested source rows, often due to streaming block finalization grace. |
+| `orderbook_tob_snapshot_validator_write_lag_seconds` | `source=statuses\|diffs\|fills` | For rows that trigger TOB snapshot enqueue, `local_time - block_time`. High values mean the validator wrote that source row late. |
+| `orderbook_tob_snapshot_listener_to_publisher_seconds` | `source=statuses\|diffs\|fills` | For TOB snapshots, source-row `local_time` to TOB publisher receive time. This includes local listener/apply/finalization work plus internal enqueue/receive time. |
+| `orderbook_tob_queue_delay_seconds` | `message_type=snapshot\|fill` | Time TOB messages spend between listener enqueue and TOB publisher receive. High values indicate internal publisher contention before packet encoding/sending. |
+| `orderbook_tob_source_lag_seconds` | `message_type=snapshot\|fill`, `decision=published\|suppressed` | Source age at the TOB freshness decision. `suppressed` means the message was older than the TOB freshness threshold and quote/trade marketdata was intentionally not published. |
+| `orderbook_tob_socket_send_seconds` | `channel=marketdata\|refdata` | Time spent in UDP send calls for TOB packets. High values suggest socket/kernel/network backpressure. |
+| `orderbook_tob_packets_total` | `message_type=quote\|trade\|heartbeat\|channel_reset\|instrument_definition\|manifest_summary` | Count of TOB multicast packets sent by packet/message class. |
+| `orderbook_tob_suppressed_total` | `message_type=snapshot\|fill` | Count of TOB source messages suppressed by stale-source freshness checks. Heartbeats and refdata can still be emitted while marketdata is suppressed. |
+| `orderbook_tob_receiver_lag_total` | `kind=event\|message` | Internal broadcast receiver lag seen by the TOB publisher. `event` counts lag occurrences; `message` counts dropped internal broadcast messages reported by Tokio. |
+| `orderbook_dob_queue_delay_seconds` | `event_type=order_add\|order_cancel\|order_execute\|batch_boundary\|instrument_reset\|heartbeat` | Time DOB events spend between apply/tap enqueue and DOB emitter receive. High values indicate contention before DOB encoding. |
+| `orderbook_dob_encode_seconds` | `event_type=...` | Time spent packing DOB events into multicast frames. |
+| `orderbook_dob_socket_send_seconds` | `stream=mktdata\|refdata\|snapshot` | Time spent in UDP send calls for DOB packets. |
+| `orderbook_dob_channel_drops_total` | `reason=full\|closed`, `event_type=...` | Count of DOB events dropped before reaching the emitter because the bounded channel was full or closed. Any sustained increase is a correctness/health issue. |
+
+For latency triage, start with the ingest split. High `orderbook_ingest_source_gossip_seconds` with low `orderbook_ingest_file_mtime_lag_seconds` and near-zero `orderbook_ingest_backlog_bytes` points to validator or upstream HL delay. Low source gossip with high file mtime lag or growing backlog points to publisher-side wake/drain contention. If ingest looks fresh but `orderbook_tob_queue_delay_seconds` or `orderbook_dob_queue_delay_seconds` is high, the bottleneck is inside multicast publishing.
+
 ## Multicast
 
 The server can optionally publish market data as UDP multicast datagrams alongside the WebSocket feed. This is useful for distributing L2 book updates and trades over a multicast-capable network such as [DoubleZero](https://docs.doublezero.io/).

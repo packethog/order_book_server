@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::{info, warn};
 use tokio::net::UdpSocket;
@@ -52,6 +52,220 @@ impl DefinitionCycler {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TobSuppressedKind {
+    Snapshot,
+    Fill,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TobHealthLevel {
+    Info,
+    Warn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TobHealthReport {
+    level: TobHealthLevel,
+    last_source_lag_ms: u64,
+    source_lag_min_ms: u64,
+    source_lag_avg_ms: u64,
+    source_lag_max_ms: u64,
+    queue_delay_min_ms: u64,
+    queue_delay_avg_ms: u64,
+    queue_delay_max_ms: u64,
+    suppressed_snapshots: u64,
+    suppressed_fills: u64,
+    receiver_lag_events: u64,
+    receiver_lagged_messages: u64,
+    last_suppressed_snapshot: Option<TobSuppressedSnapshot>,
+    last_suppressed_fill: Option<TobSuppressedFill>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TobSuppressedSnapshot {
+    source: &'static str,
+    height: u64,
+    block_time_ms: u64,
+    source_block_time_ms: u64,
+    source_local_time_ms: u64,
+    source_lag_ms: u64,
+    snapshot_to_source_block_lag_ms: u64,
+    validator_write_lag_ms: u64,
+    listener_to_publisher_ms: u64,
+    queue_delay_ms: u64,
+    latest_status_height: Option<u64>,
+    latest_diff_height: Option<u64>,
+    latest_fill_height: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TobSuppressedFill {
+    height: u64,
+    block_time_ms: u64,
+    local_time_ms: u64,
+    source_lag_ms: u64,
+    validator_write_lag_ms: u64,
+    listener_to_publisher_ms: u64,
+    queue_delay_ms: u64,
+    event_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IntervalStats {
+    min: u64,
+    max: u64,
+    sum: u64,
+    count: u64,
+}
+
+impl IntervalStats {
+    const fn new() -> Self {
+        Self { min: u64::MAX, max: 0, sum: 0, count: 0 }
+    }
+
+    fn record(&mut self, value: u64) {
+        self.min = self.min.min(value);
+        self.max = self.max.max(value);
+        self.sum = self.sum.saturating_add(value);
+        self.count = self.count.saturating_add(1);
+    }
+
+    const fn snapshot(&self) -> (u64, u64, u64) {
+        if self.count == 0 { (0, 0, 0) } else { (self.min, self.sum / self.count, self.max) }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+#[derive(Debug)]
+struct TobPublisherHealth {
+    last_source_lag_ms: Option<u64>,
+    source_lag_stats: IntervalStats,
+    queue_delay_stats: IntervalStats,
+    suppressed_snapshots: u64,
+    suppressed_fills: u64,
+    receiver_lag_events: u64,
+    receiver_lagged_messages: u64,
+    last_suppressed_snapshot: Option<TobSuppressedSnapshot>,
+    last_suppressed_fill: Option<TobSuppressedFill>,
+    last_report_ms: u64,
+}
+
+impl TobPublisherHealth {
+    const REPORT_INTERVAL_MS: u64 = 5_000;
+
+    const fn new(now_ms: u64) -> Self {
+        Self {
+            last_source_lag_ms: None,
+            source_lag_stats: IntervalStats::new(),
+            queue_delay_stats: IntervalStats::new(),
+            suppressed_snapshots: 0,
+            suppressed_fills: 0,
+            receiver_lag_events: 0,
+            receiver_lagged_messages: 0,
+            last_suppressed_snapshot: None,
+            last_suppressed_fill: None,
+            last_report_ms: now_ms,
+        }
+    }
+
+    fn record_source_lag(&mut self, lag_ms: u64) {
+        self.last_source_lag_ms = Some(lag_ms);
+        self.source_lag_stats.record(lag_ms);
+    }
+
+    fn observe_publishable_lag(&mut self, lag_ms: u64) {
+        self.record_source_lag(lag_ms);
+    }
+
+    fn record_queue_delay(&mut self, delay_ms: u64) {
+        self.queue_delay_stats.record(delay_ms);
+    }
+
+    fn record_suppressed(
+        &mut self,
+        kind: TobSuppressedKind,
+        lag_ms: u64,
+        now_ms: u64,
+        snapshot: Option<TobSuppressedSnapshot>,
+        fill: Option<TobSuppressedFill>,
+    ) -> Option<TobHealthReport> {
+        self.record_source_lag(lag_ms);
+        match kind {
+            TobSuppressedKind::Snapshot => {
+                self.suppressed_snapshots += 1;
+                self.last_suppressed_snapshot = snapshot;
+            }
+            TobSuppressedKind::Fill => {
+                self.suppressed_fills += 1;
+                self.last_suppressed_fill = fill;
+            }
+        }
+        self.report_if_due(now_ms)
+    }
+
+    fn record_receiver_lag(&mut self, lagged_messages: u64, now_ms: u64) -> Option<TobHealthReport> {
+        self.receiver_lag_events += 1;
+        self.receiver_lagged_messages += lagged_messages;
+        self.report_if_due(now_ms)
+    }
+
+    fn report_if_due(&mut self, now_ms: u64) -> Option<TobHealthReport> {
+        if now_ms.saturating_sub(self.last_report_ms) < Self::REPORT_INTERVAL_MS {
+            return None;
+        }
+        self.take_report(now_ms)
+    }
+
+    fn take_report(&mut self, now_ms: u64) -> Option<TobHealthReport> {
+        let has_suppression = self.suppressed_snapshots > 0 || self.suppressed_fills > 0;
+        let has_receiver_lag = self.receiver_lag_events > 0 || self.receiver_lagged_messages > 0;
+        if !has_suppression && !has_receiver_lag {
+            self.last_report_ms = now_ms;
+            return None;
+        }
+
+        let last_source_lag_ms = self.last_source_lag_ms.unwrap_or(0);
+        let (source_lag_min_ms, source_lag_avg_ms, source_lag_max_ms) = self.source_lag_stats.snapshot();
+        let (queue_delay_min_ms, queue_delay_avg_ms, queue_delay_max_ms) = self.queue_delay_stats.snapshot();
+        let level = if has_receiver_lag && MulticastPublisher::should_warn_for_receiver_lag(last_source_lag_ms) {
+            TobHealthLevel::Warn
+        } else {
+            TobHealthLevel::Info
+        };
+        let report = TobHealthReport {
+            level,
+            last_source_lag_ms,
+            source_lag_min_ms,
+            source_lag_avg_ms,
+            source_lag_max_ms,
+            queue_delay_min_ms,
+            queue_delay_avg_ms,
+            queue_delay_max_ms,
+            suppressed_snapshots: self.suppressed_snapshots,
+            suppressed_fills: self.suppressed_fills,
+            receiver_lag_events: self.receiver_lag_events,
+            receiver_lagged_messages: self.receiver_lagged_messages,
+            last_suppressed_snapshot: self.last_suppressed_snapshot,
+            last_suppressed_fill: self.last_suppressed_fill,
+        };
+
+        self.suppressed_snapshots = 0;
+        self.suppressed_fills = 0;
+        self.receiver_lag_events = 0;
+        self.receiver_lagged_messages = 0;
+        self.last_suppressed_snapshot = None;
+        self.last_suppressed_fill = None;
+        self.source_lag_stats.reset();
+        self.queue_delay_stats.reset();
+        self.last_report_ms = now_ms;
+        Some(report)
+    }
+}
+
 pub(crate) struct MulticastPublisher {
     socket: UdpSocket,
     config: MulticastConfig,
@@ -72,12 +286,19 @@ impl MulticastPublisher {
     const CATCHUP_THRESHOLD_MS: u64 = 500;
 
     #[cfg(test)]
+    const CATCHUP_THRESHOLD_MS: u64 = 500;
+
+    #[cfg(test)]
     fn should_publish_lag(_lag_ms: u64) -> bool {
         true
     }
 
     #[cfg(not(test))]
     fn should_publish_lag(lag_ms: u64) -> bool {
+        lag_ms <= Self::CATCHUP_THRESHOLD_MS
+    }
+
+    fn should_warn_for_receiver_lag(lag_ms: u64) -> bool {
         lag_ms <= Self::CATCHUP_THRESHOLD_MS
     }
 
@@ -91,27 +312,105 @@ impl MulticastPublisher {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
     }
 
-    fn log_catchup_progress(kind: &str, lag_ms: u64, last_log_ms: &mut u64) {
-        let now = Self::now_ms();
-        if now.saturating_sub(*last_log_ms) >= 5_000 {
-            let lag_s = lag_ms / 1_000;
-            info!("multicast: catching up, suppressing {kind} (lag {lag_s}s)");
-            *last_log_ms = now;
+    fn log_tob_health(report: TobHealthReport) {
+        match report.level {
+            TobHealthLevel::Info => {
+                info!(
+                    "tob marketdata suppressed: source_lag_ms min/avg/max={}/{}/{} publisher_queue_ms min/avg/max={}/{}/{} suppressed_snapshots={} suppressed_fills={} receiver_lag_events={} receiver_lagged_messages={}",
+                    report.source_lag_min_ms,
+                    report.source_lag_avg_ms,
+                    report.source_lag_max_ms,
+                    report.queue_delay_min_ms,
+                    report.queue_delay_avg_ms,
+                    report.queue_delay_max_ms,
+                    report.suppressed_snapshots,
+                    report.suppressed_fills,
+                    report.receiver_lag_events,
+                    report.receiver_lagged_messages,
+                );
+                if let Some(snapshot) = report.last_suppressed_snapshot {
+                    info!("{}", Self::format_suppressed_snapshot(snapshot));
+                }
+                if let Some(fill) = report.last_suppressed_fill {
+                    info!("{}", Self::format_suppressed_fill(fill));
+                }
+            }
+            TobHealthLevel::Warn => {
+                warn!(
+                    "tob receiver lagged while fresh: dropped_messages={} lag_events={} source_lag_ms={} source_lag_ms min/avg/max={}/{}/{} publisher_queue_ms min/avg/max={}/{}/{} suppressed_snapshots={} suppressed_fills={}",
+                    report.receiver_lagged_messages,
+                    report.receiver_lag_events,
+                    report.last_source_lag_ms,
+                    report.source_lag_min_ms,
+                    report.source_lag_avg_ms,
+                    report.source_lag_max_ms,
+                    report.queue_delay_min_ms,
+                    report.queue_delay_avg_ms,
+                    report.queue_delay_max_ms,
+                    report.suppressed_snapshots,
+                    report.suppressed_fills,
+                );
+                if let Some(snapshot) = report.last_suppressed_snapshot {
+                    warn!("{}", Self::format_suppressed_snapshot(snapshot));
+                }
+                if let Some(fill) = report.last_suppressed_fill {
+                    warn!("{}", Self::format_suppressed_fill(fill));
+                }
+            }
         }
     }
 
-    async fn send_frame(&self, frame: &[u8], dest: SocketAddr) {
+    fn format_suppressed_snapshot(snapshot: TobSuppressedSnapshot) -> String {
+        format!(
+            "tob suppressed snapshot detail: source={} height={} block_time_ms={} minute_phase_ms={} source_block_time_ms={} source_local_time_ms={} source_lag_ms={} snapshot_to_source_block_lag_ms={} validator_write_lag_ms={} listener_to_publisher_ms={} publisher_queue_ms={} latest_heights statuses={:?} diffs={:?} fills={:?}",
+            snapshot.source,
+            snapshot.height,
+            snapshot.block_time_ms,
+            snapshot.block_time_ms % 60_000,
+            snapshot.source_block_time_ms,
+            snapshot.source_local_time_ms,
+            snapshot.source_lag_ms,
+            snapshot.snapshot_to_source_block_lag_ms,
+            snapshot.validator_write_lag_ms,
+            snapshot.listener_to_publisher_ms,
+            snapshot.queue_delay_ms,
+            snapshot.latest_status_height,
+            snapshot.latest_diff_height,
+            snapshot.latest_fill_height,
+        )
+    }
+
+    fn format_suppressed_fill(fill: TobSuppressedFill) -> String {
+        format!(
+            "tob suppressed fill detail: height={} block_time_ms={} minute_phase_ms={} local_time_ms={} source_lag_ms={} validator_write_lag_ms={} listener_to_publisher_ms={} publisher_queue_ms={} event_count={}",
+            fill.height,
+            fill.block_time_ms,
+            fill.block_time_ms % 60_000,
+            fill.local_time_ms,
+            fill.source_lag_ms,
+            fill.validator_write_lag_ms,
+            fill.listener_to_publisher_ms,
+            fill.queue_delay_ms,
+            fill.event_count,
+        )
+    }
+
+    async fn send_frame(&self, frame: &[u8], dest: SocketAddr, channel: &'static str, packet_type: &'static str) {
+        let start = Instant::now();
         if let Err(err) = self.socket.send_to(frame, dest).await {
             warn!("multicast: failed to send frame to {dest}: {err}");
+        } else {
+            crate::metrics::inc_tob_packet(packet_type);
         }
+        crate::metrics::observe_tob_socket_send(channel, start.elapsed());
     }
 
-    async fn send_channel_reset(&self, dest: SocketAddr) {
+    async fn send_channel_reset(&self, dest: SocketAddr, channel: &'static str) {
         let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
         let buf = fb.message_buffer(CHANNEL_RESET_SIZE).expect("ChannelReset fits in empty frame");
         encode_channel_reset(buf, Self::now_ns());
         fb.commit_message();
-        self.send_frame(fb.finalize(), dest).await;
+        self.send_frame(fb.finalize(), dest, channel, "channel_reset").await;
     }
 
     async fn send_heartbeat(&self) {
@@ -119,7 +418,7 @@ impl MulticastPublisher {
         let buf = fb.message_buffer(HEARTBEAT_SIZE).expect("Heartbeat fits in empty frame");
         encode_heartbeat(buf, 0, Self::now_ns());
         fb.commit_message();
-        self.send_frame(fb.finalize(), self.config.dest()).await;
+        self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "heartbeat").await;
     }
 
     async fn send_end_of_session(&self) {
@@ -127,7 +426,7 @@ impl MulticastPublisher {
         let buf = fb.message_buffer(END_OF_SESSION_SIZE).expect("EndOfSession fits in empty frame");
         encode_end_of_session(buf, Self::now_ns());
         fb.commit_message();
-        self.send_frame(fb.finalize(), self.config.dest()).await;
+        self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "end_of_session").await;
     }
 
     /// Sends a ManifestSummary on the refdata port.
@@ -141,7 +440,7 @@ impl MulticastPublisher {
         let buf = fb.message_buffer(MANIFEST_SUMMARY_SIZE).expect("ManifestSummary fits in empty frame");
         encode_manifest_summary(buf, 0, seq_tag, count, Self::now_ns());
         fb.commit_message();
-        self.send_frame(fb.finalize(), self.config.refdata_dest()).await;
+        self.send_frame(fb.finalize(), self.config.refdata_dest(), "refdata", "manifest_summary").await;
     }
 
     /// Computes how many InstrumentDefinition messages we should emit per cycle tick.
@@ -149,7 +448,7 @@ impl MulticastPublisher {
     /// Spreads the full active set evenly across `definition_cycle`. Returns the
     /// per-tick count such that (count * ticks_per_cycle) covers all instruments.
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
-    fn defs_per_tick(&self, total: usize, tick_interval: std::time::Duration) -> usize {
+    fn defs_per_tick(&self, total: usize, tick_interval: Duration) -> usize {
         if total == 0 {
             return 0;
         }
@@ -183,7 +482,8 @@ impl MulticastPublisher {
                 }
                 Err(FrameError::ExceedsMtu { .. } | FrameError::MaxMessages) => {
                     if !fb.is_empty() {
-                        self.send_frame(fb.finalize(), self.config.refdata_dest()).await;
+                        self.send_frame(fb.finalize(), self.config.refdata_dest(), "refdata", "instrument_definition")
+                            .await;
                     }
                     fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
                     // Retry: a fresh frame is guaranteed to fit one message.
@@ -197,7 +497,7 @@ impl MulticastPublisher {
         }
 
         if !fb.is_empty() {
-            self.send_frame(fb.finalize(), self.config.refdata_dest()).await;
+            self.send_frame(fb.finalize(), self.config.refdata_dest(), "refdata", "instrument_definition").await;
         }
     }
 
@@ -312,7 +612,7 @@ impl MulticastPublisher {
                 }
                 Err(FrameError::ExceedsMtu { .. } | FrameError::MaxMessages) => {
                     if !fb.is_empty() {
-                        self.send_frame(fb.finalize(), self.config.dest()).await;
+                        self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "quote").await;
                     }
                     fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
                     let buf = fb.message_buffer(QUOTE_SIZE).expect("Quote fits in empty frame");
@@ -323,7 +623,7 @@ impl MulticastPublisher {
         }
 
         if !fb.is_empty() {
-            self.send_frame(fb.finalize(), self.config.dest()).await;
+            self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "quote").await;
         }
     }
 
@@ -369,7 +669,7 @@ impl MulticastPublisher {
                     }
                     Err(FrameError::ExceedsMtu { .. } | FrameError::MaxMessages) => {
                         if !fb.is_empty() {
-                            self.send_frame(fb.finalize(), self.config.dest()).await;
+                            self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "trade").await;
                         }
                         fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
                         let buf = fb.message_buffer(TRADE_SIZE).expect("Trade fits in empty frame");
@@ -381,7 +681,7 @@ impl MulticastPublisher {
         }
 
         if !fb.is_empty() {
-            self.send_frame(fb.finalize(), self.config.dest()).await;
+            self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "trade").await;
         }
     }
 
@@ -398,8 +698,8 @@ impl MulticastPublisher {
         );
 
         // Send ChannelReset on both ports at startup.
-        self.send_channel_reset(self.config.dest()).await;
-        self.send_channel_reset(self.config.refdata_dest()).await;
+        self.send_channel_reset(self.config.dest(), "marketdata").await;
+        self.send_channel_reset(self.config.refdata_dest(), "refdata").await;
 
         // Marketdata timers
         let mut snapshot_interval = tokio::time::interval(self.config.snapshot_interval);
@@ -415,7 +715,7 @@ impl MulticastPublisher {
         // Definition cycle tick: we want to emit one "batch" per tick so that frames
         // spread across the cycle. Tick rate = cycle / ceil(total / per_frame).
         // Use a fixed-ish tick (default: cycle / 20) so behavior is independent of registry size.
-        let def_tick_interval = self.config.definition_cycle.div_f64(20.0).max(std::time::Duration::from_millis(500));
+        let def_tick_interval = self.config.definition_cycle.div_f64(20.0).max(Duration::from_millis(500));
         let mut definition_interval = tokio::time::interval(def_tick_interval);
         definition_interval.tick().await;
 
@@ -423,7 +723,7 @@ impl MulticastPublisher {
         let mut cached_snapshot: Option<Arc<InternalMessage>> = None;
         let mut had_activity = false;
         let mut caught_up = false;
-        let mut last_catchup_log_ms: u64 = 0;
+        let mut health = TobPublisherHealth::new(Self::now_ms());
 
         // Definition cycler state
         let mut cycler = DefinitionCycler::empty();
@@ -433,10 +733,37 @@ impl MulticastPublisher {
                 result = rx.recv() => {
                     match result {
                         Ok(msg) => match msg.as_ref() {
-                            InternalMessage::Snapshot { l2_snapshots, time } => {
+                            InternalMessage::Snapshot {
+                                l2_snapshots,
+                                time,
+                                height,
+                                source,
+                                source_block_time_ms,
+                                source_local_time_ms,
+                                latest_heights,
+                                enqueued_at_ms,
+                            } => {
                                 cached_snapshot = Some(msg.clone());
-                                let lag_ms = Self::now_ms().saturating_sub(*time);
+                                let now_ms = Self::now_ms();
+                                let queue_delay_ms = now_ms.saturating_sub(*enqueued_at_ms);
+                                let listener_to_publisher_ms = now_ms.saturating_sub(*source_local_time_ms);
+                                health.record_queue_delay(queue_delay_ms);
+                                crate::metrics::observe_tob_queue_delay(
+                                    "snapshot",
+                                    Duration::from_millis(queue_delay_ms),
+                                );
+                                crate::metrics::observe_tob_snapshot_listener_to_publisher(
+                                    source,
+                                    Duration::from_millis(listener_to_publisher_ms),
+                                );
+                                let lag_ms = now_ms.saturating_sub(*time);
                                 if Self::should_publish_lag(lag_ms) {
+                                    health.observe_publishable_lag(lag_ms);
+                                    crate::metrics::observe_tob_source_lag(
+                                        "snapshot",
+                                        "published",
+                                        Duration::from_millis(lag_ms),
+                                    );
                                     if !caught_up {
                                         info!("multicast: caught up (lag {lag_ms}ms), publishing quotes");
                                         caught_up = true;
@@ -446,16 +773,84 @@ impl MulticastPublisher {
                                     had_activity = true;
                                     heartbeat_interval.reset();
                                 } else {
-                                    Self::log_catchup_progress("quotes", lag_ms, &mut last_catchup_log_ms);
+                                    caught_up = false;
+                                    crate::metrics::observe_tob_source_lag(
+                                        "snapshot",
+                                        "suppressed",
+                                        Duration::from_millis(lag_ms),
+                                    );
+                                    crate::metrics::inc_tob_suppressed("snapshot");
+                                    let snapshot = TobSuppressedSnapshot {
+                                        source: *source,
+                                        height: *height,
+                                        block_time_ms: *time,
+                                        source_block_time_ms: *source_block_time_ms,
+                                        source_local_time_ms: *source_local_time_ms,
+                                        source_lag_ms: lag_ms,
+                                        snapshot_to_source_block_lag_ms: (*source_block_time_ms).saturating_sub(*time),
+                                        validator_write_lag_ms: (*source_local_time_ms)
+                                            .saturating_sub(*source_block_time_ms),
+                                        listener_to_publisher_ms,
+                                        queue_delay_ms,
+                                        latest_status_height: latest_heights.statuses,
+                                        latest_diff_height: latest_heights.diffs,
+                                        latest_fill_height: latest_heights.fills,
+                                    };
+                                    if let Some(report) = health.record_suppressed(
+                                        TobSuppressedKind::Snapshot,
+                                        lag_ms,
+                                        now_ms,
+                                        Some(snapshot),
+                                        None,
+                                    ) {
+                                        Self::log_tob_health(report);
+                                    }
                                 }
                             }
-                            InternalMessage::Fills { batch } => {
-                                let lag_ms = Self::now_ms().saturating_sub(batch.block_time());
+                            InternalMessage::Fills { batch, enqueued_at_ms } => {
+                                let now_ms = Self::now_ms();
+                                let queue_delay_ms = now_ms.saturating_sub(*enqueued_at_ms);
+                                health.record_queue_delay(queue_delay_ms);
+                                crate::metrics::observe_tob_queue_delay("fill", Duration::from_millis(queue_delay_ms));
+                                let lag_ms = now_ms.saturating_sub(batch.block_time());
                                 if Self::should_publish_lag(lag_ms) {
+                                    health.observe_publishable_lag(lag_ms);
+                                    crate::metrics::observe_tob_source_lag(
+                                        "fill",
+                                        "published",
+                                        Duration::from_millis(lag_ms),
+                                    );
                                     let trades_by_coin = crate::servers::websocket_server::coin_to_trades(batch);
                                     self.publish_trades(&trades_by_coin).await;
                                     had_activity = true;
                                     heartbeat_interval.reset();
+                                } else {
+                                    let local_time_ms = batch.local_time_ms();
+                                    let fill = TobSuppressedFill {
+                                        height: batch.block_number(),
+                                        block_time_ms: batch.block_time(),
+                                        local_time_ms,
+                                        source_lag_ms: lag_ms,
+                                        validator_write_lag_ms: local_time_ms.saturating_sub(batch.block_time()),
+                                        listener_to_publisher_ms: now_ms.saturating_sub(local_time_ms),
+                                        queue_delay_ms,
+                                        event_count: batch.events_ref().len(),
+                                    };
+                                    crate::metrics::observe_tob_source_lag(
+                                        "fill",
+                                        "suppressed",
+                                        Duration::from_millis(lag_ms),
+                                    );
+                                    crate::metrics::inc_tob_suppressed("fill");
+                                    if let Some(report) = health.record_suppressed(
+                                        TobSuppressedKind::Fill,
+                                        lag_ms,
+                                        now_ms,
+                                        None,
+                                        Some(fill),
+                                    ) {
+                                        Self::log_tob_health(report);
+                                    }
                                 }
                                 // fills are high volume during catchup; progress
                                 // is already logged by the snapshot path above
@@ -465,7 +860,11 @@ impl MulticastPublisher {
                             }
                         },
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            warn!("multicast: broadcast receiver lagged by {n} messages");
+                            crate::metrics::inc_tob_receiver_lag("event", 1);
+                            crate::metrics::inc_tob_receiver_lag("message", n);
+                            if let Some(report) = health.record_receiver_lag(n, Self::now_ms()) {
+                                Self::log_tob_health(report);
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             warn!("multicast: broadcast channel closed, sending EndOfSession");
@@ -477,7 +876,7 @@ impl MulticastPublisher {
                 _ = snapshot_interval.tick() => {
                     if caught_up {
                         if let Some(ref cached) = cached_snapshot
-                            && let InternalMessage::Snapshot { l2_snapshots, time } = cached.as_ref() {
+                            && let InternalMessage::Snapshot { l2_snapshots, time, .. } = cached.as_ref() {
                                 self.publish_quotes(l2_snapshots.as_ref(), *time, true).await;
                                 had_activity = true;
                                 heartbeat_interval.reset();
@@ -621,9 +1020,9 @@ mod tests {
 
     #[tokio::test]
     async fn sends_channel_reset_on_both_ports_at_startup() {
-        let send_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let marketdata_recv = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let refdata_recv = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let send_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let marketdata_recv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let refdata_recv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         let mut config = test_config();
         config.port = marketdata_recv.local_addr().unwrap().port();
@@ -631,8 +1030,8 @@ mod tests {
 
         let publisher = MulticastPublisher::new(send_socket, config, test_registry());
 
-        publisher.send_channel_reset(publisher.config.dest()).await;
-        publisher.send_channel_reset(publisher.config.refdata_dest()).await;
+        publisher.send_channel_reset(publisher.config.dest(), "marketdata").await;
+        publisher.send_channel_reset(publisher.config.refdata_dest(), "refdata").await;
 
         let mut buf = [0u8; 2048];
 
@@ -656,8 +1055,8 @@ mod tests {
 
     #[tokio::test]
     async fn manifest_summary_carries_registry_state() {
-        let send_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let recv_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let send_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let recv_port = recv_socket.local_addr().unwrap().port();
 
         let mut config = test_config();
@@ -682,8 +1081,8 @@ mod tests {
 
     #[tokio::test]
     async fn definition_batch_emits_instruments() {
-        let send_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let recv_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let send_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let recv_port = recv_socket.local_addr().unwrap().port();
 
         let mut config = test_config();
@@ -709,8 +1108,8 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_sends_valid_frame() {
-        let send_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let recv_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let send_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let recv_addr = recv_socket.local_addr().unwrap();
 
         let mut config = test_config();
@@ -756,5 +1155,94 @@ mod tests {
     fn make_leg_truncation() {
         let leg = make_leg("LONGLONGCOIN");
         assert_eq!(&leg, b"LONGLONG");
+    }
+
+    #[test]
+    fn tob_health_reports_stale_suppression_as_info_and_resets() {
+        let mut health = TobPublisherHealth::new(1_000);
+
+        let snapshot = TobSuppressedSnapshot {
+            source: "diffs",
+            height: 42,
+            block_time_ms: 61_234,
+            source_block_time_ms: 62_000,
+            source_local_time_ms: 62_250,
+            source_lag_ms: 30_000,
+            snapshot_to_source_block_lag_ms: 766,
+            validator_write_lag_ms: 250,
+            listener_to_publisher_ms: 1_000,
+            queue_delay_ms: 4,
+            latest_status_height: Some(43),
+            latest_diff_height: Some(42),
+            latest_fill_height: Some(41),
+        };
+        assert_eq!(health.record_suppressed(TobSuppressedKind::Snapshot, 30_000, 2_000, Some(snapshot), None), None);
+        assert_eq!(health.record_receiver_lag(42, 3_000), None);
+
+        let fill = TobSuppressedFill {
+            height: 43,
+            block_time_ms: 62_345,
+            local_time_ms: 63_000,
+            source_lag_ms: 31_000,
+            validator_write_lag_ms: 655,
+            listener_to_publisher_ms: 30_345,
+            queue_delay_ms: 5,
+            event_count: 2,
+        };
+        let report =
+            health.record_suppressed(TobSuppressedKind::Fill, 31_000, 6_000, None, Some(fill)).expect("report is due");
+
+        assert_eq!(report.level, TobHealthLevel::Info);
+        assert_eq!(report.last_source_lag_ms, 31_000);
+        assert_eq!(report.source_lag_min_ms, 30_000);
+        assert_eq!(report.source_lag_avg_ms, 30_500);
+        assert_eq!(report.source_lag_max_ms, 31_000);
+        assert_eq!(report.suppressed_snapshots, 1);
+        assert_eq!(report.suppressed_fills, 1);
+        assert_eq!(report.receiver_lag_events, 1);
+        assert_eq!(report.receiver_lagged_messages, 42);
+        assert_eq!(report.last_suppressed_snapshot, Some(snapshot));
+        assert_eq!(report.last_suppressed_fill, Some(fill));
+        assert!(MulticastPublisher::format_suppressed_snapshot(snapshot).contains("minute_phase_ms=1234"));
+        assert!(MulticastPublisher::format_suppressed_snapshot(snapshot).contains("listener_to_publisher_ms=1000"));
+        assert!(MulticastPublisher::format_suppressed_fill(fill).contains("event_count=2"));
+
+        assert_eq!(health.take_report(11_000), None);
+    }
+
+    #[test]
+    fn tob_health_warns_when_receiver_lags_while_source_is_fresh() {
+        let mut health = TobPublisherHealth::new(1_000);
+        health.observe_publishable_lag(100);
+        health.record_queue_delay(2);
+        health.record_queue_delay(4);
+
+        let report = health.record_receiver_lag(7, 6_000).expect("report is due");
+
+        assert_eq!(report.level, TobHealthLevel::Warn);
+        assert_eq!(report.last_source_lag_ms, 100);
+        assert_eq!(report.queue_delay_min_ms, 2);
+        assert_eq!(report.queue_delay_avg_ms, 3);
+        assert_eq!(report.queue_delay_max_ms, 4);
+        assert_eq!(report.suppressed_snapshots, 0);
+        assert_eq!(report.suppressed_fills, 0);
+        assert_eq!(report.receiver_lag_events, 1);
+        assert_eq!(report.receiver_lagged_messages, 7);
+    }
+
+    #[test]
+    fn tob_health_coalesces_receiver_lag_events() {
+        let mut health = TobPublisherHealth::new(1_000);
+        health.observe_publishable_lag(10_000);
+
+        assert_eq!(health.record_receiver_lag(3, 2_000), None);
+        assert_eq!(health.record_receiver_lag(5, 3_000), None);
+
+        let report = health.record_receiver_lag(11, 6_000).expect("report is due");
+
+        assert_eq!(report.level, TobHealthLevel::Info);
+        assert_eq!(report.last_source_lag_ms, 10_000);
+        assert_eq!(report.receiver_lag_events, 3);
+        assert_eq!(report.receiver_lagged_messages, 19);
     }
 }

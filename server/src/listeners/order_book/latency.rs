@@ -75,6 +75,11 @@ impl LatencyStats {
         let process_us = process_duration.as_micros() as u64;
         let e2e_ms = now_ms.saturating_sub(block_time_ms);
 
+        crate::metrics::observe_listener_latency("gossip", gossip_ms as f64 / 1_000.0);
+        crate::metrics::observe_listener_latency("hl_to_wake", hl_to_wake_ms as f64 / 1_000.0);
+        crate::metrics::observe_listener_latency("process", process_duration.as_secs_f64());
+        crate::metrics::observe_listener_latency("e2e", e2e_ms as f64 / 1_000.0);
+
         update_bucket(&self.gossip_min, &self.gossip_max, &self.gossip_sum, gossip_ms);
         update_bucket(&self.hl_to_wake_min, &self.hl_to_wake_max, &self.hl_to_wake_sum, hl_to_wake_ms);
         update_bucket(&self.process_min, &self.process_max, &self.process_sum, process_us);

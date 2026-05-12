@@ -1,5 +1,9 @@
 #![allow(unused_crate_dependencies)]
-use std::{net::Ipv4Addr, path::PathBuf, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+    time::Duration,
+};
 
 use clap::{Parser, ValueEnum};
 use server::{DobConfig, IngestMode, MulticastConfig, Result, run_websocket_server};
@@ -134,6 +138,18 @@ struct Args {
     /// the mktdata stream.
     #[arg(long, default_value_t = 1232)]
     dob_snapshot_mtu: u16,
+
+    /// Address for the Prometheus metrics HTTP listener.
+    #[arg(long, default_value_t = Ipv4Addr::LOCALHOST)]
+    metrics_address: Ipv4Addr,
+
+    /// Port for the Prometheus metrics HTTP listener.
+    #[arg(long, default_value_t = 9090)]
+    metrics_port: u16,
+
+    /// Disable the Prometheus metrics HTTP listener.
+    #[arg(long, default_value_t = false)]
+    disable_metrics: bool,
 }
 
 #[tokio::main]
@@ -146,6 +162,14 @@ async fn main() -> Result<()> {
     println!("Running websocket server on {full_address}");
 
     let compression_level = args.websocket_compression_level.unwrap_or(1);
+    if !args.disable_metrics {
+        let metrics_address = SocketAddr::new(IpAddr::V4(args.metrics_address), args.metrics_port);
+        tokio::spawn(async move {
+            if let Err(err) = server::metrics::run_metrics_server(metrics_address).await {
+                eprintln!("metrics server stopped: {err}");
+            }
+        });
+    }
 
     let multicast_config = if let Some(group_addr) = args.multicast_group {
         let Some(bind_addr) = args.multicast_bind_addr else {
@@ -202,4 +226,36 @@ async fn main() -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_cli_defaults_to_localhost_9090_enabled() {
+        let args = Args::parse_from(["dz_hl_publisher", "--address", "127.0.0.1", "--port", "8000"]);
+        assert_eq!(args.metrics_address, Ipv4Addr::LOCALHOST);
+        assert_eq!(args.metrics_port, 9090);
+        assert!(!args.disable_metrics);
+    }
+
+    #[test]
+    fn metrics_cli_accepts_disable_and_custom_address() {
+        let args = Args::parse_from([
+            "dz_hl_publisher",
+            "--address",
+            "127.0.0.1",
+            "--port",
+            "8000",
+            "--metrics-address",
+            "0.0.0.0",
+            "--metrics-port",
+            "19090",
+            "--disable-metrics",
+        ]);
+        assert_eq!(args.metrics_address, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(args.metrics_port, 19090);
+        assert!(args.disable_metrics);
+    }
 }

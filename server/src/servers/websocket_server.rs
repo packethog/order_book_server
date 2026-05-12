@@ -284,7 +284,7 @@ pub async fn run_websocket_server(
             t.tick().await; // skip the first immediate tick
             loop {
                 t.tick().await;
-                if hb_tx.send(DobEvent::HeartbeatTick).await.is_err() {
+                if hb_tx.send(DobEvent::HeartbeatTick.with_enqueue_timestamp()).await.is_err() {
                     break;
                 }
             }
@@ -369,13 +369,13 @@ async fn handle_socket(
                 match recv_result {
                     Ok(msg) => {
                         match msg.as_ref() {
-                            InternalMessage::Snapshot{ l2_snapshots, time } => {
+                            InternalMessage::Snapshot { l2_snapshots, time, .. } => {
                                 universe = new_universe(l2_snapshots, ignore_spot);
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time).await;
                                 }
                             },
-                            InternalMessage::Fills{ batch } => {
+                            InternalMessage::Fills { batch, .. } => {
                                 let mut trades = coin_to_trades(batch);
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_trades(&mut socket, sub, &mut trades).await;

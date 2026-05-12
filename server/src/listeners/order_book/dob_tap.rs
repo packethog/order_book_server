@@ -142,12 +142,15 @@ impl DobApplyTap {
     }
 
     fn try_send(&self, event: DobEvent, label: &'static str) {
-        match self.sender.try_send(event) {
+        let event_type = event.event_type_label();
+        match self.sender.try_send(event.with_enqueue_timestamp()) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
+                crate::metrics::inc_dob_channel_drop("full", event_type);
                 log::warn!("dob_tap: channel full, dropping {label}");
             }
             Err(TrySendError::Closed(_)) => {
+                crate::metrics::inc_dob_channel_drop("closed", event_type);
                 log::error!("dob_tap: emitter channel closed, dropping {label}");
             }
         }
@@ -199,6 +202,13 @@ mod tests {
         }
     }
 
+    fn unwrap_timed(event: DobEvent) -> DobEvent {
+        match event {
+            DobEvent::Timed { event, .. } => *event,
+            event => event,
+        }
+    }
+
     #[tokio::test]
     async fn emit_order_add_sends_order_add_event() {
         let (tx, mut rx) = channel(4);
@@ -209,7 +219,7 @@ mod tests {
         tap.emit_order_add(&btc_coin(), &order, 1_700_000_000_000_000_000);
 
         let event = rx.recv().await.unwrap();
-        match event {
+        match unwrap_timed(event) {
             DobEvent::OrderAdd(msg) => {
                 assert_eq!(msg.instrument_id, 0);
                 assert_eq!(msg.source_id, 1);
@@ -235,7 +245,7 @@ mod tests {
         tap.emit_order_cancel(&btc_coin(), oid, 1_700_000_000_000_000_001);
 
         let event = rx.recv().await.unwrap();
-        match event {
+        match unwrap_timed(event) {
             DobEvent::OrderCancel(msg) => {
                 assert_eq!(msg.instrument_id, 0);
                 assert_eq!(msg.source_id, 2);
@@ -260,7 +270,7 @@ mod tests {
         tap.emit_order_execute(&btc_coin(), oid, exec_price, exec_quantity, 1_700_000_000_000_000_002);
 
         let event = rx.recv().await.unwrap();
-        match event {
+        match unwrap_timed(event) {
             DobEvent::OrderExecute(msg) => {
                 assert_eq!(msg.instrument_id, 0);
                 assert_eq!(msg.source_id, 3);
@@ -292,7 +302,7 @@ mod tests {
 
         for expected_seq in 1u32..=3 {
             let event = rx.recv().await.unwrap();
-            let seq = match event {
+            let seq = match unwrap_timed(event) {
                 DobEvent::OrderAdd(m) => m.per_instrument_seq,
                 DobEvent::OrderCancel(m) => m.per_instrument_seq,
                 DobEvent::OrderExecute(m) => m.per_instrument_seq,
@@ -322,7 +332,7 @@ mod tests {
         let seq = Arc::new(Mutex::new(PerInstrumentSeqCounter::new()));
         let mut tap = DobApplyTap::new(tx, /* source_id */ 1, /* channel_id */ 7, seq, btc_resolver());
         tap.emit_batch_boundary(0, 999, 1_700_000_000_000_000_000);
-        match rx.recv().await.unwrap() {
+        match unwrap_timed(rx.recv().await.unwrap()) {
             DobEvent::BatchBoundary(msg) => {
                 assert_eq!(msg.channel_id, 7);
                 assert_eq!(msg.phase, 0);
@@ -348,7 +358,7 @@ mod tests {
 
         tap.emit_order_add(&btc_coin(), &order, 1_000);
 
-        match rx.recv().await.unwrap() {
+        match unwrap_timed(rx.recv().await.unwrap()) {
             DobEvent::OrderAdd(msg) => {
                 assert_eq!(
                     msg.quantity, 500,
@@ -376,7 +386,7 @@ mod tests {
 
         tap.emit_order_add(&btc_coin(), &order, 1_000);
 
-        match rx.recv().await.unwrap() {
+        match unwrap_timed(rx.recv().await.unwrap()) {
             DobEvent::OrderAdd(msg) => {
                 assert_eq!(
                     msg.quantity, 2921,
@@ -398,7 +408,7 @@ mod tests {
 
         tap.emit_order_execute(&btc_coin(), Oid::new(77), Px::parse_from_str("100").unwrap(), exec_quantity, 2_000);
 
-        match rx.recv().await.unwrap() {
+        match unwrap_timed(rx.recv().await.unwrap()) {
             DobEvent::OrderExecute(msg) => {
                 assert_eq!(
                     msg.exec_quantity, 1234,

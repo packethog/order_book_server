@@ -7,7 +7,7 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -42,6 +42,38 @@ pub enum DobEvent {
     HeartbeatTick,
     /// Signals the emitter to flush and emit `EndOfSession` on shutdown.
     Shutdown,
+    /// Carries enqueue time from producer edge to emitter for queue-delay metrics.
+    Timed {
+        event: Box<DobEvent>,
+        enqueued_at_ns: u64,
+    },
+}
+
+impl DobEvent {
+    #[must_use]
+    pub(crate) fn with_enqueue_timestamp(self) -> Self {
+        Self::Timed { event: Box::new(self), enqueued_at_ns: now_ns() }
+    }
+
+    pub(crate) fn event_type_label(&self) -> &'static str {
+        match self {
+            Self::OrderAdd(_) => "order_add",
+            Self::OrderCancel(_) => "order_cancel",
+            Self::OrderExecute(_) => "order_execute",
+            Self::BatchBoundary(_) => "batch_boundary",
+            Self::InstrumentReset(_) => "instrument_reset",
+            Self::HeartbeatTick => "heartbeat",
+            Self::Shutdown => "shutdown",
+            Self::Timed { event, .. } => event.event_type_label(),
+        }
+    }
+
+    fn into_queued_parts(self) -> (Self, Option<u64>) {
+        match self {
+            Self::Timed { event, enqueued_at_ns } => (*event, Some(enqueued_at_ns)),
+            event => (event, None),
+        }
+    }
 }
 
 /// Sender half handed to the L4 apply step and control tasks.
@@ -164,7 +196,9 @@ impl DobEmitter {
         if let Some(mut fb) = self.current_frame.take() {
             if !fb.is_empty() {
                 let frame = fb.finalize();
+                let start = Instant::now();
                 self.socket.send(frame).await?;
+                crate::metrics::observe_dob_socket_send("mktdata", start.elapsed());
             }
         }
         Ok(())
@@ -186,6 +220,7 @@ impl DobEmitter {
 
         let fb = self.current_frame.as_mut().unwrap();
         let buf = fb.message_buffer(size).expect("size checked above");
+        let encode_start = Instant::now();
         match event {
             DobEvent::OrderAdd(msg) => encode_order_add(buf, msg),
             DobEvent::OrderCancel(msg) => encode_order_cancel(buf, msg),
@@ -195,6 +230,7 @@ impl DobEmitter {
             _ => unreachable!("size filter should have returned"),
         }
         fb.commit_message();
+        crate::metrics::observe_dob_encode(event.event_type_label(), encode_start.elapsed());
         Ok(())
     }
 }
@@ -207,6 +243,7 @@ fn event_size(event: &DobEvent) -> usize {
         DobEvent::BatchBoundary(_) => BATCH_BOUNDARY_SIZE,
         DobEvent::InstrumentReset(_) => INSTRUMENT_RESET_SIZE,
         DobEvent::HeartbeatTick | DobEvent::Shutdown => 0,
+        DobEvent::Timed { event, .. } => event_size(event),
     }
 }
 
@@ -223,6 +260,12 @@ pub async fn run_dob_emitter(mut emitter: DobEmitter, mut rx: DobEventReceiver) 
                     // crash/restart is not a graceful shutdown).
                     return Ok(());
                 };
+                let (event, enqueued_at_ns) = event.into_queued_parts();
+                let event_type = event.event_type_label();
+                if let Some(enqueued_at_ns) = enqueued_at_ns {
+                    let delay_ns = now_ns().saturating_sub(enqueued_at_ns);
+                    crate::metrics::observe_dob_queue_delay(event_type, Duration::from_nanos(delay_ns));
+                }
                 if matches!(event, DobEvent::Shutdown) {
                     // Emit EndOfSession on mktdata before exiting so subscribers
                     // see a clean session close rather than a silent timeout.
@@ -233,8 +276,10 @@ pub async fn run_dob_emitter(mut emitter: DobEmitter, mut rx: DobEventReceiver) 
                     }
                     let fb = emitter.current_frame.as_mut().unwrap();
                     let buf = fb.message_buffer(END_OF_SESSION_SIZE).expect("size checked");
+                    let encode_start = Instant::now();
                     crate::protocol::dob::messages::encode_end_of_session(buf, now_ns());
                     fb.commit_message();
+                    crate::metrics::observe_dob_encode("shutdown", encode_start.elapsed());
                     emitter.flush().await?;
                     return Ok(());
                 }
@@ -246,8 +291,10 @@ pub async fn run_dob_emitter(mut emitter: DobEmitter, mut rx: DobEventReceiver) 
                     }
                     let fb = emitter.current_frame.as_mut().unwrap();
                     let buf = fb.message_buffer(HEARTBEAT_SIZE).expect("size checked");
+                    let encode_start = Instant::now();
                     encode_heartbeat(buf, emitter.config.channel_id, now_ns());
                     fb.commit_message();
+                    crate::metrics::observe_dob_encode("heartbeat", encode_start.elapsed());
                     emitter.flush().await?;
                     continue;
                 }
@@ -274,6 +321,36 @@ mod tests {
         tx.send(msg.clone()).await.unwrap();
         let received = rx.recv().await.unwrap();
         assert!(matches!(received, DobEvent::HeartbeatTick));
+    }
+
+    #[tokio::test]
+    async fn timed_events_record_queue_delay_and_encode_metrics() {
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = DobMktdataConfig {
+            group_addr: Ipv4Addr::LOCALHOST,
+            port: recv_socket.local_addr().unwrap().port(),
+            bind_addr: Ipv4Addr::LOCALHOST,
+            channel_id: 0,
+            mtu: 1232,
+            heartbeat_interval: Duration::from_secs(60),
+        };
+        let emitter = DobEmitter::bind(config).await.unwrap();
+        let (tx, rx) = channel(4);
+
+        let handle = tokio::spawn(run_dob_emitter(emitter, rx));
+        tx.send(DobEvent::HeartbeatTick.with_enqueue_timestamp()).await.unwrap();
+        let mut buf = [0u8; 2048];
+        tokio::time::timeout(Duration::from_secs(2), recv_socket.recv(&mut buf))
+            .await
+            .expect("timed out")
+            .expect("recv failed");
+        tx.send(DobEvent::Shutdown).await.unwrap();
+        handle.await.unwrap().unwrap();
+
+        let body = crate::metrics::render().expect("metrics render");
+        assert!(body.contains("orderbook_dob_queue_delay_seconds"));
+        assert!(body.contains("event_type=\"heartbeat\""));
+        assert!(body.contains("orderbook_dob_encode_seconds"));
     }
 }
 
@@ -361,7 +438,9 @@ impl DobSnapshotEmitter {
             encode_snapshot_begin(buf, &begin);
             fb.commit_message();
             let frame = fb.finalize();
+            let start = Instant::now();
             self.socket.send(frame).await?;
+            crate::metrics::observe_dob_socket_send("snapshot", start.elapsed());
         }
 
         // 2. Pack SnapshotOrder messages into MTU-sized frames.
@@ -372,7 +451,9 @@ impl DobSnapshotEmitter {
                 if let Some(mut fb) = fb_opt.take() {
                     if !fb.is_empty() {
                         let frame = fb.finalize();
+                        let start = Instant::now();
                         self.socket.send(frame).await?;
+                        crate::metrics::observe_dob_socket_send("snapshot", start.elapsed());
                     }
                 }
                 fb_opt = Some(DobFrameBuilder::new(
@@ -411,7 +492,9 @@ impl DobSnapshotEmitter {
         if let Some(mut fb) = fb_opt.take() {
             if !fb.is_empty() {
                 let frame = fb.finalize();
+                let start = Instant::now();
                 self.socket.send(frame).await?;
+                crate::metrics::observe_dob_socket_send("snapshot", start.elapsed());
             }
         }
 
@@ -429,7 +512,9 @@ impl DobSnapshotEmitter {
             encode_snapshot_end(buf, &end);
             fb.commit_message();
             let frame = fb.finalize();
+            let start = Instant::now();
             self.socket.send(frame).await?;
+            crate::metrics::observe_dob_socket_send("snapshot", start.elapsed());
         }
 
         Ok(())
@@ -527,7 +612,7 @@ pub(crate) async fn run_dob_snapshot_task(
             let last_instrument_seq = seq_counter.lock().expect("seq mutex poisoned").last(instrument_id);
             let orders = listener.lock().await.clone_coin_orders(&coin).unwrap_or_default();
 
-            let emit_start = std::time::Instant::now();
+            let emit_start = Instant::now();
             emitter.emit_snapshot(instrument_id, anchor_seq, last_instrument_seq, qty_exponent, orders).await?;
             let elapsed = emit_start.elapsed();
             if elapsed < slot_budget {
@@ -648,7 +733,9 @@ pub async fn run_dob_refdata_task(
                             // Frame full — flush and open a new one.
                             if !fb.is_empty() {
                                 let frame = fb.finalize();
+                                let start = Instant::now();
                                 socket.send(frame).await?;
+                                crate::metrics::observe_dob_socket_send("refdata", start.elapsed());
                             }
                             let now2 = now_ns();
                             fb = DobFrameBuilder::new(
@@ -666,7 +753,9 @@ pub async fn run_dob_refdata_task(
                 // Flush any partial final frame.
                 if !fb.is_empty() {
                     let frame = fb.finalize();
+                    let start = Instant::now();
                     socket.send(frame).await?;
+                    crate::metrics::observe_dob_socket_send("refdata", start.elapsed());
                 }
             }
 
@@ -696,7 +785,9 @@ pub async fn run_dob_refdata_task(
                 );
                 fb.commit_message();
                 let frame = fb.finalize();
+                let start = Instant::now();
                 socket.send(frame).await?;
+                crate::metrics::observe_dob_socket_send("refdata", start.elapsed());
             }
         }
     }
