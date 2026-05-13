@@ -160,6 +160,8 @@ Key properties:
 - `OrderBookState::apply_updates` is the book mutation boundary.
 - Raw-book `New` diffs use direct resting-order insertion, not local matching.
   The validator diff already represents venue-decided book state.
+  For resting `New` orders, the status row supplies identity/metadata while the
+  raw diff supplies authoritative resting price and size.
 - DoB batch boundaries are emitted around blocks with multiple emittable DoB
   mutations.
 - Fills publish TOB trades but do not mutate book state.
@@ -496,7 +498,8 @@ emitted for that coin.
 - Streaming mode is opt-in and optimized for lower latency.
 - Fills do not mutate book state.
 - Raw-book `New` diffs insert resting orders directly; they do not invoke local
-  matching.
+  matching. The raw diff price/size are authoritative for the resting book;
+  status metadata is normalized when it conflicts with a rested order.
 - TOB and DoB are independent outputs. Enabling DoB must not disable TOB.
 - TOB subscribers should not be required to derive TOB from DoB.
 - DoB drops are correctness-significant.

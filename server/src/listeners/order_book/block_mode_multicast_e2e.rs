@@ -948,6 +948,8 @@ async fn block_mode_raw_new_rests_on_crossed_local_book_and_later_updates_apply(
     let order = raw_diff_test_order_in_listener(&mut listener, new_oid).expect("raw New rests despite crossed book");
     assert_eq!(order.side, Side::Ask);
     assert_eq!(order.sz.to_str(), "5");
+    assert_eq!(order.limit_px.to_str(), "99");
+    assert_eq!(order.tif.as_deref(), Some("Alo"));
 
     let update = raw_update_diff(new_oid, "99", "5", "3");
     listener.receive_batch(EventBatch::Orders(Batch::new_for_test(3, 1_700_000_003_000, vec![]))).unwrap();
@@ -962,7 +964,28 @@ async fn block_mode_raw_new_rests_on_crossed_local_book_and_later_updates_apply(
 }
 
 #[tokio::test]
-async fn block_mode_ioc_open_status_matches_raw_new_diff() {
+async fn block_mode_raw_new_uses_diff_price_for_triggered_resting_order() {
+    let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Block);
+    listener.init_from_snapshot(crossed_raw_diff_snapshot(), 1);
+
+    let new_oid = 2_009;
+    let status = raw_diff_triggered_order_status(new_oid, Side::Ask, "120", "300", 1_700_000_002_000);
+    let new_diff = raw_new_diff(new_oid, "99", "300");
+    listener.receive_batch(EventBatch::Orders(Batch::new_for_test(2, 1_700_000_002_000, vec![status]))).unwrap();
+    listener.receive_batch(EventBatch::BookDiffs(Batch::new_for_test(2, 1_700_000_002_000, vec![new_diff]))).unwrap();
+
+    let order =
+        raw_diff_test_order_in_listener(&mut listener, new_oid).expect("triggered raw New rests at raw-diff price");
+    assert_eq!(order.limit_px.to_str(), "99");
+    assert_eq!(order.sz.to_str(), "300");
+    assert_eq!(order.trigger_condition, "Triggered");
+    assert!(!order.is_trigger);
+    assert_eq!(order.trigger_px, "0.0");
+    assert_eq!(order.tif.as_deref(), Some("Gtc"));
+}
+
+#[tokio::test]
+async fn block_mode_ioc_open_status_normalizes_to_gtc_for_raw_new_diff() {
     let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Block);
     listener.init_from_snapshot(crossed_raw_diff_snapshot(), 1);
 
@@ -973,9 +996,10 @@ async fn block_mode_ioc_open_status_matches_raw_new_diff() {
     listener.receive_batch(EventBatch::BookDiffs(Batch::new_for_test(2, 1_700_000_002_000, vec![new_diff]))).unwrap();
 
     let order = raw_diff_test_order_in_listener(&mut listener, new_oid)
-        .expect("raw New uses Ioc open status metadata when validator diff says the order rested");
+        .expect("raw New uses raw diff resting state when validator diff says the order rested");
     assert_eq!(order.sz.to_str(), "18");
-    assert_eq!(order.tif.as_deref(), Some("Ioc"));
+    assert_eq!(order.limit_px.to_str(), "99");
+    assert_eq!(order.tif.as_deref(), Some("Gtc"));
 }
 
 #[tokio::test]
@@ -993,6 +1017,8 @@ async fn streaming_raw_new_rests_on_crossed_local_book_and_later_updates_apply()
     let order = raw_diff_test_order_in_listener(&mut listener, new_oid).expect("raw New rests despite crossed book");
     assert_eq!(order.side, Side::Ask);
     assert_eq!(order.sz.to_str(), "5");
+    assert_eq!(order.limit_px.to_str(), "99");
+    assert_eq!(order.tif.as_deref(), Some("Alo"));
 
     let update = raw_update_diff(new_oid, "99", "5", "3");
     listener.receive_batch(EventBatch::BookDiffs(Batch::new_for_test(3, 1_700_000_003_000, vec![update]))).unwrap();
@@ -1005,7 +1031,29 @@ async fn streaming_raw_new_rests_on_crossed_local_book_and_later_updates_apply()
 }
 
 #[tokio::test]
-async fn streaming_ioc_open_status_is_not_overwritten_by_same_block_fill_status() {
+async fn streaming_raw_new_uses_diff_price_for_triggered_resting_order() {
+    let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Stream);
+    listener.init_from_snapshot(crossed_raw_diff_snapshot(), 1);
+    listener.complete_stream_startup_sync_for_test();
+
+    let new_oid = 2_012;
+    let status = raw_diff_triggered_order_status(new_oid, Side::Ask, "120", "300", 1_700_000_002_000);
+    let new_diff = raw_new_diff(new_oid, "99", "300");
+    listener.receive_batch(EventBatch::Orders(Batch::new_for_test(2, 1_700_000_002_000, vec![status]))).unwrap();
+    listener.receive_batch(EventBatch::BookDiffs(Batch::new_for_test(2, 1_700_000_002_000, vec![new_diff]))).unwrap();
+
+    let order =
+        raw_diff_test_order_in_listener(&mut listener, new_oid).expect("triggered raw New rests at raw-diff price");
+    assert_eq!(order.limit_px.to_str(), "99");
+    assert_eq!(order.sz.to_str(), "300");
+    assert_eq!(order.trigger_condition, "Triggered");
+    assert!(!order.is_trigger);
+    assert_eq!(order.trigger_px, "0.0");
+    assert_eq!(order.tif.as_deref(), Some("Gtc"));
+}
+
+#[tokio::test]
+async fn streaming_ioc_open_status_normalizes_to_gtc_and_ignores_same_block_fill_status() {
     let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Stream);
     listener.init_from_snapshot(crossed_raw_diff_snapshot(), 1);
     listener.complete_stream_startup_sync_for_test();
@@ -1019,7 +1067,10 @@ async fn streaming_ioc_open_status_is_not_overwritten_by_same_block_fill_status(
         .unwrap();
     listener.receive_batch(EventBatch::BookDiffs(Batch::new_for_test(2, 1_700_000_002_000, vec![new_diff]))).unwrap();
 
-    assert_eq!(raw_diff_test_order_in_listener(&mut listener, new_oid).unwrap().sz.to_str(), "18");
+    let order = raw_diff_test_order_in_listener(&mut listener, new_oid).unwrap();
+    assert_eq!(order.sz.to_str(), "18");
+    assert_eq!(order.limit_px.to_str(), "99");
+    assert_eq!(order.tif.as_deref(), Some("Gtc"));
 
     let update = raw_update_diff(new_oid, "99", "18", "0");
     let remove = raw_remove_diff(new_oid, "99");
@@ -1287,6 +1338,26 @@ fn raw_diff_order_status_with_tif(
         status: "open".to_string(),
         order,
     }
+}
+
+fn raw_diff_triggered_order_status(
+    oid: u64,
+    side: Side,
+    trigger_px: &str,
+    sz: &str,
+    block_time_ms: u64,
+) -> NodeDataOrderStatus {
+    let mut order_status = raw_diff_order_status_with_tif(oid, side, trigger_px, sz, block_time_ms, "Gtc");
+    order_status.status = "triggered".to_string();
+    order_status.order.is_trigger = true;
+    order_status.order.trigger_px = trigger_px.to_string();
+    order_status.order.trigger_condition = match side {
+        Side::Ask => format!("Price below {trigger_px}"),
+        Side::Bid => format!("Price above {trigger_px}"),
+    };
+    order_status.order.order_type = "Stop Market".to_string();
+    order_status.order.tif = None;
+    order_status
 }
 
 fn raw_diff_terminal_status(

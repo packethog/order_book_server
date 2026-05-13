@@ -25,6 +25,23 @@ pub(super) struct OrderBookState {
     dob_tap: Option<DobApplyTap>,
 }
 
+fn resting_order_from_raw_new(
+    order: NodeDataOrderStatus,
+    diff: &NodeDataOrderDiff,
+    resting_sz: crate::order_book::Sz,
+) -> Result<InnerL4Order> {
+    let time = order.time.and_utc().timestamp_millis();
+    let mut inner_order: InnerL4Order = order.try_into()?;
+    inner_order.limit_px = diff.px()?;
+    inner_order.modify_sz(resting_sz);
+    #[allow(clippy::unwrap_used)]
+    inner_order.convert_trigger(time.try_into().unwrap());
+    if inner_order.tif.as_deref() == Some("Ioc") {
+        inner_order.tif = Some("Gtc".to_string());
+    }
+    Ok(inner_order)
+}
+
 impl Clone for OrderBookState {
     fn clone(&self) -> Self {
         Self {
@@ -172,12 +189,7 @@ impl OrderBookState {
             match inner_diff {
                 InnerOrderDiff::New { sz } => {
                     if let Some(order) = order_map.remove(&oid) {
-                        let time = order.time.and_utc().timestamp_millis();
-                        let mut inner_order: InnerL4Order = order.try_into()?;
-                        inner_order.modify_sz(sz);
-                        // must replace time with time of entering book, which is the timestamp of the order status update
-                        #[allow(clippy::unwrap_used)]
-                        inner_order.convert_trigger(time.try_into().unwrap());
+                        let inner_order = resting_order_from_raw_new(order, &diff, sz)?;
                         let order_for_tap = inner_order.clone();
                         self.order_book.add_resting_order_from_diff(inner_order);
                         if !self.order_book.contains_order(&oid, &coin) {
@@ -284,11 +296,7 @@ impl OrderBookState {
                     self.snapped = false;
                     return Ok(false);
                 };
-                let time = order.time.and_utc().timestamp_millis();
-                let mut inner_order: InnerL4Order = order.try_into()?;
-                inner_order.modify_sz(sz);
-                #[allow(clippy::unwrap_used)]
-                inner_order.convert_trigger(time.try_into().unwrap());
+                let inner_order = resting_order_from_raw_new(order, &diff, sz)?;
                 let order_for_tap = inner_order.clone();
                 self.order_book.add_resting_order_from_diff(inner_order);
                 if !self.order_book.contains_order(&oid, &coin) {

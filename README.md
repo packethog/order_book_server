@@ -67,6 +67,22 @@ If you want logging, prepend the command with `RUST_LOG=info`.
 
 The WebSocket server comes with compression built-in. The compression ratio can be tuned using the `--websocket-compression-level` flag.
 
+## Order Book Reconstruction
+
+Block and streaming ingest both treat Hyperliquid raw-book `New` diffs as the
+authoritative resting-book mutation. The matching order-status row supplies
+identity and metadata such as user, coin, side, order type, reduce-only, client
+order id, and non-conflicting time-in-force values. The raw diff supplies the
+actual resting price and resting size. This matters for triggered orders, where
+the status row can contain the trigger or submitted limit price while the raw
+diff contains the price that actually rests in the validator snapshot.
+
+If an order-status row reports `Ioc` but the raw-book `New` diff shows a
+residual resting quantity, the publisher normalizes that reconstructed resting
+order to `Gtc`. That matches validator snapshots: a raw-book `New` represents
+book state that survived matching, so downstream L4/DOB state should model it as
+a resting order rather than a still-active immediate-or-cancel instruction.
+
 ## Metrics
 
 The publisher exposes Prometheus metrics on a separate HTTP listener by default:

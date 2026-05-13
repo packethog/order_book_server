@@ -8,7 +8,7 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    order_book::{Coin, Oid},
+    order_book::{Coin, Oid, Px},
     types::{Fill, L4Order, OrderDiff},
 };
 
@@ -31,6 +31,10 @@ impl NodeDataOrderDiff {
 
     pub(crate) fn coin(&self) -> Coin {
         Coin::new(&self.coin)
+    }
+
+    pub(crate) fn px(&self) -> crate::prelude::Result<Px> {
+        Px::parse_from_str(&self.px)
     }
 
     /// Test-only constructor.  Lets parity tests build a synthetic diff
