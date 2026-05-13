@@ -1002,7 +1002,13 @@ impl MulticastPublisher {
                                         Duration::from_millis(lag_ms),
                                     );
                                     if !caught_up {
-                                        info!("multicast: caught up (lag {lag_ms}ms), publishing quotes");
+                                        info!(
+                                            "tob marketdata caught up: publishing quote frames source={} height={} source_lag_ms={} dest={}",
+                                            source,
+                                            height,
+                                            lag_ms,
+                                            self.config.dest(),
+                                        );
                                         caught_up = true;
                                     }
                                     let snapshot_map = l2_snapshots.as_ref();
