@@ -17,6 +17,7 @@ pub struct Metrics {
     ingest_source_gossip_seconds: HistogramVec,
     ingest_file_tail_lag_seconds: GaugeVec,
     ingest_file_mtime_lag_seconds: HistogramVec,
+    ingest_row_file_visibility_lag_seconds: HistogramVec,
     ingest_backlog_bytes: IntGaugeVec,
     tob_snapshot_compute_seconds: HistogramVec,
     tob_snapshot_enqueue_lag_seconds: HistogramVec,
@@ -79,6 +80,14 @@ pub fn get() -> &'static Metrics {
             HistogramOpts::new(
                 "orderbook_ingest_file_mtime_lag_seconds",
                 "Observed lag between file modification time and publisher processing, by ingest source.",
+            ),
+            &["source"],
+        );
+        let ingest_row_file_visibility_lag_seconds = register_histogram(
+            &registry,
+            HistogramOpts::new(
+                "orderbook_ingest_row_file_visibility_lag_seconds",
+                "File modification time minus row local_time, by ingest source.",
             ),
             &["source"],
         );
@@ -194,6 +203,7 @@ pub fn get() -> &'static Metrics {
             ingest_source_gossip_seconds,
             ingest_file_tail_lag_seconds,
             ingest_file_mtime_lag_seconds,
+            ingest_row_file_visibility_lag_seconds,
             ingest_backlog_bytes,
             tob_snapshot_compute_seconds,
             tob_snapshot_enqueue_lag_seconds,
@@ -228,6 +238,10 @@ pub fn set_ingest_file_tail_lag(source: &'static str, duration: Duration) {
 
 pub fn observe_ingest_file_mtime_lag(source: &'static str, duration: Duration) {
     get().ingest_file_mtime_lag_seconds.with_label_values(&[source]).observe(duration.as_secs_f64());
+}
+
+pub fn observe_ingest_row_file_visibility_lag(source: &'static str, duration: Duration) {
+    get().ingest_row_file_visibility_lag_seconds.with_label_values(&[source]).observe(duration.as_secs_f64());
 }
 
 pub fn set_ingest_backlog_bytes(source: &'static str, bytes: u64) {
@@ -328,6 +342,7 @@ mod tests {
         observe_ingest_source_gossip("diffs", Duration::from_millis(2));
         set_ingest_file_tail_lag("diffs", Duration::from_millis(3));
         observe_ingest_file_mtime_lag("diffs", Duration::from_millis(4));
+        observe_ingest_row_file_visibility_lag("diffs", Duration::from_millis(5));
         set_ingest_backlog_bytes("diffs", 5);
         observe_tob_snapshot_compute("diffs", Duration::from_millis(6));
         observe_tob_snapshot_enqueue_lag("diffs", Duration::from_millis(7));
@@ -345,6 +360,7 @@ mod tests {
         assert!(body.contains("orderbook_ingest_source_gossip_seconds"));
         assert!(body.contains("orderbook_ingest_file_tail_lag_seconds"));
         assert!(body.contains("orderbook_ingest_file_mtime_lag_seconds"));
+        assert!(body.contains("orderbook_ingest_row_file_visibility_lag_seconds"));
         assert!(body.contains("orderbook_ingest_backlog_bytes"));
         assert!(body.contains("orderbook_tob_snapshot_compute_seconds"));
         assert!(body.contains("orderbook_tob_snapshot_enqueue_lag_seconds"));

@@ -81,6 +81,7 @@ All duration metrics are exported in seconds. Log summaries may render the same 
 | `orderbook_ingest_source_gossip_seconds` | `source=statuses\|diffs\|fills` | Per-source `local_time - block_time` from the HL JSONL wrapper. If this is high while file mtime lag and backlog are low, the validator is already writing late rows. |
 | `orderbook_ingest_file_tail_lag_seconds` | `source=statuses\|diffs\|fills` | Current wall-clock lag of the newest processed row: `now - local_time`. This answers “how stale is the latest row we have consumed?” |
 | `orderbook_ingest_file_mtime_lag_seconds` | `source=statuses\|diffs\|fills` | Time between the file modification timestamp and publisher processing. High values point at file notification, scheduling, or reader contention after the validator has written the file. |
+| `orderbook_ingest_row_file_visibility_lag_seconds` | `source=statuses\|diffs\|fills` | File modification timestamp minus the parsed row `local_time`. High values mean the row was timestamped before it became visible to the publisher through the streaming file. |
 | `orderbook_ingest_backlog_bytes` | `source=statuses\|diffs\|fills` | Unread bytes remaining in the tailed file after a drain pass. Sustained non-zero backlog means the publisher is not keeping up with disk output. |
 | `orderbook_tob_snapshot_source_block_lag_seconds` | `source=statuses\|diffs\|fills` | For TOB snapshots, source-row block time minus emitted snapshot block time. High values mean the book snapshot itself is behind the newest ingested source rows, often due to streaming block finalization grace. |
 | `orderbook_tob_snapshot_validator_write_lag_seconds` | `source=statuses\|diffs\|fills` | For rows that trigger TOB snapshot enqueue, `local_time - block_time`. High values mean the validator wrote that source row late. |
@@ -96,7 +97,20 @@ All duration metrics are exported in seconds. Log summaries may render the same 
 | `orderbook_dob_socket_send_seconds` | `stream=mktdata\|refdata\|snapshot` | Time spent in UDP send calls for DOB packets. |
 | `orderbook_dob_channel_drops_total` | `reason=full\|closed`, `event_type=...` | Count of DOB events dropped before reaching the emitter because the bounded channel was full or closed. Any sustained increase is a correctness/health issue. |
 
-For latency triage, start with the ingest split. High `orderbook_ingest_source_gossip_seconds` with low `orderbook_ingest_file_mtime_lag_seconds` and near-zero `orderbook_ingest_backlog_bytes` points to validator or upstream HL delay. Low source gossip with high file mtime lag or growing backlog points to publisher-side wake/drain contention. If ingest looks fresh but `orderbook_tob_queue_delay_seconds` or `orderbook_dob_queue_delay_seconds` is high, the bottleneck is inside multicast publishing.
+For latency triage, start with the ingest split. High `orderbook_ingest_source_gossip_seconds` with low `orderbook_ingest_file_mtime_lag_seconds` and near-zero `orderbook_ingest_backlog_bytes` points to validator or upstream HL delay. High `orderbook_ingest_row_file_visibility_lag_seconds` means the row's `local_time` was assigned materially before the append became visible in the file. Low source gossip with high file mtime lag or growing backlog points to publisher-side wake/drain contention. If ingest looks fresh but `orderbook_tob_queue_delay_seconds` or `orderbook_dob_queue_delay_seconds` is high, the bottleneck is inside multicast publishing.
+
+### Validator Output Latency
+
+For streaming ingest, run `hl-node` with `--stream-with-block-info --disable-output-file-buffering`. Hyperliquid documents `--disable-output-file-buffering` as the low-latency mode for output files: it flushes each line immediately, reducing latency at the cost of additional disk IO. Without it, the validator can assign a row `local_time` well before the row becomes visible in the streaming file, which can cause TOB trades or snapshots to be suppressed by the freshness guard even when the publisher is keeping up.
+
+A canary on `aws-tyo-hl-mainnet` measured `node_fills_streaming` visibility before and after enabling this flag:
+
+| Validator mode | `local_time` to file mtime avg | p99 | max |
+|----------------|-------------------------------:|----:|----:|
+| default output buffering | `190.6ms` | `890.5ms` | `2897.5ms` |
+| `--disable-output-file-buffering` | `0.5ms` | `1.3ms` | `3.3ms` |
+
+In that same live window, inotify and polling both observed new fill rows within a few milliseconds of the file mtime, while publisher `hl_to_wake` stayed at `0-1ms`. That means fill suppression was caused by validator output buffering, not inotify delay or publisher queueing. Snapshot suppression can still occur during upstream validator or Hyperliquid source jitter; diagnose that separately with `orderbook_ingest_source_gossip_seconds`, `orderbook_tob_snapshot_validator_write_lag_seconds`, and `orderbook_tob_queue_delay_seconds`.
 
 ## Multicast
 

@@ -74,11 +74,36 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+fn system_time_ms(time: SystemTime) -> Option<u64> {
+    let millis = time.duration_since(UNIX_EPOCH).ok()?.as_millis();
+    millis.try_into().ok()
+}
+
 const fn ingest_source_label(source: EventSource) -> &'static str {
     match source {
         EventSource::Fills => "fills",
         EventSource::OrderStatuses => "statuses",
         EventSource::OrderDiffs => "diffs",
+    }
+}
+
+fn seek_to_recent_jsonl_boundary(file: &mut File) -> Result<bool> {
+    let end = file.seek(SeekFrom::End(0))?;
+    let backtrack = end.min(8192);
+    if backtrack == 0 {
+        return Ok(false);
+    }
+
+    file.seek(SeekFrom::End(-(backtrack as i64)))?;
+    let mut buf = vec![0u8; backtrack as usize];
+    file.read_exact(&mut buf)?;
+    if let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') {
+        let rewind = backtrack - (last_nl as u64) - 1;
+        file.seek(SeekFrom::End(-(rewind as i64)))?;
+        Ok(false)
+    } else {
+        file.seek(SeekFrom::End(0))?;
+        Ok(true)
     }
 }
 
@@ -127,7 +152,6 @@ pub(crate) async fn hl_listen(
     // that was recreating a Sleep future on every select! iteration)
     let mut last_event_time: Option<Instant> = None;
 
-    // Classify an fs path into its EventSource (avoids repeating starts_with checks)
     let classify_path = |path: &Path| -> Option<EventSource> {
         if path.starts_with(&order_statuses_dir) {
             Some(EventSource::OrderStatuses)
@@ -371,6 +395,9 @@ pub(crate) struct OrderBookListener {
     last_fill_height: Option<u64>,
     last_status_height: Option<u64>,
     last_diff_height: Option<u64>,
+    last_fill_file_mtime_ms: Option<u64>,
+    last_status_file_mtime_ms: Option<u64>,
+    last_diff_file_mtime_ms: Option<u64>,
     discard_fill_fragment: bool,
     discard_status_fragment: bool,
     discard_diff_fragment: bool,
@@ -417,6 +444,9 @@ impl OrderBookListener {
             last_fill_height: None,
             last_status_height: None,
             last_diff_height: None,
+            last_fill_file_mtime_ms: None,
+            last_status_file_mtime_ms: None,
+            last_diff_file_mtime_ms: None,
             discard_fill_fragment: false,
             discard_status_fragment: false,
             discard_diff_fragment: false,
@@ -1021,11 +1051,28 @@ impl OrderBookListener {
 }
 
 impl OrderBookListener {
-    fn record_file_mtime_lag(path: &Path, source: EventSource) {
-        let Ok(metadata) = path.metadata() else { return };
-        let Ok(modified) = metadata.modified() else { return };
+    fn record_file_mtime_lag(path: &Path, source: EventSource) -> Option<u64> {
+        let Ok(metadata) = path.metadata() else { return None };
+        let Ok(modified) = metadata.modified() else { return None };
         let lag = SystemTime::now().duration_since(modified).unwrap_or_default();
         crate::metrics::observe_ingest_file_mtime_lag(ingest_source_label(source), lag);
+        system_time_ms(modified)
+    }
+
+    fn file_mtime_mut(&mut self, source: EventSource) -> &mut Option<u64> {
+        match source {
+            EventSource::Fills => &mut self.last_fill_file_mtime_ms,
+            EventSource::OrderStatuses => &mut self.last_status_file_mtime_ms,
+            EventSource::OrderDiffs => &mut self.last_diff_file_mtime_ms,
+        }
+    }
+
+    const fn file_mtime(&self, source: EventSource) -> Option<u64> {
+        match source {
+            EventSource::Fills => self.last_fill_file_mtime_ms,
+            EventSource::OrderStatuses => self.last_status_file_mtime_ms,
+            EventSource::OrderDiffs => self.last_diff_file_mtime_ms,
+        }
     }
 
     fn record_backlog_bytes(&mut self, source: EventSource) -> Result<()> {
@@ -1063,7 +1110,7 @@ impl OrderBookListener {
     }
 
     fn process_update(&mut self, event: &Event, new_path: &PathBuf, event_source: EventSource) -> Result<()> {
-        Self::record_file_mtime_lag(new_path, event_source);
+        *self.file_mtime_mut(event_source) = Self::record_file_mtime_lag(new_path, event_source);
         if event.kind.is_create() {
             info!("-- Event: {} created --", new_path.display());
             self.on_file_creation(new_path.clone(), event_source)?;
@@ -1078,25 +1125,9 @@ impl OrderBookListener {
             } else {
                 info!("-- Event: {} modified, tracking it now --", new_path.display());
                 let mut new_file = File::open(new_path)?;
-                // Seek to end, then back up to the last newline so we start
-                // on a clean line boundary.  Without this, we can land mid-JSON
-                // if hl-node is mid-write, producing a permanent deser error.
-                let end = new_file.seek(SeekFrom::End(0))?;
-                let backtrack = end.min(8192);
-                if backtrack > 0 {
-                    new_file.seek(SeekFrom::End(-(backtrack as i64)))?;
-                    let mut buf = vec![0u8; backtrack as usize];
-                    new_file.read_exact(&mut buf)?;
-                    if let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') {
-                        // Position right after the last newline
-                        let rewind = backtrack - (last_nl as u64) - 1;
-                        new_file.seek(SeekFrom::End(-(rewind as i64)))?;
-                        *self.discard_fragment_mut(event_source) = false;
-                    } else {
-                        *self.discard_fragment_mut(event_source) = true;
-                    }
-                    // else: no newline in last 8KB, stay at end
-                }
+                // Start on a clean JSONL boundary even when hl-node is in the
+                // middle of writing a very long streaming row.
+                *self.discard_fragment_mut(event_source) = seek_to_recent_jsonl_boundary(&mut new_file)?;
                 *self.file_mut(event_source) = Some(new_file);
                 self.record_backlog_bytes(event_source)?;
             }
@@ -1203,6 +1234,12 @@ impl DirectoryListener for OrderBookListener {
                 source_label,
                 Duration::from_millis(now_ms().saturating_sub(local_time_ms)),
             );
+            if let Some(file_mtime_ms) = self.file_mtime(event_source) {
+                crate::metrics::observe_ingest_row_file_visibility_lag(
+                    source_label,
+                    Duration::from_millis(file_mtime_ms.saturating_sub(local_time_ms)),
+                );
+            }
             self.last_batch_block_time_ms = Some(block_time_ms);
             self.last_batch_local_time_ms = Some(local_time_ms);
             last_source_times = Some((block_time_ms, local_time_ms));

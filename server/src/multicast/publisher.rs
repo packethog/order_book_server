@@ -395,14 +395,23 @@ impl MulticastPublisher {
         )
     }
 
-    async fn send_frame(&self, frame: &[u8], dest: SocketAddr, channel: &'static str, packet_type: &'static str) {
+    async fn send_frame(
+        &self,
+        frame: &[u8],
+        dest: SocketAddr,
+        channel: &'static str,
+        packet_type: &'static str,
+    ) -> bool {
         let start = Instant::now();
-        if let Err(err) = self.socket.send_to(frame, dest).await {
+        let sent = if let Err(err) = self.socket.send_to(frame, dest).await {
             warn!("multicast: failed to send frame to {dest}: {err}");
+            false
         } else {
             crate::metrics::inc_tob_packet(packet_type);
-        }
+            true
+        };
         crate::metrics::observe_tob_socket_send(channel, start.elapsed());
+        sent
     }
 
     async fn send_channel_reset(&self, dest: SocketAddr, channel: &'static str) {
@@ -410,15 +419,15 @@ impl MulticastPublisher {
         let buf = fb.message_buffer(CHANNEL_RESET_SIZE).expect("ChannelReset fits in empty frame");
         encode_channel_reset(buf, Self::now_ns());
         fb.commit_message();
-        self.send_frame(fb.finalize(), dest, channel, "channel_reset").await;
+        let _sent = self.send_frame(fb.finalize(), dest, channel, "channel_reset").await;
     }
 
-    async fn send_heartbeat(&self) {
+    async fn send_heartbeat(&self) -> bool {
         let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
         let buf = fb.message_buffer(HEARTBEAT_SIZE).expect("Heartbeat fits in empty frame");
         encode_heartbeat(buf, 0, Self::now_ns());
         fb.commit_message();
-        self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "heartbeat").await;
+        self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "heartbeat").await
     }
 
     async fn send_end_of_session(&self) {
@@ -426,7 +435,7 @@ impl MulticastPublisher {
         let buf = fb.message_buffer(END_OF_SESSION_SIZE).expect("EndOfSession fits in empty frame");
         encode_end_of_session(buf, Self::now_ns());
         fb.commit_message();
-        self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "end_of_session").await;
+        let _sent = self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "end_of_session").await;
     }
 
     /// Sends a ManifestSummary on the refdata port.
@@ -528,11 +537,12 @@ impl MulticastPublisher {
         >,
         time: u64,
         is_snapshot: bool,
-    ) {
+    ) -> bool {
         let flags = if is_snapshot { FLAG_SNAPSHOT } else { 0 };
         let source_timestamp_ns = time * 1_000_000; // HL time is ms
 
         let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
+        let mut sent_any = false;
         let default_params = crate::listeners::order_book::L2SnapshotParams::new(None, None);
 
         // Snapshot-then-lookup against the lock-free ArcSwap. Holding the load
@@ -612,7 +622,7 @@ impl MulticastPublisher {
                 }
                 Err(FrameError::ExceedsMtu { .. } | FrameError::MaxMessages) => {
                     if !fb.is_empty() {
-                        self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "quote").await;
+                        sent_any |= self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "quote").await;
                     }
                     fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
                     let buf = fb.message_buffer(QUOTE_SIZE).expect("Quote fits in empty frame");
@@ -623,13 +633,15 @@ impl MulticastPublisher {
         }
 
         if !fb.is_empty() {
-            self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "quote").await;
+            sent_any |= self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "quote").await;
         }
+        sent_any
     }
 
     /// Encodes fills as Trade messages, batching into frames.
-    async fn publish_trades(&self, trades_by_coin: &HashMap<String, Vec<crate::types::Trade>>) {
+    async fn publish_trades(&self, trades_by_coin: &HashMap<String, Vec<crate::types::Trade>>) -> bool {
         let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
+        let mut sent_any = false;
 
         let lookups: HashMap<String, InstrumentInfo> = {
             let guard = self.registry.load();
@@ -669,7 +681,7 @@ impl MulticastPublisher {
                     }
                     Err(FrameError::ExceedsMtu { .. } | FrameError::MaxMessages) => {
                         if !fb.is_empty() {
-                            self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "trade").await;
+                            sent_any |= self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "trade").await;
                         }
                         fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
                         let buf = fb.message_buffer(TRADE_SIZE).expect("Trade fits in empty frame");
@@ -681,8 +693,9 @@ impl MulticastPublisher {
         }
 
         if !fb.is_empty() {
-            self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "trade").await;
+            sent_any |= self.send_frame(fb.finalize(), self.config.dest(), "marketdata", "trade").await;
         }
+        sent_any
     }
 
     /// Main loop: subscribes to the broadcast channel and publishes binary frames.
@@ -769,9 +782,10 @@ impl MulticastPublisher {
                                         caught_up = true;
                                     }
                                     let snapshot_map = l2_snapshots.as_ref();
-                                    self.publish_quotes(snapshot_map, *time, false).await;
-                                    had_activity = true;
-                                    heartbeat_interval.reset();
+                                    if self.publish_quotes(snapshot_map, *time, false).await {
+                                        had_activity = true;
+                                        heartbeat_interval.reset();
+                                    }
                                 } else {
                                     caught_up = false;
                                     crate::metrics::observe_tob_source_lag(
@@ -821,9 +835,10 @@ impl MulticastPublisher {
                                         Duration::from_millis(lag_ms),
                                     );
                                     let trades_by_coin = crate::servers::websocket_server::coin_to_trades(batch);
-                                    self.publish_trades(&trades_by_coin).await;
-                                    had_activity = true;
-                                    heartbeat_interval.reset();
+                                    if self.publish_trades(&trades_by_coin).await {
+                                        had_activity = true;
+                                        heartbeat_interval.reset();
+                                    }
                                 } else {
                                     let local_time_ms = batch.local_time_ms();
                                     let fill = TobSuppressedFill {
@@ -877,9 +892,10 @@ impl MulticastPublisher {
                     if caught_up {
                         if let Some(ref cached) = cached_snapshot
                             && let InternalMessage::Snapshot { l2_snapshots, time, .. } = cached.as_ref() {
-                                self.publish_quotes(l2_snapshots.as_ref(), *time, true).await;
-                                had_activity = true;
-                                heartbeat_interval.reset();
+                                if self.publish_quotes(l2_snapshots.as_ref(), *time, true).await {
+                                    had_activity = true;
+                                    heartbeat_interval.reset();
+                                }
                         }
                     }
                 }
@@ -966,10 +982,14 @@ pub(crate) fn make_leg(name: &str) -> [u8; 8] {
 mod tests {
     use super::*;
     use crate::instruments::{RegistryState, UniverseEntry, make_symbol};
+    use crate::listeners::order_book::InternalMessage;
+    use crate::order_book::types::Side;
     use crate::protocol::constants::{
         DEFAULT_MTU, FRAME_HEADER_SIZE, MAGIC_BYTES, MSG_TYPE_CHANNEL_RESET, MSG_TYPE_HEARTBEAT,
-        MSG_TYPE_INSTRUMENT_DEF, MSG_TYPE_MANIFEST_SUMMARY, SCHEMA_VERSION,
+        MSG_TYPE_INSTRUMENT_DEF, MSG_TYPE_MANIFEST_SUMMARY, MSG_TYPE_QUOTE, MSG_TYPE_TRADE, SCHEMA_VERSION,
     };
+    use crate::types::{Fill, node_data::Batch, node_data::NodeDataFill};
+    use alloy::primitives::Address;
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
@@ -1016,6 +1036,90 @@ mod tests {
             },
         ];
         crate::instruments::new_shared_registry(RegistryState::new(universe))
+    }
+
+    fn test_fill(coin: &str, side: Side, tid: u64) -> NodeDataFill {
+        NodeDataFill(
+            Address::new([0; 20]),
+            Fill {
+                coin: coin.to_string(),
+                px: "100.0".to_string(),
+                sz: "1.0".to_string(),
+                side,
+                time: MulticastPublisher::now_ms(),
+                start_position: "0".to_string(),
+                dir: "Open Long".to_string(),
+                closed_pnl: "0".to_string(),
+                hash: "0x0".to_string(),
+                oid: 1,
+                crossed: side == Side::Ask,
+                fee: "0".to_string(),
+                tid,
+                fee_token: "USDC".to_string(),
+                liquidation: None,
+            },
+        )
+    }
+
+    fn frame_msg_types(buf: &[u8], n: usize) -> Vec<u8> {
+        if n < FRAME_HEADER_SIZE {
+            return Vec::new();
+        }
+        let msg_count = buf[20] as usize;
+        let mut offset = FRAME_HEADER_SIZE;
+        let mut msg_types = Vec::new();
+        for _ in 0..msg_count {
+            if offset + 2 > n {
+                break;
+            }
+            msg_types.push(buf[offset]);
+            let msg_len = buf[offset + 1] as usize;
+            if msg_len == 0 {
+                break;
+            }
+            offset += msg_len;
+        }
+        msg_types
+    }
+
+    async fn collect_market_msg_types(socket: &UdpSocket, duration: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + duration;
+        let mut msg_types = Vec::new();
+        let mut buf = [0u8; 2048];
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            match tokio::time::timeout(remaining, socket.recv(&mut buf)).await {
+                Ok(Ok(n)) => msg_types.extend(frame_msg_types(&buf, n)),
+                _ => break,
+            }
+        }
+        msg_types
+    }
+
+    async fn spawn_running_test_publisher(
+        heartbeat_interval: Duration,
+    ) -> (tokio::sync::broadcast::Sender<Arc<InternalMessage>>, tokio::task::JoinHandle<()>, UdpSocket) {
+        let send_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let marketdata_recv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let refdata_recv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let mut config = test_config();
+        config.port = marketdata_recv.local_addr().unwrap().port();
+        config.refdata_port = refdata_recv.local_addr().unwrap().port();
+        config.heartbeat_interval = heartbeat_interval;
+        config.manifest_cadence = Duration::from_secs(60);
+        config.definition_cycle = Duration::from_secs(60);
+
+        let publisher = MulticastPublisher::new(send_socket, config, test_registry());
+        let (tx, _) = tokio::sync::broadcast::channel(128);
+        let rx = tx.subscribe();
+        let handle = tokio::spawn(async move {
+            publisher.run(rx).await;
+        });
+
+        (tx, handle, marketdata_recv)
     }
 
     #[tokio::test]
@@ -1127,6 +1231,94 @@ mod tests {
         assert_eq!(&buf[0..2], &MAGIC_BYTES);
         assert_eq!(buf[FRAME_HEADER_SIZE], MSG_TYPE_HEARTBEAT);
         assert_eq!(buf[FRAME_HEADER_SIZE + 1], HEARTBEAT_SIZE as u8);
+    }
+
+    #[tokio::test]
+    async fn empty_quote_batch_reports_no_marketdata_frame() {
+        let send_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let mut config = test_config();
+        config.port = recv_socket.local_addr().unwrap().port();
+
+        let publisher = MulticastPublisher::new(send_socket, config, test_registry());
+        let sent = publisher.publish_quotes(&HashMap::new(), MulticastPublisher::now_ms(), false).await;
+
+        assert!(!sent, "empty quote batch must not count as marketdata activity");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                collect_market_msg_types(&recv_socket, Duration::from_millis(10))
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "empty quote batch should not emit marketdata packets",
+        );
+    }
+
+    #[tokio::test]
+    async fn unmapped_fresh_fills_do_not_starve_heartbeats() {
+        let heartbeat_interval = Duration::from_millis(40);
+        let (tx, handle, marketdata_recv) = spawn_running_test_publisher(heartbeat_interval).await;
+
+        let startup = collect_market_msg_types(&marketdata_recv, Duration::from_millis(100)).await;
+        assert!(startup.contains(&MSG_TYPE_CHANNEL_RESET), "publisher emits startup ChannelReset on mktdata");
+
+        let send_until = Instant::now() + Duration::from_millis(160);
+        let mut tid = 1;
+        while Instant::now() < send_until {
+            let batch = Batch::new_for_test(
+                1,
+                MulticastPublisher::now_ms(),
+                vec![test_fill("UNKNOWN", Side::Ask, tid), test_fill("UNKNOWN", Side::Bid, tid)],
+            );
+            let _unused =
+                tx.send(Arc::new(InternalMessage::Fills { batch, enqueued_at_ms: MulticastPublisher::now_ms() }));
+            tid += 1;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let msg_types = collect_market_msg_types(&marketdata_recv, Duration::from_millis(160)).await;
+        handle.abort();
+
+        assert!(
+            msg_types.contains(&MSG_TYPE_HEARTBEAT),
+            "fresh fills that produce no trade frame must leave mktdata idle so heartbeats continue",
+        );
+        assert!(!msg_types.contains(&MSG_TYPE_TRADE), "unmapped fills should not emit trade frames");
+        assert!(!msg_types.contains(&MSG_TYPE_QUOTE), "fill-only traffic should not emit quote frames");
+    }
+
+    #[tokio::test]
+    async fn fresh_trade_frame_resets_heartbeat_timer() {
+        let heartbeat_interval = Duration::from_millis(80);
+        let (tx, handle, marketdata_recv) = spawn_running_test_publisher(heartbeat_interval).await;
+
+        let startup = collect_market_msg_types(&marketdata_recv, Duration::from_millis(100)).await;
+        assert!(startup.contains(&MSG_TYPE_CHANNEL_RESET), "publisher emits startup ChannelReset on mktdata");
+
+        let batch = Batch::new_for_test(
+            1,
+            MulticastPublisher::now_ms(),
+            vec![test_fill("BTC", Side::Ask, 42), test_fill("BTC", Side::Bid, 42)],
+        );
+        let _unused = tx.send(Arc::new(InternalMessage::Fills { batch, enqueued_at_ms: MulticastPublisher::now_ms() }));
+
+        let early = collect_market_msg_types(&marketdata_recv, Duration::from_millis(40)).await;
+        assert!(early.contains(&MSG_TYPE_TRADE), "fresh mapped fills emit a trade frame");
+        assert!(
+            !early.contains(&MSG_TYPE_HEARTBEAT),
+            "trade frame is mktdata activity and should reset heartbeat timer",
+        );
+
+        let later = collect_market_msg_types(&marketdata_recv, Duration::from_millis(140)).await;
+        handle.abort();
+
+        assert!(
+            later.contains(&MSG_TYPE_HEARTBEAT),
+            "heartbeat resumes after the marketdata path is idle for the heartbeat interval",
+        );
     }
 
     #[test]
