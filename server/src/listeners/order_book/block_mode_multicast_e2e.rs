@@ -5,6 +5,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
+    io::{Read, Seek, Write},
     net::{Ipv4Addr, SocketAddrV4},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -659,6 +660,36 @@ fn partial_trailing_json_line_is_deferred_without_panic() {
     assert!(listener.order_book_state.is_none());
 }
 
+#[test]
+fn partial_trailing_json_line_rewinds_only_unread_suffix() {
+    let mut listener = OrderBookListener::new_with_ingest_mode(None, true, IngestMode::Block);
+    let complete = "{\"local_time\":\"2026-04-30T20:00:00\",\"block_time\":\"2026-04-30T20:00:00\",\"block_number\":2,\"events\":[]}";
+    let partial = "{\"local_time\":\"2026-04-30T20:00:01\",\"block_time\":\"2026-04-30T20:00:01\"";
+    let data = format!("{complete}\n{partial}");
+    let path = std::env::temp_dir().join(format!(
+        "order_book_partial_rewind_{}_{}.jsonl",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
+    ));
+
+    {
+        let mut writer = fs::File::create(&path).unwrap();
+        writer.write_all(data.as_bytes()).unwrap();
+    }
+    let mut file = fs::File::open(&path).unwrap();
+    let mut read_data = String::new();
+    file.read_to_string(&mut read_data).unwrap();
+    listener.order_diff_file = Some(file);
+
+    listener
+        .process_data(read_data, EventSource::OrderDiffs)
+        .expect("partial line should be deferred after complete rows are processed");
+
+    let position = listener.order_diff_file.as_mut().unwrap().stream_position().unwrap();
+    assert_eq!(position, (complete.len() + 1) as u64);
+    fs::remove_file(path).unwrap();
+}
+
 #[tokio::test]
 async fn streaming_diff_before_status_waits_then_applies() {
     let (mut listener, snapshot_height) = stream_listener_from_fixture().await;
@@ -719,6 +750,13 @@ async fn streaming_new_without_opening_status_is_skipped_after_later_block() {
             next_height + 1,
             1_700_000_002_000,
             Vec::<NodeDataOrderDiff>::new(),
+        )))
+        .unwrap();
+    listener
+        .receive_batch(EventBatch::Orders(Batch::new_for_test(
+            next_height + 1,
+            1_700_000_002_000,
+            Vec::<NodeDataOrderStatus>::new(),
         )))
         .unwrap();
     assert_eq!(listener.compute_snapshot().unwrap().height, next_height);
@@ -894,6 +932,7 @@ async fn block_mode_ioc_open_status_matches_raw_new_diff() {
 async fn streaming_raw_new_rests_on_crossed_local_book_and_later_updates_apply() {
     let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Stream);
     listener.init_from_snapshot(crossed_raw_diff_snapshot(), 1);
+    listener.complete_stream_startup_sync_for_test();
 
     let new_oid = 2_001;
     let status = raw_diff_order_status(new_oid, Side::Ask, "99", "5", 1_700_000_002_000);
@@ -919,6 +958,7 @@ async fn streaming_raw_new_rests_on_crossed_local_book_and_later_updates_apply()
 async fn streaming_ioc_open_status_is_not_overwritten_by_same_block_fill_status() {
     let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Stream);
     listener.init_from_snapshot(crossed_raw_diff_snapshot(), 1);
+    listener.complete_stream_startup_sync_for_test();
 
     let new_oid = 2_011;
     let open_status = raw_diff_order_status_with_tif(new_oid, Side::Ask, "99", "27", 1_700_000_002_000, "Ioc");
@@ -942,10 +982,10 @@ async fn streaming_ioc_open_status_is_not_overwritten_by_same_block_fill_status(
 #[tokio::test]
 async fn streaming_late_data_for_finalized_block_is_dropped() {
     // hl-node writes the streaming statuses, diffs, and fills files concurrently;
-    // they're delivered through one notify channel. If a later block's diffs
-    // arrive and finalize an earlier block before that earlier block's statuses/
-    // diffs from another file land, the listener must drop the late events with
-    // a warn log rather than crash. This test simulates that race.
+    // they're delivered through one notify channel. Once both watermarks have
+    // crossed a finalized block, meaningful late data for that block is a
+    // correctness failure because the DoB BatchBoundary(close) has already gone
+    // out.
     let (mut listener, _snapshot_height) = stream_listener_from_fixture().await;
     let (status_batch, diff_batch) = first_streaming_new_diff_and_status();
     let next_empty_batch = Batch::new_for_test(
@@ -953,18 +993,113 @@ async fn streaming_late_data_for_finalized_block_is_dropped() {
         diff_batch.block_time() + 1_000,
         Vec::<NodeDataOrderDiff>::new(),
     );
+    let next_empty_status_batch = Batch::new_for_test(
+        status_batch.block_number() + 1,
+        status_batch.block_time() + 1_000,
+        Vec::<NodeDataOrderStatus>::new(),
+    );
 
     listener.receive_batch(EventBatch::Orders(status_batch)).unwrap();
     listener.receive_batch(EventBatch::BookDiffs(diff_batch.clone())).unwrap();
     listener.receive_batch(EventBatch::BookDiffs(next_empty_batch)).unwrap();
+    listener.receive_batch(EventBatch::Orders(next_empty_status_batch)).unwrap();
 
-    // Replay the now-finalized block's diff: must be dropped silently (Ok),
-    // not propagated as a fatal error that would tear down the listener.
-    listener.receive_batch(EventBatch::BookDiffs(diff_batch)).expect("late events drop, do not crash");
+    // Replay the now-finalized block's meaningful diff: this would arrive after
+    // a DoB BatchBoundary(close), so applying it would corrupt downstream
+    // semantics. The listener must fail closed instead of silently continuing.
+    let err = listener.receive_batch(EventBatch::BookDiffs(diff_batch)).unwrap_err().to_string();
+    assert!(err.contains("late streaming diffs for finalized block"), "{err}");
 }
 
 #[tokio::test]
-async fn streaming_finalize_grace_accepts_late_same_block_diffs() {
+async fn streaming_late_status_after_finalization_is_ignored() {
+    let (mut listener, _snapshot_height) = stream_listener_from_fixture().await;
+    let (status_batch, diff_batch) = first_streaming_new_diff_and_status();
+    let next_empty_diff_batch = Batch::new_for_test(
+        diff_batch.block_number() + 1,
+        diff_batch.block_time() + 1_000,
+        Vec::<NodeDataOrderDiff>::new(),
+    );
+    let next_empty_status_batch = Batch::new_for_test(
+        status_batch.block_number() + 1,
+        status_batch.block_time() + 1_000,
+        Vec::<NodeDataOrderStatus>::new(),
+    );
+
+    listener.receive_batch(EventBatch::Orders(status_batch.clone())).unwrap();
+    listener.receive_batch(EventBatch::BookDiffs(diff_batch)).unwrap();
+    listener.receive_batch(EventBatch::BookDiffs(next_empty_diff_batch)).unwrap();
+    listener.receive_batch(EventBatch::Orders(next_empty_status_batch)).unwrap();
+
+    listener
+        .receive_batch(EventBatch::Orders(status_batch))
+        .expect("late statuses are metadata-only and safe to ignore after block close");
+}
+
+#[tokio::test]
+async fn streaming_ignored_spot_late_data_after_finalization_does_not_error() {
+    let (mut listener, _snapshot_height) = stream_listener_from_fixture().await;
+    let (status_batch, diff_batch) = first_streaming_new_diff_and_status();
+    let next_empty_batch = Batch::new_for_test(
+        diff_batch.block_number() + 1,
+        diff_batch.block_time() + 1_000,
+        Vec::<NodeDataOrderDiff>::new(),
+    );
+    let next_empty_status_batch = Batch::new_for_test(
+        status_batch.block_number() + 1,
+        status_batch.block_time() + 1_000,
+        Vec::<NodeDataOrderStatus>::new(),
+    );
+
+    listener.receive_batch(EventBatch::Orders(status_batch)).unwrap();
+    listener.receive_batch(EventBatch::BookDiffs(diff_batch.clone())).unwrap();
+    listener.receive_batch(EventBatch::BookDiffs(next_empty_batch)).unwrap();
+    listener.receive_batch(EventBatch::Orders(next_empty_status_batch)).unwrap();
+
+    let late_spot = NodeDataOrderDiff::new_for_test(
+        Address::new([0; 20]),
+        u64::MAX - 2,
+        "1.0".to_string(),
+        "@123".to_string(),
+        OrderDiff::Remove,
+    );
+    listener
+        .receive_batch(EventBatch::BookDiffs(Batch::new_for_test(
+            diff_batch.block_number(),
+            diff_batch.block_time(),
+            vec![late_spot],
+        )))
+        .expect("ignored spot late rows are counted but do not force fatal ingest");
+}
+
+#[tokio::test]
+async fn streaming_watermark_finalizes_without_fixed_grace() {
+    let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Stream);
+    listener.init_from_snapshot(crossed_raw_diff_snapshot(), 1);
+    listener.set_stream_block_finalize_grace_for_test(Duration::from_secs(60));
+    listener.complete_stream_startup_sync_for_test();
+
+    listener
+        .receive_batch(EventBatch::BookDiffs(Batch::new_for_test(
+            2,
+            1_700_000_002_000,
+            Vec::<NodeDataOrderDiff>::new(),
+        )))
+        .unwrap();
+    listener
+        .receive_batch(EventBatch::BookDiffs(Batch::new_for_test(
+            3,
+            1_700_000_003_000,
+            Vec::<NodeDataOrderDiff>::new(),
+        )))
+        .unwrap();
+
+    assert_eq!(listener.streaming_state.finalized_height, Some(2));
+    assert_eq!(listener.stream_finalization_mode_for_test(), super::StreamFinalizationMode::Watermark);
+}
+
+#[tokio::test]
+async fn streaming_startup_sync_waits_for_status_watermark() {
     let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Stream);
     listener.init_from_snapshot(crossed_raw_diff_snapshot(), 1);
     listener.set_stream_block_finalize_grace_for_test(Duration::from_secs(60));
@@ -984,6 +1119,52 @@ async fn streaming_finalize_grace_accepts_late_same_block_diffs() {
         )))
         .unwrap();
 
+    assert_eq!(listener.streaming_state.finalized_height, None);
+    assert_eq!(listener.stream_finalization_mode_for_test(), super::StreamFinalizationMode::GraceFallback);
+
+    listener
+        .receive_batch(EventBatch::Orders(Batch::new_for_test(2, 1_700_000_002_000, Vec::<NodeDataOrderStatus>::new())))
+        .unwrap();
+    listener
+        .receive_batch(EventBatch::Orders(Batch::new_for_test(3, 1_700_000_003_000, Vec::<NodeDataOrderStatus>::new())))
+        .unwrap();
+
+    assert_eq!(listener.streaming_state.finalized_height, None);
+}
+
+#[tokio::test]
+async fn streaming_out_of_order_open_block_uses_grace_fallback() {
+    let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Stream);
+    listener.init_from_snapshot(crossed_raw_diff_snapshot(), 1);
+    listener.set_stream_block_finalize_grace_for_test(Duration::from_secs(60));
+
+    listener
+        .receive_batch(EventBatch::BookDiffs(Batch::new_for_test(
+            2,
+            1_700_000_002_000,
+            Vec::<NodeDataOrderDiff>::new(),
+        )))
+        .unwrap();
+    listener
+        .receive_batch(EventBatch::Orders(Batch::new_for_test(3, 1_700_000_003_000, Vec::<NodeDataOrderStatus>::new())))
+        .unwrap();
+    listener
+        .receive_batch(EventBatch::Orders(Batch::new_for_test(
+            2,
+            1_700_000_002_000,
+            vec![raw_diff_order_status(2_000, Side::Bid, "101", "1", 1_700_000_002_000)],
+        )))
+        .unwrap();
+
+    assert_eq!(listener.stream_finalization_mode_for_test(), super::StreamFinalizationMode::GraceFallback);
+    listener
+        .receive_batch(EventBatch::BookDiffs(Batch::new_for_test(
+            3,
+            1_700_000_003_000,
+            Vec::<NodeDataOrderDiff>::new(),
+        )))
+        .unwrap();
+    assert_eq!(listener.streaming_state.finalized_height, None);
     assert!(raw_diff_test_order_in_listener(&mut listener, 1_000).is_some());
 
     let late_remove = raw_remove_diff(1_000, "100");

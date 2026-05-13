@@ -12,6 +12,9 @@ This server provides the `l2book` and `trades` endpoints from [Hyperliquid’s o
   `n_levels`, which can be up to `100` and defaults to `20`.
 - This server also introduces a new endpoint: `l4book`.
 
+For a codebase-level mental model, including the block-mode and streaming-mode
+publishing hot paths, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 The `l4book` subscription first sends a snapshot of the entire book and then forwards order diffs by block. The subscription format is:
 
 ```json
@@ -83,7 +86,12 @@ All duration metrics are exported in seconds. Log summaries may render the same 
 | `orderbook_ingest_file_mtime_lag_seconds` | `source=statuses\|diffs\|fills` | Time between the file modification timestamp and publisher processing. High values point at file notification, scheduling, or reader contention after the validator has written the file. |
 | `orderbook_ingest_row_file_visibility_lag_seconds` | `source=statuses\|diffs\|fills` | File modification timestamp minus the parsed row `local_time`. High values mean the row was timestamped before it became visible to the publisher through the streaming file. |
 | `orderbook_ingest_backlog_bytes` | `source=statuses\|diffs\|fills` | Unread bytes remaining in the tailed file after a drain pass. Sustained non-zero backlog means the publisher is not keeping up with disk output. |
-| `orderbook_tob_snapshot_source_block_lag_seconds` | `source=statuses\|diffs\|fills` | For TOB snapshots, source-row block time minus emitted snapshot block time. High values mean the book snapshot itself is behind the newest ingested source rows, often due to streaming block finalization grace. |
+| `orderbook_stream_out_of_order_rows_total` | `source=statuses\|diffs` | Streaming rows whose block number is below that source's current watermark. Meaningful non-spot rows switch finalization into grace fallback. |
+| `orderbook_stream_late_finalized_rows_total` | `source=statuses\|diffs`, `action=ignored\|fatal` | Rows received after their block was finalized. Late statuses are metadata-only once no pending raw diff can consume them and are ignored; meaningful late diffs are fatal because they would mutate a block whose DoB boundary has already closed. |
+| `orderbook_stream_finalization_mode` | `mode=watermark\|grace_fallback` | Gauge set to `1` for the active streaming finalization mode and `0` for the inactive mode. |
+| `orderbook_stream_finalization_lag_seconds` | `mode=watermark\|grace_fallback` | Time from last row received for a streaming block to block finalization. Watermark mode should avoid the fixed grace delay in healthy monotonic periods. |
+| `orderbook_stream_reorder_delay_seconds` | `source=statuses\|diffs` | Difference between the latest source `local_time` and an out-of-order row's `local_time`, when computable. |
+| `orderbook_tob_snapshot_source_block_lag_seconds` | `source=statuses\|diffs\|fills` | For TOB snapshots, source-row block time minus emitted snapshot block time. High values mean the book snapshot itself is behind the newest ingested source rows, often due to streaming finalization waiting for watermarks or grace fallback. |
 | `orderbook_tob_snapshot_validator_write_lag_seconds` | `source=statuses\|diffs\|fills` | For rows that trigger TOB snapshot enqueue, `local_time - block_time`. High values mean the validator wrote that source row late. |
 | `orderbook_tob_snapshot_listener_to_publisher_seconds` | `source=statuses\|diffs\|fills` | For TOB snapshots, source-row `local_time` to TOB publisher receive time. This includes local listener/apply/finalization work plus internal enqueue/receive time. |
 | `orderbook_tob_queue_delay_seconds` | `message_type=snapshot\|fill` | Time TOB messages spend between listener enqueue and TOB publisher receive. High values indicate internal publisher contention before packet encoding/sending. |
@@ -97,7 +105,11 @@ All duration metrics are exported in seconds. Log summaries may render the same 
 | `orderbook_dob_socket_send_seconds` | `stream=mktdata\|refdata\|snapshot` | Time spent in UDP send calls for DOB packets. |
 | `orderbook_dob_channel_drops_total` | `reason=full\|closed`, `event_type=...` | Count of DOB events dropped before reaching the emitter because the bounded channel was full or closed. Any sustained increase is a correctness/health issue. |
 
-For latency triage, start with the ingest split. High `orderbook_ingest_source_gossip_seconds` with low `orderbook_ingest_file_mtime_lag_seconds` and near-zero `orderbook_ingest_backlog_bytes` points to validator or upstream HL delay. High `orderbook_ingest_row_file_visibility_lag_seconds` means the row's `local_time` was assigned materially before the append became visible in the file. Low source gossip with high file mtime lag or growing backlog points to publisher-side wake/drain contention. If ingest looks fresh but `orderbook_tob_queue_delay_seconds` or `orderbook_dob_queue_delay_seconds` is high, the bottleneck is inside multicast publishing.
+For latency triage, start with the ingest split. High `orderbook_ingest_source_gossip_seconds` with low `orderbook_ingest_file_mtime_lag_seconds` and near-zero `orderbook_ingest_backlog_bytes` points to validator or upstream HL delay. High `orderbook_ingest_row_file_visibility_lag_seconds` means the row's `local_time` was assigned materially before the append became visible in the file. Low source gossip with high file mtime lag or growing backlog points to publisher-side wake/drain contention. In streaming mode, `orderbook_stream_finalization_mode{mode="watermark"}` should be active during healthy monotonic output; `grace_fallback` means the listener is in startup synchronization or a conservative fallback after out-of-order rows. If ingest looks fresh but `orderbook_tob_queue_delay_seconds` or `orderbook_dob_queue_delay_seconds` is high, the bottleneck is inside multicast publishing.
+
+### Streaming Startup Synchronization
+
+Streaming status and raw-diff files are tailed independently. On process startup the publisher can begin in the middle of a block, with one source already ahead of the other. To avoid closing a DoB block before matching status rows have become visible, streaming finalization starts in grace-fallback mode until both status and diff watermarks have crossed the startup sync height. After that point, healthy monotonic output uses watermark finalization and avoids the fixed grace delay.
 
 ### Validator Output Latency
 

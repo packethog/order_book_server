@@ -61,6 +61,11 @@ const DEFAULT_STREAM_BLOCK_FINALIZE_GRACE: Duration = Duration::from_millis(500)
 #[cfg(test)]
 const DEFAULT_STREAM_BLOCK_FINALIZE_GRACE: Duration = Duration::from_millis(0);
 
+#[cfg(not(test))]
+const STREAM_REORDER_FALLBACK_WINDOW: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const STREAM_REORDER_FALLBACK_WINDOW: Duration = Duration::from_millis(50);
+
 /// Wall-clock nanoseconds since the Unix epoch. Mirrors the helper in
 /// `multicast::dob` (kept module-local there) so `apply_recovery` can stamp
 /// `InstrumentReset.timestamp_ns` without crossing a privacy boundary.
@@ -249,7 +254,11 @@ pub(crate) async fn hl_listen(
                 }
 
                 latency_stats.report();
-                listener.lock().await.progress.report();
+                {
+                    let mut guard = listener.lock().await;
+                    guard.progress.report();
+                    guard.report_streaming_health();
+                }
 
                 let listener = listener.clone();
                 let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
@@ -363,6 +372,32 @@ struct StreamingBlock {
 struct StreamingState {
     blocks: BTreeMap<u64, StreamingBlock>,
     finalized_height: Option<u64>,
+    diff_watermark: Option<u64>,
+    status_watermark: Option<u64>,
+    startup_sync_height: Option<u64>,
+    diff_watermark_local_time_ms: Option<u64>,
+    status_watermark_local_time_ms: Option<u64>,
+    grace_fallback_until: Option<Instant>,
+    out_of_order_rows: u64,
+    late_finalized_rows: u64,
+    grace_fallback_activations: u64,
+    finalized_watermark_blocks: u64,
+    finalized_grace_blocks: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum StreamFinalizationMode {
+    Watermark,
+    GraceFallback,
+}
+
+impl StreamFinalizationMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Watermark => "watermark",
+            Self::GraceFallback => "grace_fallback",
+        }
+    }
 }
 
 struct UnresolvedStreamNewDebug {
@@ -473,6 +508,22 @@ impl OrderBookListener {
     #[cfg(test)]
     fn set_stream_block_finalize_grace_for_test(&mut self, grace: Duration) {
         self.stream_block_finalize_grace = grace;
+    }
+
+    #[cfg(test)]
+    fn stream_finalization_mode_for_test(&mut self) -> StreamFinalizationMode {
+        self.effective_stream_finalization_mode()
+    }
+
+    #[cfg(test)]
+    fn complete_stream_startup_sync_for_test(&mut self) {
+        let current_height = self
+            .order_book_state
+            .as_ref()
+            .map(OrderBookState::height)
+            .or(self.streaming_state.finalized_height)
+            .unwrap_or(0);
+        self.streaming_state.startup_sync_height = Some(current_height);
     }
 
     /// Returns (block_time_ms, local_time_ms) from the most recently
@@ -685,20 +736,252 @@ impl OrderBookListener {
         Ok(())
     }
 
+    fn is_meaningful_stream_status(&self, status: &NodeDataOrderStatus) -> bool {
+        if !status.is_opening_status_for_raw_diff() {
+            return false;
+        }
+        !(Coin::new(&status.order.coin).is_spot() && self.ignore_spot)
+    }
+
+    fn stream_batch_has_meaningful_statuses(&self, batch: &Batch<NodeDataOrderStatus>) -> bool {
+        batch.events_ref().iter().any(|status| self.is_meaningful_stream_status(status))
+    }
+
+    fn stream_batch_has_meaningful_diffs(&self, batch: &Batch<NodeDataOrderDiff>) -> bool {
+        batch.events_ref().iter().any(|diff| !(diff.coin().is_spot() && self.ignore_spot))
+    }
+
+    fn current_stream_finalization_mode(&mut self) -> StreamFinalizationMode {
+        if self.streaming_state.grace_fallback_until.is_some_and(|deadline| deadline > Instant::now()) {
+            StreamFinalizationMode::GraceFallback
+        } else {
+            self.streaming_state.grace_fallback_until = None;
+            StreamFinalizationMode::Watermark
+        }
+    }
+
+    fn stream_startup_sync_height(&mut self) -> Option<u64> {
+        if self.streaming_state.startup_sync_height.is_none()
+            && let (Some(diff_watermark), Some(status_watermark)) =
+                (self.streaming_state.diff_watermark, self.streaming_state.status_watermark)
+        {
+            let startup_sync_height = diff_watermark.max(status_watermark);
+            self.streaming_state.startup_sync_height = Some(startup_sync_height);
+            info!(
+                "stream startup sync established: height={startup_sync_height} \
+                 diff_watermark={diff_watermark} status_watermark={status_watermark}"
+            );
+        }
+
+        self.streaming_state.startup_sync_height
+    }
+
+    fn stream_startup_sync_complete(&mut self) -> bool {
+        let Some(startup_sync_height) = self.stream_startup_sync_height() else {
+            return false;
+        };
+        self.streaming_state.finalized_height.is_some_and(|finalized| finalized >= startup_sync_height)
+    }
+
+    fn stream_block_requires_startup_sync(&mut self, height: u64) -> bool {
+        match self.stream_startup_sync_height() {
+            Some(startup_sync_height) => height <= startup_sync_height,
+            None => true,
+        }
+    }
+
+    fn stream_block_finalization_mode(&mut self, height: u64) -> StreamFinalizationMode {
+        if self.stream_block_requires_startup_sync(height) {
+            StreamFinalizationMode::GraceFallback
+        } else {
+            self.current_stream_finalization_mode()
+        }
+    }
+
+    fn effective_stream_finalization_mode(&mut self) -> StreamFinalizationMode {
+        if self.stream_startup_sync_complete() {
+            self.current_stream_finalization_mode()
+        } else {
+            StreamFinalizationMode::GraceFallback
+        }
+    }
+
+    fn report_streaming_health(&mut self) {
+        if self.ingest_mode != IngestMode::Stream {
+            return;
+        }
+        let mode = self.effective_stream_finalization_mode();
+        let startup_sync_height = self.stream_startup_sync_height();
+        let startup_sync_complete = startup_sync_height
+            .is_some_and(|height| self.streaming_state.finalized_height.is_some_and(|finalized| finalized >= height));
+        crate::metrics::set_stream_finalization_mode(mode.label());
+        if self.streaming_state.out_of_order_rows == 0
+            && self.streaming_state.late_finalized_rows == 0
+            && self.streaming_state.grace_fallback_activations == 0
+            && self.streaming_state.finalized_watermark_blocks == 0
+            && self.streaming_state.finalized_grace_blocks == 0
+            && startup_sync_complete
+        {
+            return;
+        }
+        info!(
+            "stream finalization | mode={} diff_watermark={:?} status_watermark={:?} \
+             startup_sync_height={:?} startup_sync_complete={} out_of_order_rows={} \
+             late_finalized_rows={} grace_fallback_activations={} \
+             finalized_watermark_blocks={} finalized_grace_blocks={}",
+            mode.label(),
+            self.streaming_state.diff_watermark,
+            self.streaming_state.status_watermark,
+            startup_sync_height,
+            startup_sync_complete,
+            self.streaming_state.out_of_order_rows,
+            self.streaming_state.late_finalized_rows,
+            self.streaming_state.grace_fallback_activations,
+            self.streaming_state.finalized_watermark_blocks,
+            self.streaming_state.finalized_grace_blocks,
+        );
+    }
+
+    fn activate_stream_grace_fallback(&mut self) {
+        self.streaming_state.grace_fallback_until = Some(Instant::now() + STREAM_REORDER_FALLBACK_WINDOW);
+        self.streaming_state.grace_fallback_activations += 1;
+    }
+
+    fn update_stream_watermark(&mut self, source: EventSource, height: u64, local_time_ms: u64, meaningful: bool) {
+        let source_label = ingest_source_label(source);
+        let (current_watermark, current_watermark_local_time_ms) = match source {
+            EventSource::OrderDiffs => {
+                (self.streaming_state.diff_watermark, self.streaming_state.diff_watermark_local_time_ms)
+            }
+            EventSource::OrderStatuses => {
+                (self.streaming_state.status_watermark, self.streaming_state.status_watermark_local_time_ms)
+            }
+            EventSource::Fills => return,
+        };
+
+        if current_watermark.is_some_and(|current| height < current) {
+            self.streaming_state.out_of_order_rows += 1;
+            crate::metrics::inc_stream_out_of_order_row(source_label);
+            if let Some(latest_local_time_ms) = current_watermark_local_time_ms {
+                crate::metrics::observe_stream_reorder_delay(
+                    source_label,
+                    Duration::from_millis(latest_local_time_ms.saturating_sub(local_time_ms)),
+                );
+            }
+            if meaningful {
+                self.activate_stream_grace_fallback();
+                log::warn!(
+                    "streaming source out of order: source={source} block={height} watermark={:?}; using grace fallback",
+                    current_watermark
+                );
+            } else {
+                debug!(
+                    "ignored out-of-order streaming row: source={source} block={height} watermark={current_watermark:?}"
+                );
+            }
+        }
+
+        if current_watermark.is_none_or(|current| height >= current) {
+            match source {
+                EventSource::OrderDiffs => {
+                    self.streaming_state.diff_watermark = Some(height);
+                    self.streaming_state.diff_watermark_local_time_ms = Some(local_time_ms);
+                }
+                EventSource::OrderStatuses => {
+                    self.streaming_state.status_watermark = Some(height);
+                    self.streaming_state.status_watermark_local_time_ms = Some(local_time_ms);
+                }
+                EventSource::Fills => {}
+            }
+        }
+    }
+
+    fn handle_late_finalized_stream_statuses(&mut self, height: u64, batch: &Batch<NodeDataOrderStatus>) -> Result<()> {
+        let meaningful = self.stream_batch_has_meaningful_statuses(batch);
+        self.streaming_state.late_finalized_rows += 1;
+        crate::metrics::inc_stream_late_finalized_row(ingest_source_label(EventSource::OrderStatuses), "ignored");
+        if meaningful {
+            debug!(
+                "ignoring late finalized streaming opening statuses for block {height}; \
+                 statuses are metadata-only without a pending raw diff"
+            );
+        } else {
+            debug!("ignoring late non-meaningful streaming statuses for finalized block {height}");
+        }
+        Ok(())
+    }
+
+    fn handle_late_finalized_stream_diffs(&mut self, height: u64, batch: &Batch<NodeDataOrderDiff>) -> Result<()> {
+        let meaningful = self.stream_batch_has_meaningful_diffs(batch);
+        let action = if meaningful { "fatal" } else { "ignored" };
+        self.streaming_state.late_finalized_rows += 1;
+        crate::metrics::inc_stream_late_finalized_row(ingest_source_label(EventSource::OrderDiffs), action);
+        if meaningful {
+            Err(format!("late streaming diffs for finalized block {height}").into())
+        } else {
+            debug!("ignoring late non-meaningful streaming diffs for finalized block {height}");
+            Ok(())
+        }
+    }
+
+    fn status_watermark_proves_missing(&self, height: u64) -> bool {
+        self.streaming_state.status_watermark.is_some_and(|watermark| watermark > height)
+    }
+
+    fn stream_block_can_finalize(
+        &mut self,
+        height: u64,
+        block: &StreamingBlock,
+        later_block_seen: bool,
+        mode: StreamFinalizationMode,
+    ) -> bool {
+        crate::metrics::set_stream_finalization_mode(mode.label());
+        match mode {
+            StreamFinalizationMode::Watermark => {
+                self.streaming_state.diff_watermark.is_some_and(|watermark| watermark > height)
+            }
+            StreamFinalizationMode::GraceFallback => {
+                let startup_sync_ready = !self.stream_block_requires_startup_sync(height)
+                    || (self.streaming_state.diff_watermark.is_some_and(|watermark| watermark > height)
+                        && self.streaming_state.status_watermark.is_some_and(|watermark| watermark > height));
+                later_block_seen
+                    && startup_sync_ready
+                    && block
+                        .last_received_at
+                        .is_none_or(|last_received_at| last_received_at.elapsed() >= self.stream_block_finalize_grace())
+            }
+        }
+    }
+
+    fn finalize_stream_block(&mut self, height: u64, block: StreamingBlock, mode: StreamFinalizationMode) {
+        if block.boundary_open
+            && let (Some(state), Some(block_time_ms)) = (self.order_book_state.as_mut(), block.block_time_ms)
+        {
+            state.emit_batch_boundary(1, height, block_time_ms);
+        }
+        if let Some(last_received_at) = block.last_received_at {
+            crate::metrics::observe_stream_finalization_lag(mode.label(), last_received_at.elapsed());
+        }
+        match mode {
+            StreamFinalizationMode::Watermark => self.streaming_state.finalized_watermark_blocks += 1,
+            StreamFinalizationMode::GraceFallback => self.streaming_state.finalized_grace_blocks += 1,
+        }
+        self.streaming_state.finalized_height = Some(height);
+    }
+
     fn receive_stream_statuses(&mut self, batch: Batch<NodeDataOrderStatus>) -> Result<()> {
         let height = batch.block_number();
-        // hl-node writes the three streaming files (statuses, diffs, fills)
-        // concurrently. They're delivered to us through one notify channel,
-        // but cross-file ordering can lag — e.g. drain_streaming_blocks may
-        // already have finalized block N (because we saw block N+1's diffs)
-        // when block N's statuses arrive. Drop these late events rather than
-        // crashing the listener.
         if self.streaming_state.finalized_height.is_some_and(|finalized| height <= finalized) {
-            log::warn!("dropping late streaming statuses for finalized block {height} (cross-file ordering)");
-            return Ok(());
+            return self.handle_late_finalized_stream_statuses(height, &batch);
         }
         self.last_batch_block_time_ms = Some(batch.block_time());
         self.last_batch_local_time_ms = Some(batch.local_time_ms());
+        self.update_stream_watermark(
+            EventSource::OrderStatuses,
+            height,
+            batch.local_time_ms(),
+            self.stream_batch_has_meaningful_statuses(&batch),
+        );
 
         let block = self.streaming_state.blocks.entry(height).or_default();
         block.block_time_ms.get_or_insert(batch.block_time());
@@ -714,13 +997,17 @@ impl OrderBookListener {
 
     fn receive_stream_diffs(&mut self, batch: Batch<NodeDataOrderDiff>) -> Result<()> {
         let height = batch.block_number();
-        // See receive_stream_statuses for the cross-file race rationale.
         if self.streaming_state.finalized_height.is_some_and(|finalized| height <= finalized) {
-            log::warn!("dropping late streaming diffs for finalized block {height} (cross-file ordering)");
-            return Ok(());
+            return self.handle_late_finalized_stream_diffs(height, &batch);
         }
         self.last_batch_block_time_ms = Some(batch.block_time());
         self.last_batch_local_time_ms = Some(batch.local_time_ms());
+        self.update_stream_watermark(
+            EventSource::OrderDiffs,
+            height,
+            batch.local_time_ms(),
+            self.stream_batch_has_meaningful_diffs(&batch),
+        );
 
         let block = self.streaming_state.blocks.entry(height).or_default();
         block.block_time_ms.get_or_insert(batch.block_time());
@@ -743,6 +1030,7 @@ impl OrderBookListener {
                 self.streaming_state.blocks.insert(height, block);
                 return Ok(());
             }
+            let mut blocked_on_missing_status = false;
 
             while let Some(diff_batch) = block.diffs.front() {
                 let diff = diff_batch.events_ref().first().expect("stream diff batch has one event");
@@ -777,7 +1065,30 @@ impl OrderBookListener {
                             };
                             let waited = now.duration_since(first_seen_at);
 
-                            if later_block_seen && waited >= UNRESOLVED_STREAM_NEW_SKIP_AFTER {
+                            if self.status_watermark_proves_missing(height) {
+                                log::warn!(
+                                    "streaming drain skipping New diff without matching opening status after status watermark: \
+                                     height={height} oid={oid:?} coin={:?} status_watermark={:?} \
+                                     pending_diffs={} available_statuses={} buffered_blocks={buffered_blocks} \
+                                     highest_buffered_height={highest_buffered_height}",
+                                    diff.coin(),
+                                    self.streaming_state.status_watermark,
+                                    block.diffs.len(),
+                                    block.statuses.len(),
+                                );
+                                if self
+                                    .last_unresolved_stream_new
+                                    .as_ref()
+                                    .is_some_and(|prev| prev.height == height && prev.oid == oid)
+                                {
+                                    self.last_unresolved_stream_new = None;
+                                }
+                                None
+                            } else if self.stream_block_finalization_mode(height)
+                                == StreamFinalizationMode::GraceFallback
+                                && later_block_seen
+                                && waited >= UNRESOLVED_STREAM_NEW_SKIP_AFTER
+                            {
                                 log::warn!(
                                     "streaming drain skipping New diff without matching opening status after timeout: \
                                      height={height} oid={oid:?} coin={:?} waited_ms={} \
@@ -820,6 +1131,7 @@ impl OrderBookListener {
                                         max_buffered_blocks_logged: buffered_blocks,
                                     });
                                 }
+                                blocked_on_missing_status = true;
                                 break;
                             }
                         }
@@ -856,16 +1168,12 @@ impl OrderBookListener {
                 }
             }
 
-            let finalize_grace_elapsed = block
-                .last_received_at
-                .is_none_or(|last_received_at| last_received_at.elapsed() >= self.stream_block_finalize_grace());
-            if block.diffs.is_empty() && later_block_seen && finalize_grace_elapsed {
-                if block.boundary_open
-                    && let (Some(state), Some(block_time_ms)) = (self.order_book_state.as_mut(), block.block_time_ms)
-                {
-                    state.emit_batch_boundary(1, height, block_time_ms);
-                }
-                self.streaming_state.finalized_height = Some(height);
+            let mode = self.stream_block_finalization_mode(height);
+            if block.diffs.is_empty()
+                && !blocked_on_missing_status
+                && self.stream_block_can_finalize(height, &block, later_block_seen, mode)
+            {
+                self.finalize_stream_block(height, block, mode);
             } else {
                 self.streaming_state.blocks.insert(height, block);
                 return Ok(());
@@ -1183,9 +1491,12 @@ impl DirectoryListener for OrderBookListener {
             return Ok(());
         }
         let mut last_source_times: Option<(u64, u64)> = None;
-        let lines = data.lines();
-        for line in lines {
+        let mut consumed_bytes = 0usize;
+        for raw_line in data.split_inclusive('\n') {
+            let line_len = raw_line.len();
+            let line = raw_line.trim_end_matches(['\r', '\n']);
             if line.is_empty() {
+                consumed_bytes += line_len;
                 continue;
             }
             let res = match event_source {
@@ -1211,7 +1522,9 @@ impl DirectoryListener for OrderBookListener {
             let (height, block_time_ms, local_time_ms, event_batch) = match res {
                 Ok(data) => data,
                 Err(err) => {
-                    // if we run into a serialization error (hitting EOF), just return to last line.
+                    // If we run into a serialization error from a partial trailing JSONL row,
+                    // rewind only the unread suffix. Previously this rewound the full read
+                    // buffer, replaying already-applied complete rows on the next append.
                     let preview: String = line.chars().take(100).collect();
                     self.progress.record_jsonl_deferral(event_source);
                     debug!(
@@ -1220,11 +1533,12 @@ impl DirectoryListener for OrderBookListener {
                         preview,
                     );
                     #[allow(clippy::unwrap_used)]
-                    let total_len: i64 = total_len.try_into().unwrap();
-                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-total_len));
+                    let unread_len: i64 = (total_len - consumed_bytes).try_into().unwrap();
+                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-unread_len));
                     break;
                 }
             };
+            consumed_bytes += line_len;
             let source_label = ingest_source_label(event_source);
             crate::metrics::observe_ingest_source_gossip(
                 source_label,

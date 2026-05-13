@@ -19,6 +19,11 @@ pub struct Metrics {
     ingest_file_mtime_lag_seconds: HistogramVec,
     ingest_row_file_visibility_lag_seconds: HistogramVec,
     ingest_backlog_bytes: IntGaugeVec,
+    stream_out_of_order_rows_total: IntCounterVec,
+    stream_late_finalized_rows_total: IntCounterVec,
+    stream_finalization_mode: GaugeVec,
+    stream_finalization_lag_seconds: HistogramVec,
+    stream_reorder_delay_seconds: HistogramVec,
     tob_snapshot_compute_seconds: HistogramVec,
     tob_snapshot_enqueue_lag_seconds: HistogramVec,
     tob_snapshot_source_block_lag_seconds: HistogramVec,
@@ -100,6 +105,47 @@ pub fn get() -> &'static Metrics {
         )
         .expect("valid gauge metric");
         registry.register(Box::new(ingest_backlog_bytes.clone())).expect("metric registered once");
+        let stream_out_of_order_rows_total = register_counter(
+            &registry,
+            Opts::new(
+                "orderbook_stream_out_of_order_rows_total",
+                "Streaming rows received below their source watermark.",
+            ),
+            &["source"],
+        );
+        let stream_late_finalized_rows_total = register_counter(
+            &registry,
+            Opts::new(
+                "orderbook_stream_late_finalized_rows_total",
+                "Streaming rows received after their block was finalized.",
+            ),
+            &["source", "action"],
+        );
+        let stream_finalization_mode = GaugeVec::new(
+            Opts::new(
+                "orderbook_stream_finalization_mode",
+                "Current streaming finalization mode. The active mode has value 1.",
+            ),
+            &["mode"],
+        )
+        .expect("valid gauge metric");
+        registry.register(Box::new(stream_finalization_mode.clone())).expect("metric registered once");
+        let stream_finalization_lag_seconds = register_histogram(
+            &registry,
+            HistogramOpts::new(
+                "orderbook_stream_finalization_lag_seconds",
+                "Time from last row received for a streaming block until finalization.",
+            ),
+            &["mode"],
+        );
+        let stream_reorder_delay_seconds = register_histogram(
+            &registry,
+            HistogramOpts::new(
+                "orderbook_stream_reorder_delay_seconds",
+                "Difference between latest source local_time and an out-of-order row local_time.",
+            ),
+            &["source"],
+        );
         let tob_snapshot_compute_seconds = register_histogram(
             &registry,
             HistogramOpts::new(
@@ -205,6 +251,11 @@ pub fn get() -> &'static Metrics {
             ingest_file_mtime_lag_seconds,
             ingest_row_file_visibility_lag_seconds,
             ingest_backlog_bytes,
+            stream_out_of_order_rows_total,
+            stream_late_finalized_rows_total,
+            stream_finalization_mode,
+            stream_finalization_lag_seconds,
+            stream_reorder_delay_seconds,
             tob_snapshot_compute_seconds,
             tob_snapshot_enqueue_lag_seconds,
             tob_snapshot_source_block_lag_seconds,
@@ -247,6 +298,30 @@ pub fn observe_ingest_row_file_visibility_lag(source: &'static str, duration: Du
 pub fn set_ingest_backlog_bytes(source: &'static str, bytes: u64) {
     let value = i64::try_from(bytes).unwrap_or(i64::MAX);
     get().ingest_backlog_bytes.with_label_values(&[source]).set(value);
+}
+
+pub fn inc_stream_out_of_order_row(source: &'static str) {
+    get().stream_out_of_order_rows_total.with_label_values(&[source]).inc();
+}
+
+pub fn inc_stream_late_finalized_row(source: &'static str, action: &'static str) {
+    get().stream_late_finalized_rows_total.with_label_values(&[source, action]).inc();
+}
+
+pub fn set_stream_finalization_mode(mode: &'static str) {
+    let metrics = get();
+    for candidate in ["watermark", "grace_fallback"] {
+        let value = if candidate == mode { 1.0 } else { 0.0 };
+        metrics.stream_finalization_mode.with_label_values(&[candidate]).set(value);
+    }
+}
+
+pub fn observe_stream_finalization_lag(mode: &'static str, duration: Duration) {
+    get().stream_finalization_lag_seconds.with_label_values(&[mode]).observe(duration.as_secs_f64());
+}
+
+pub fn observe_stream_reorder_delay(source: &'static str, duration: Duration) {
+    get().stream_reorder_delay_seconds.with_label_values(&[source]).observe(duration.as_secs_f64());
 }
 
 pub fn observe_tob_snapshot_compute(source: &'static str, duration: Duration) {
@@ -344,6 +419,11 @@ mod tests {
         observe_ingest_file_mtime_lag("diffs", Duration::from_millis(4));
         observe_ingest_row_file_visibility_lag("diffs", Duration::from_millis(5));
         set_ingest_backlog_bytes("diffs", 5);
+        inc_stream_out_of_order_row("diffs");
+        inc_stream_late_finalized_row("diffs", "fatal");
+        set_stream_finalization_mode("watermark");
+        observe_stream_finalization_lag("watermark", Duration::from_millis(6));
+        observe_stream_reorder_delay("diffs", Duration::from_millis(7));
         observe_tob_snapshot_compute("diffs", Duration::from_millis(6));
         observe_tob_snapshot_enqueue_lag("diffs", Duration::from_millis(7));
         observe_tob_queue_delay("snapshot", Duration::from_millis(2));
@@ -362,6 +442,11 @@ mod tests {
         assert!(body.contains("orderbook_ingest_file_mtime_lag_seconds"));
         assert!(body.contains("orderbook_ingest_row_file_visibility_lag_seconds"));
         assert!(body.contains("orderbook_ingest_backlog_bytes"));
+        assert!(body.contains("orderbook_stream_out_of_order_rows_total"));
+        assert!(body.contains("orderbook_stream_late_finalized_rows_total"));
+        assert!(body.contains("orderbook_stream_finalization_mode"));
+        assert!(body.contains("orderbook_stream_finalization_lag_seconds"));
+        assert!(body.contains("orderbook_stream_reorder_delay_seconds"));
         assert!(body.contains("orderbook_tob_snapshot_compute_seconds"));
         assert!(body.contains("orderbook_tob_snapshot_enqueue_lag_seconds"));
         assert!(body.contains("orderbook_tob_queue_delay_seconds"));
