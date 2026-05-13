@@ -48,8 +48,20 @@ cargo run --release --bin dz_hl_publisher -- \
 
 `--hl-data-root` is the directory containing the `node_*` output directories; it defaults to `$HOME/hl/data`. Block mode reads `node_fills_by_block`, `node_order_statuses_by_block`, and `node_raw_book_diffs_by_block`. Streaming mode reads `node_fills_streaming`, `node_order_statuses_streaming`, and `node_raw_book_diffs_streaming`. Snapshot validation output still defaults to `$HOME/out.json`.
 
+Streaming mode can optionally tail fills on a separate listener:
+
+```bash
+cargo run --release --bin dz_hl_publisher -- \
+  --address 0.0.0.0 --port 8000 \
+  --ingest-mode stream \
+  --hl-data-root /data/hl-data \
+  --separate-fill-ingest
+```
+
+`--separate-fill-ingest` is streaming-only and defaults off. It keeps status/raw-diff processing on the normal book listener, but sends `node_fills_streaming` rows directly to the TOB trade publisher. This is useful when trade latency should not wait behind high-volume book reconstruction. Block mode does not support the flag. This flag only affects TOB trades; TOB quotes still come from book snapshots produced by the normal status/raw-diff listener.
+
 If this local server does not detect the node writing down any new events, it will automatically exit after some amount of time (currently set to 5 seconds).
-In addition, the local server periodically fetches order book snapshots from the node, and compares to its own internal state. If a difference is detected, it will exit.
+In addition, the local server periodically fetches order book snapshots from the node and compares them to its own internal state. When a per-coin divergence is detected, the publisher repairs only the affected coin. If DoB is enabled, that repair emits an `InstrumentReset` and schedules a priority snapshot for the affected instrument.
 
 If you want logging, prepend the command with `RUST_LOG=info`.
 
@@ -94,6 +106,10 @@ All duration metrics are exported in seconds. Log summaries may render the same 
 | `orderbook_tob_snapshot_source_block_lag_seconds` | `source=statuses\|diffs\|fills` | For TOB snapshots, source-row block time minus emitted snapshot block time. High values mean the book snapshot itself is behind the newest ingested source rows, often due to streaming finalization waiting for watermarks or grace fallback. |
 | `orderbook_tob_snapshot_validator_write_lag_seconds` | `source=statuses\|diffs\|fills` | For rows that trigger TOB snapshot enqueue, `local_time - block_time`. High values mean the validator wrote that source row late. |
 | `orderbook_tob_snapshot_listener_to_publisher_seconds` | `source=statuses\|diffs\|fills` | For TOB snapshots, source-row `local_time` to TOB publisher receive time. This includes local listener/apply/finalization work plus internal enqueue/receive time. |
+| `orderbook_tob_fill_enqueue_lag_seconds` | `path=main_listener\|separate_listener` | For TOB fills, source lag at listener enqueue. This is measured before the internal TOB broadcast send, so it exposes local delay that happened before enqueue. |
+| `orderbook_tob_fill_listener_to_publisher_seconds` | `path=main_listener\|separate_listener` | For TOB fills, source-row `local_time` to TOB publisher receive time. Compare this with `orderbook_tob_queue_delay_seconds{message_type="fill"}` to split listener-side delay from internal queue delay. |
+| `orderbook_tob_fill_pair_total` | `outcome=paired\|orphan_dropped\|one_sided_token_alias\|malformed\|duplicate_replaced` | TOB fill pairing outcomes. Streaming fills can deliver the two sides of one trade in separate rows; `paired` is the count that should track trade emission eligibility. `one_sided_token_alias` counts expected one-sided `#...` token-alias fills and is not treated as a missing normal trade pair. Non-zero malformed/orphan/duplicate counts need inspection. |
+| `orderbook_tob_fill_pair_pending` | *(none)* | Current number of one-sided fills waiting for the opposite side by trade id. This should stay bounded; growth means the publisher is seeing unmatched fill sides. |
 | `orderbook_tob_queue_delay_seconds` | `message_type=snapshot\|fill` | Time TOB messages spend between listener enqueue and TOB publisher receive. High values indicate internal publisher contention before packet encoding/sending. |
 | `orderbook_tob_source_lag_seconds` | `message_type=snapshot\|fill`, `decision=published\|suppressed` | Source age at the TOB freshness decision. `suppressed` means the message was older than the TOB freshness threshold and quote/trade marketdata was intentionally not published. |
 | `orderbook_tob_socket_send_seconds` | `channel=marketdata\|refdata` | Time spent in UDP send calls for TOB packets. High values suggest socket/kernel/network backpressure. |
@@ -105,7 +121,18 @@ All duration metrics are exported in seconds. Log summaries may render the same 
 | `orderbook_dob_socket_send_seconds` | `stream=mktdata\|refdata\|snapshot` | Time spent in UDP send calls for DOB packets. |
 | `orderbook_dob_channel_drops_total` | `reason=full\|closed`, `event_type=...` | Count of DOB events dropped before reaching the emitter because the bounded channel was full or closed. Any sustained increase is a correctness/health issue. |
 
-For latency triage, start with the ingest split. High `orderbook_ingest_source_gossip_seconds` with low `orderbook_ingest_file_mtime_lag_seconds` and near-zero `orderbook_ingest_backlog_bytes` points to validator or upstream HL delay. High `orderbook_ingest_row_file_visibility_lag_seconds` means the row's `local_time` was assigned materially before the append became visible in the file. Low source gossip with high file mtime lag or growing backlog points to publisher-side wake/drain contention. In streaming mode, `orderbook_stream_finalization_mode{mode="watermark"}` should be active during healthy monotonic output; `grace_fallback` means the listener is in startup synchronization or a conservative fallback after out-of-order rows. If ingest looks fresh but `orderbook_tob_queue_delay_seconds` or `orderbook_dob_queue_delay_seconds` is high, the bottleneck is inside multicast publishing.
+For latency triage, start with the ingest split. High `orderbook_ingest_source_gossip_seconds` with low `orderbook_ingest_file_mtime_lag_seconds` and near-zero `orderbook_ingest_backlog_bytes` points to validator or upstream HL delay. High `orderbook_ingest_row_file_visibility_lag_seconds` means the row's `local_time` was assigned materially before the append became visible in the file. Low source gossip with high file mtime lag or growing backlog points to publisher-side wake/drain contention. In streaming mode, `orderbook_stream_finalization_mode{mode="watermark"}` should be active during healthy monotonic output; `grace_fallback` means the listener is in startup synchronization or a conservative fallback after out-of-order rows. If ingest looks fresh but `orderbook_tob_queue_delay_seconds` or `orderbook_dob_queue_delay_seconds` is high, the bottleneck is inside multicast publishing. For TOB fills specifically, compare `orderbook_tob_fill_listener_to_publisher_seconds` to `orderbook_tob_queue_delay_seconds{message_type="fill"}`: high listener-to-publisher with low queue delay means delay before enqueue; high queue delay means receiver/publisher contention after enqueue.
+
+TOB trades are emitted only after both sides of a Hyperliquid fill pair are
+available. Block-mode rows often contain both sides in one batch, while live
+streaming rows can split the ask and bid sides across separate
+`node_fills_streaming` rows. The publisher pairs fills by trade id and verifies
+opposite sides plus matching coin, hash, price, size, and trade time before
+publishing a trade. Pending one-sided fills expire after a short bound. Stable
+one-sided `#...` token-alias fills are classified separately as
+`one_sided_token_alias` because live validator output can contain them without
+an opposite-side fill row. Pairing health is exposed through
+`orderbook_tob_fill_pair_total` and `orderbook_tob_fill_pair_pending`.
 
 ### Streaming Startup Synchronization
 
@@ -122,7 +149,7 @@ A canary on `aws-tyo-hl-mainnet` measured `node_fills_streaming` visibility befo
 | default output buffering | `190.6ms` | `890.5ms` | `2897.5ms` |
 | `--disable-output-file-buffering` | `0.5ms` | `1.3ms` | `3.3ms` |
 
-In that same live window, inotify and polling both observed new fill rows within a few milliseconds of the file mtime, while publisher `hl_to_wake` stayed at `0-1ms`. That means fill suppression was caused by validator output buffering, not inotify delay or publisher queueing. Snapshot suppression can still occur during upstream validator or Hyperliquid source jitter; diagnose that separately with `orderbook_ingest_source_gossip_seconds`, `orderbook_tob_snapshot_validator_write_lag_seconds`, and `orderbook_tob_queue_delay_seconds`.
+In that same live window, inotify and polling both observed new fill rows within a few milliseconds of the file mtime, while publisher `hl_to_wake` stayed at `0-1ms`. That means fill suppression was caused by validator output buffering, not inotify delay or publisher queueing. A later canary with `--separate-fill-ingest` showed the local fill handoff dropping to roughly `1ms`, confirming that split fill ingest removes local trade delay when status/diff processing is busy. Snapshot suppression can still occur during upstream validator or Hyperliquid source jitter, or when status/raw-diff processing is near the freshness threshold; diagnose that separately with `orderbook_ingest_source_gossip_seconds`, `orderbook_tob_snapshot_validator_write_lag_seconds`, `orderbook_tob_snapshot_listener_to_publisher_seconds`, and `orderbook_tob_queue_delay_seconds`.
 
 ## Multicast
 

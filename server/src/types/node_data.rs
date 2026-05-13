@@ -78,7 +78,7 @@ impl FromStr for IngestMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, strum_macros::Display)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, strum_macros::Display)]
 pub(crate) enum EventSource {
     Fills,
     OrderStatuses,

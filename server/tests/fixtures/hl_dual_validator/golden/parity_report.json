@@ -23,6 +23,7 @@
     "block_marketdata_packets": 64,
     "matched_end_quote_count": 50,
     "stream_end_quote_count": 50,
-    "stream_marketdata_packets": 1334
+    "stream_marketdata_packets": 1345,
+    "trade_count": 11
   }
 }

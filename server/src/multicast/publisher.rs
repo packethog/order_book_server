@@ -1,5 +1,5 @@
 #![allow(clippy::expect_used)]
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +21,7 @@ use crate::protocol::messages::{
     InstrumentDefinitionData, QuoteData, TradeData, encode_channel_reset, encode_end_of_session, encode_heartbeat,
     encode_instrument_definition, encode_manifest_summary, encode_quote, encode_trade,
 };
+use crate::types::{Trade, node_data::NodeDataFill};
 
 /// Per-cycle snapshot of instruments for definition retransmission.
 ///
@@ -50,6 +51,228 @@ impl DefinitionCycler {
     fn advance_to_start(&mut self) {
         self.pos = 0;
     }
+}
+
+#[derive(Debug)]
+struct PairedTobTrade {
+    trade: Trade,
+    block_time_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingFill {
+    fill: NodeDataFill,
+    block_time_ms: u64,
+    received_at_ms: u64,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingFillKey {
+    tid: u64,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FillPairIntervalReport {
+    paired: u64,
+    orphan_dropped: u64,
+    one_sided_token_alias: u64,
+    malformed: u64,
+    duplicate_replaced: u64,
+    pending: usize,
+}
+
+#[derive(Debug)]
+struct FillPairAccumulator {
+    pending: HashMap<u64, PendingFill>,
+    insertion_order: VecDeque<PendingFillKey>,
+    next_generation: u64,
+    paired_since_report: u64,
+    orphan_dropped_since_report: u64,
+    one_sided_token_alias_since_report: u64,
+    malformed_since_report: u64,
+    duplicate_replaced_since_report: u64,
+    last_report_ms: u64,
+}
+
+impl FillPairAccumulator {
+    const ORPHAN_TIMEOUT_MS: u64 = 5_000;
+    const MAX_PENDING: usize = 100_000;
+    const REPORT_INTERVAL_MS: u64 = 60_000;
+
+    fn new(now_ms: u64) -> Self {
+        crate::metrics::set_tob_fill_pair_pending(0);
+        Self {
+            pending: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            next_generation: 1,
+            paired_since_report: 0,
+            orphan_dropped_since_report: 0,
+            one_sided_token_alias_since_report: 0,
+            malformed_since_report: 0,
+            duplicate_replaced_since_report: 0,
+            last_report_ms: now_ms,
+        }
+    }
+
+    fn ingest_batch(
+        &mut self,
+        batch: &crate::types::node_data::Batch<NodeDataFill>,
+        now_ms: u64,
+    ) -> Vec<PairedTobTrade> {
+        self.expire_orphans(now_ms);
+        let mut paired = Vec::new();
+        for fill in batch.events_ref() {
+            if let Some(pair) = self.ingest_fill(fill.clone(), batch.block_time(), now_ms) {
+                paired.push(pair);
+            }
+        }
+        self.evict_to_capacity();
+        crate::metrics::set_tob_fill_pair_pending(self.pending.len());
+        paired
+    }
+
+    fn ingest_fill(&mut self, fill: NodeDataFill, block_time_ms: u64, now_ms: u64) -> Option<PairedTobTrade> {
+        let tid = fill.1.tid;
+        if let Some(existing) = self.pending.remove(&tid) {
+            if existing.fill.1.side == fill.1.side {
+                self.record_duplicate_replaced();
+                self.insert_pending(fill, block_time_ms, now_ms);
+                return None;
+            }
+
+            if !fills_are_pairable(&existing.fill, &fill) {
+                self.record_malformed();
+                return None;
+            }
+
+            let mut fills = HashMap::new();
+            fills.insert(existing.fill.1.side, existing.fill);
+            fills.insert(fill.1.side, fill);
+            let Some(trade) = Trade::from_fills(fills) else {
+                self.record_malformed();
+                return None;
+            };
+            self.record_paired();
+            return Some(PairedTobTrade { trade, block_time_ms: existing.block_time_ms.max(block_time_ms) });
+        }
+
+        self.insert_pending(fill, block_time_ms, now_ms);
+        None
+    }
+
+    fn insert_pending(&mut self, fill: NodeDataFill, block_time_ms: u64, now_ms: u64) {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let tid = fill.1.tid;
+        self.pending.insert(tid, PendingFill { fill, block_time_ms, received_at_ms: now_ms, generation });
+        self.insertion_order.push_back(PendingFillKey { tid, generation });
+    }
+
+    fn expire_orphans(&mut self, now_ms: u64) {
+        loop {
+            let Some(key) = self.insertion_order.front().copied() else {
+                break;
+            };
+            let Some(pending) = self.pending.get(&key.tid) else {
+                self.insertion_order.pop_front();
+                continue;
+            };
+            if pending.generation != key.generation {
+                self.insertion_order.pop_front();
+                continue;
+            }
+            if now_ms.saturating_sub(pending.received_at_ms) < Self::ORPHAN_TIMEOUT_MS {
+                break;
+            }
+            self.insertion_order.pop_front();
+            if let Some(pending) = self.pending.remove(&key.tid) {
+                self.record_unpaired_pending(&pending.fill);
+            }
+        }
+    }
+
+    fn evict_to_capacity(&mut self) {
+        while self.pending.len() > Self::MAX_PENDING {
+            let Some(key) = self.insertion_order.pop_front() else {
+                break;
+            };
+            if self.pending.get(&key.tid).is_some_and(|pending| pending.generation == key.generation)
+                && let Some(pending) = self.pending.remove(&key.tid)
+            {
+                self.record_unpaired_pending(&pending.fill);
+            }
+        }
+    }
+
+    fn report_if_due(&mut self, now_ms: u64) -> Option<FillPairIntervalReport> {
+        if now_ms.saturating_sub(self.last_report_ms) < Self::REPORT_INTERVAL_MS {
+            return None;
+        }
+        let report = FillPairIntervalReport {
+            paired: self.paired_since_report,
+            orphan_dropped: self.orphan_dropped_since_report,
+            one_sided_token_alias: self.one_sided_token_alias_since_report,
+            malformed: self.malformed_since_report,
+            duplicate_replaced: self.duplicate_replaced_since_report,
+            pending: self.pending.len(),
+        };
+        self.paired_since_report = 0;
+        self.orphan_dropped_since_report = 0;
+        self.one_sided_token_alias_since_report = 0;
+        self.malformed_since_report = 0;
+        self.duplicate_replaced_since_report = 0;
+        self.last_report_ms = now_ms;
+        if report.orphan_dropped > 0
+            || report.one_sided_token_alias > 0
+            || report.malformed > 0
+            || report.duplicate_replaced > 0
+        {
+            Some(report)
+        } else {
+            None
+        }
+    }
+
+    fn record_paired(&mut self) {
+        self.paired_since_report += 1;
+        crate::metrics::inc_tob_fill_pair("paired", 1);
+    }
+
+    fn record_orphan_dropped(&mut self) {
+        self.orphan_dropped_since_report += 1;
+        crate::metrics::inc_tob_fill_pair("orphan_dropped", 1);
+    }
+
+    fn record_unpaired_pending(&mut self, fill: &NodeDataFill) {
+        if fill.1.coin.starts_with('#') {
+            self.one_sided_token_alias_since_report += 1;
+            crate::metrics::inc_tob_fill_pair("one_sided_token_alias", 1);
+        } else {
+            self.record_orphan_dropped();
+        }
+    }
+
+    fn record_malformed(&mut self) {
+        self.malformed_since_report += 1;
+        crate::metrics::inc_tob_fill_pair("malformed", 1);
+    }
+
+    fn record_duplicate_replaced(&mut self) {
+        self.duplicate_replaced_since_report += 1;
+        crate::metrics::inc_tob_fill_pair("duplicate_replaced", 1);
+    }
+}
+
+fn fills_are_pairable(left: &NodeDataFill, right: &NodeDataFill) -> bool {
+    left.1.side != right.1.side
+        && left.1.tid == right.1.tid
+        && left.1.coin == right.1.coin
+        && left.1.hash == right.1.hash
+        && left.1.px == right.1.px
+        && left.1.sz == right.1.sz
+        && left.1.time == right.1.time
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -639,7 +862,7 @@ impl MulticastPublisher {
     }
 
     /// Encodes fills as Trade messages, batching into frames.
-    async fn publish_trades(&self, trades_by_coin: &HashMap<String, Vec<crate::types::Trade>>) -> bool {
+    async fn publish_trades(&self, trades_by_coin: &HashMap<String, Vec<Trade>>) -> bool {
         let mut fb = FrameBuilder::new(0, self.next_seq(), Self::now_ns(), self.config.mtu);
         let mut sent_any = false;
 
@@ -737,6 +960,7 @@ impl MulticastPublisher {
         let mut had_activity = false;
         let mut caught_up = false;
         let mut health = TobPublisherHealth::new(Self::now_ms());
+        let mut fill_pairs = FillPairAccumulator::new(Self::now_ms());
 
         // Definition cycler state
         let mut cycler = DefinitionCycler::empty();
@@ -821,51 +1045,88 @@ impl MulticastPublisher {
                                     }
                                 }
                             }
-                            InternalMessage::Fills { batch, enqueued_at_ms } => {
+                            InternalMessage::Fills { batch, enqueued_at_ms, path } => {
                                 let now_ms = Self::now_ms();
                                 let queue_delay_ms = now_ms.saturating_sub(*enqueued_at_ms);
+                                let listener_to_publisher_ms = now_ms.saturating_sub(batch.local_time_ms());
                                 health.record_queue_delay(queue_delay_ms);
                                 crate::metrics::observe_tob_queue_delay("fill", Duration::from_millis(queue_delay_ms));
-                                let lag_ms = now_ms.saturating_sub(batch.block_time());
-                                if Self::should_publish_lag(lag_ms) {
-                                    health.observe_publishable_lag(lag_ms);
-                                    crate::metrics::observe_tob_source_lag(
-                                        "fill",
-                                        "published",
-                                        Duration::from_millis(lag_ms),
-                                    );
-                                    let trades_by_coin = crate::servers::websocket_server::coin_to_trades(batch);
-                                    if self.publish_trades(&trades_by_coin).await {
-                                        had_activity = true;
-                                        heartbeat_interval.reset();
-                                    }
-                                } else {
+                                crate::metrics::observe_tob_fill_listener_to_publisher(
+                                    path,
+                                    Duration::from_millis(listener_to_publisher_ms),
+                                );
+                                let row_lag_ms = now_ms.saturating_sub(batch.block_time());
+                                if !Self::should_publish_lag(row_lag_ms) {
                                     let local_time_ms = batch.local_time_ms();
                                     let fill = TobSuppressedFill {
                                         height: batch.block_number(),
                                         block_time_ms: batch.block_time(),
                                         local_time_ms,
-                                        source_lag_ms: lag_ms,
+                                        source_lag_ms: row_lag_ms,
                                         validator_write_lag_ms: local_time_ms.saturating_sub(batch.block_time()),
-                                        listener_to_publisher_ms: now_ms.saturating_sub(local_time_ms),
+                                        listener_to_publisher_ms,
                                         queue_delay_ms,
                                         event_count: batch.events_ref().len(),
                                     };
                                     crate::metrics::observe_tob_source_lag(
                                         "fill",
                                         "suppressed",
-                                        Duration::from_millis(lag_ms),
+                                        Duration::from_millis(row_lag_ms),
                                     );
                                     crate::metrics::inc_tob_suppressed("fill");
                                     if let Some(report) = health.record_suppressed(
                                         TobSuppressedKind::Fill,
-                                        lag_ms,
+                                        row_lag_ms,
                                         now_ms,
                                         None,
                                         Some(fill),
                                     ) {
                                         Self::log_tob_health(report);
                                     }
+                                }
+                                let paired = fill_pairs.ingest_batch(batch, now_ms);
+                                let mut publishable_trades = HashMap::<String, Vec<Trade>>::new();
+                                for paired_trade in paired {
+                                    let trade_lag_ms = now_ms.saturating_sub(paired_trade.block_time_ms);
+                                    if Self::should_publish_lag(trade_lag_ms) {
+                                        health.observe_publishable_lag(trade_lag_ms);
+                                        crate::metrics::observe_tob_source_lag(
+                                            "fill",
+                                            "published",
+                                            Duration::from_millis(trade_lag_ms),
+                                        );
+                                        publishable_trades
+                                            .entry(paired_trade.trade.coin.clone())
+                                            .or_default()
+                                            .push(paired_trade.trade);
+                                    }
+                                }
+                                if self.publish_trades(&publishable_trades).await {
+                                    had_activity = true;
+                                    heartbeat_interval.reset();
+                                }
+                                if let Some(report) = fill_pairs.report_if_due(now_ms) {
+                                        if report.malformed > 0 || report.duplicate_replaced > 0 {
+                                            warn!(
+                                                "tob fill pairing: paired={} orphan_dropped={} one_sided_token_alias={} malformed={} duplicate_replaced={} pending={}",
+                                                report.paired,
+                                                report.orphan_dropped,
+                                                report.one_sided_token_alias,
+                                                report.malformed,
+                                                report.duplicate_replaced,
+                                                report.pending,
+                                            );
+                                        } else {
+                                            info!(
+                                                "tob fill pairing: paired={} orphan_dropped={} one_sided_token_alias={} malformed={} duplicate_replaced={} pending={}",
+                                                report.paired,
+                                                report.orphan_dropped,
+                                                report.one_sided_token_alias,
+                                                report.malformed,
+                                                report.duplicate_replaced,
+                                                report.pending,
+                                            );
+                                        }
                                 }
                                 // fills are high volume during catchup; progress
                                 // is already logged by the snapshot path above
@@ -1046,7 +1307,7 @@ mod tests {
                 px: "100.0".to_string(),
                 sz: "1.0".to_string(),
                 side,
-                time: MulticastPublisher::now_ms(),
+                time: 1_700_000_000_000,
                 start_position: "0".to_string(),
                 dir: "Open Long".to_string(),
                 closed_pnl: "0".to_string(),
@@ -1273,8 +1534,11 @@ mod tests {
                 MulticastPublisher::now_ms(),
                 vec![test_fill("UNKNOWN", Side::Ask, tid), test_fill("UNKNOWN", Side::Bid, tid)],
             );
-            let _unused =
-                tx.send(Arc::new(InternalMessage::Fills { batch, enqueued_at_ms: MulticastPublisher::now_ms() }));
+            let _unused = tx.send(Arc::new(InternalMessage::Fills {
+                batch,
+                enqueued_at_ms: MulticastPublisher::now_ms(),
+                path: "test",
+            }));
             tid += 1;
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1303,7 +1567,11 @@ mod tests {
             MulticastPublisher::now_ms(),
             vec![test_fill("BTC", Side::Ask, 42), test_fill("BTC", Side::Bid, 42)],
         );
-        let _unused = tx.send(Arc::new(InternalMessage::Fills { batch, enqueued_at_ms: MulticastPublisher::now_ms() }));
+        let _unused = tx.send(Arc::new(InternalMessage::Fills {
+            batch,
+            enqueued_at_ms: MulticastPublisher::now_ms(),
+            path: "test",
+        }));
 
         let early = collect_market_msg_types(&marketdata_recv, Duration::from_millis(40)).await;
         assert!(early.contains(&MSG_TYPE_TRADE), "fresh mapped fills emit a trade frame");
@@ -1319,6 +1587,137 @@ mod tests {
             later.contains(&MSG_TYPE_HEARTBEAT),
             "heartbeat resumes after the marketdata path is idle for the heartbeat interval",
         );
+    }
+
+    #[tokio::test]
+    async fn split_row_fills_emit_trade_frame() {
+        let heartbeat_interval = Duration::from_millis(100);
+        let (tx, handle, marketdata_recv) = spawn_running_test_publisher(heartbeat_interval).await;
+
+        let startup = collect_market_msg_types(&marketdata_recv, Duration::from_millis(100)).await;
+        assert!(startup.contains(&MSG_TYPE_CHANNEL_RESET), "publisher emits startup ChannelReset on mktdata");
+
+        for fill in [test_fill("BTC", Side::Bid, 420), test_fill("BTC", Side::Ask, 420)] {
+            let batch = Batch::new_for_test(1, MulticastPublisher::now_ms(), vec![fill]);
+            let _unused = tx.send(Arc::new(InternalMessage::Fills {
+                batch,
+                enqueued_at_ms: MulticastPublisher::now_ms(),
+                path: "test",
+            }));
+        }
+
+        let msg_types = collect_market_msg_types(&marketdata_recv, Duration::from_millis(100)).await;
+        handle.abort();
+
+        assert!(msg_types.contains(&MSG_TYPE_TRADE), "split-row fills emit a trade frame");
+    }
+
+    fn fill_batch(block_number: u64, events: Vec<NodeDataFill>) -> Batch<NodeDataFill> {
+        Batch::new_for_test(block_number, 1_700_000_000_000, events)
+    }
+
+    #[test]
+    fn fill_pair_accumulator_pairs_same_row() {
+        let mut pairs = FillPairAccumulator::new(1_000);
+        let out = pairs
+            .ingest_batch(&fill_batch(1, vec![test_fill("BTC", Side::Bid, 1), test_fill("BTC", Side::Ask, 1)]), 1_000);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].trade.tid, 1);
+        assert!(pairs.pending.is_empty());
+    }
+
+    #[test]
+    fn fill_pair_accumulator_pairs_split_rows_bid_then_ask() {
+        let mut pairs = FillPairAccumulator::new(1_000);
+
+        let first = pairs.ingest_batch(&fill_batch(1, vec![test_fill("BTC", Side::Bid, 2)]), 1_000);
+        let second = pairs.ingest_batch(&fill_batch(1, vec![test_fill("BTC", Side::Ask, 2)]), 1_001);
+
+        assert!(first.is_empty());
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].trade.tid, 2);
+        assert!(pairs.pending.is_empty());
+    }
+
+    #[test]
+    fn fill_pair_accumulator_pairs_split_rows_ask_then_bid() {
+        let mut pairs = FillPairAccumulator::new(1_000);
+
+        let first = pairs.ingest_batch(&fill_batch(1, vec![test_fill("BTC", Side::Ask, 3)]), 1_000);
+        let second = pairs.ingest_batch(&fill_batch(1, vec![test_fill("BTC", Side::Bid, 3)]), 1_001);
+
+        assert!(first.is_empty());
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].trade.tid, 3);
+        assert!(pairs.pending.is_empty());
+    }
+
+    #[test]
+    fn fill_pair_accumulator_replaces_duplicate_same_side() {
+        let mut pairs = FillPairAccumulator::new(1_000);
+        assert!(pairs.ingest_batch(&fill_batch(1, vec![test_fill("BTC", Side::Bid, 4)]), 1_000).is_empty());
+        assert!(pairs.ingest_batch(&fill_batch(1, vec![test_fill("BTC", Side::Bid, 4)]), 1_001).is_empty());
+
+        let report = pairs.report_if_due(61_001).expect("duplicate report");
+        assert_eq!(report.duplicate_replaced, 1);
+        assert_eq!(report.pending, 1);
+    }
+
+    #[test]
+    fn fill_pair_accumulator_rejects_mismatched_pair() {
+        let mut pairs = FillPairAccumulator::new(1_000);
+        let mut ask = test_fill("BTC", Side::Ask, 5);
+        ask.1.hash = "0x1".to_string();
+        let mut bid = test_fill("BTC", Side::Bid, 5);
+        bid.1.hash = "0x2".to_string();
+
+        assert!(pairs.ingest_batch(&fill_batch(1, vec![ask]), 1_000).is_empty());
+        assert!(pairs.ingest_batch(&fill_batch(1, vec![bid]), 1_001).is_empty());
+
+        let report = pairs.report_if_due(61_001).expect("malformed report");
+        assert_eq!(report.malformed, 1);
+        assert_eq!(report.pending, 0);
+    }
+
+    #[test]
+    fn fill_pair_accumulator_expires_orphans() {
+        let mut pairs = FillPairAccumulator::new(1_000);
+        assert!(pairs.ingest_batch(&fill_batch(1, vec![test_fill("BTC", Side::Bid, 6)]), 1_000).is_empty());
+
+        pairs.expire_orphans(1_000 + FillPairAccumulator::ORPHAN_TIMEOUT_MS + 1);
+        let report = pairs.report_if_due(61_001).expect("orphan report");
+
+        assert_eq!(report.orphan_dropped, 1);
+        assert_eq!(report.one_sided_token_alias, 0);
+        assert_eq!(report.pending, 0);
+    }
+
+    #[test]
+    fn fill_pair_accumulator_classifies_one_sided_token_aliases_separately() {
+        let mut pairs = FillPairAccumulator::new(1_000);
+        assert!(pairs.ingest_batch(&fill_batch(1, vec![test_fill("#350", Side::Bid, 7)]), 1_000).is_empty());
+
+        pairs.expire_orphans(1_000 + FillPairAccumulator::ORPHAN_TIMEOUT_MS + 1);
+        let report = pairs.report_if_due(61_001).expect("one-sided token alias report");
+
+        assert_eq!(report.orphan_dropped, 0);
+        assert_eq!(report.one_sided_token_alias, 1);
+        assert_eq!(report.pending, 0);
+    }
+
+    #[test]
+    fn fill_pair_accumulator_capacity_evicts_oldest() {
+        let mut pairs = FillPairAccumulator::new(1_000);
+
+        for tid in 0..=FillPairAccumulator::MAX_PENDING as u64 {
+            let _paired = pairs.ingest_batch(&fill_batch(1, vec![test_fill("BTC", Side::Bid, tid)]), 1_000);
+        }
+
+        assert_eq!(pairs.pending.len(), FillPairAccumulator::MAX_PENDING);
+        assert!(!pairs.pending.contains_key(&0), "oldest pending fill is evicted");
+        let report = pairs.report_if_due(61_001).expect("capacity report");
+        assert_eq!(report.orphan_dropped, 1);
     }
 
     #[test]

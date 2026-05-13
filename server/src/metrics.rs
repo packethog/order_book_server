@@ -29,12 +29,16 @@ pub struct Metrics {
     tob_snapshot_source_block_lag_seconds: HistogramVec,
     tob_snapshot_validator_write_lag_seconds: HistogramVec,
     tob_snapshot_listener_to_publisher_seconds: HistogramVec,
+    tob_fill_enqueue_lag_seconds: HistogramVec,
+    tob_fill_listener_to_publisher_seconds: HistogramVec,
     tob_queue_delay_seconds: HistogramVec,
     tob_source_lag_seconds: HistogramVec,
     tob_socket_send_seconds: HistogramVec,
     tob_packets_total: IntCounterVec,
     tob_suppressed_total: IntCounterVec,
     tob_receiver_lag_total: IntCounterVec,
+    tob_fill_pair_total: IntCounterVec,
+    tob_fill_pair_pending: IntGaugeVec,
     dob_queue_delay_seconds: HistogramVec,
     dob_encode_seconds: HistogramVec,
     dob_socket_send_seconds: HistogramVec,
@@ -186,6 +190,22 @@ pub fn get() -> &'static Metrics {
             ),
             &["source"],
         );
+        let tob_fill_enqueue_lag_seconds = register_histogram(
+            &registry,
+            HistogramOpts::new(
+                "orderbook_tob_fill_enqueue_lag_seconds",
+                "TOB fill source lag at listener enqueue, before publisher queueing.",
+            ),
+            &["path"],
+        );
+        let tob_fill_listener_to_publisher_seconds = register_histogram(
+            &registry,
+            HistogramOpts::new(
+                "orderbook_tob_fill_listener_to_publisher_seconds",
+                "Fill source-row local_time to TOB publisher receive time.",
+            ),
+            &["path"],
+        );
         let tob_queue_delay_seconds = register_histogram(
             &registry,
             HistogramOpts::new(
@@ -219,6 +239,17 @@ pub fn get() -> &'static Metrics {
             Opts::new("orderbook_tob_receiver_lag_total", "TOB internal broadcast receiver lag."),
             &["kind"],
         );
+        let tob_fill_pair_total = register_counter(
+            &registry,
+            Opts::new("orderbook_tob_fill_pair_total", "TOB fill pair accumulator outcomes."),
+            &["outcome"],
+        );
+        let tob_fill_pair_pending = IntGaugeVec::new(
+            Opts::new("orderbook_tob_fill_pair_pending", "Current pending one-sided TOB fill pairs."),
+            &[],
+        )
+        .expect("valid gauge metric");
+        registry.register(Box::new(tob_fill_pair_pending.clone())).expect("metric registered once");
         let dob_queue_delay_seconds = register_histogram(
             &registry,
             HistogramOpts::new(
@@ -261,12 +292,16 @@ pub fn get() -> &'static Metrics {
             tob_snapshot_source_block_lag_seconds,
             tob_snapshot_validator_write_lag_seconds,
             tob_snapshot_listener_to_publisher_seconds,
+            tob_fill_enqueue_lag_seconds,
+            tob_fill_listener_to_publisher_seconds,
             tob_queue_delay_seconds,
             tob_source_lag_seconds,
             tob_socket_send_seconds,
             tob_packets_total,
             tob_suppressed_total,
             tob_receiver_lag_total,
+            tob_fill_pair_total,
+            tob_fill_pair_pending,
             dob_queue_delay_seconds,
             dob_encode_seconds,
             dob_socket_send_seconds,
@@ -344,6 +379,14 @@ pub fn observe_tob_snapshot_listener_to_publisher(source: &'static str, duration
     get().tob_snapshot_listener_to_publisher_seconds.with_label_values(&[source]).observe(duration.as_secs_f64());
 }
 
+pub fn observe_tob_fill_enqueue_lag(path: &'static str, duration: Duration) {
+    get().tob_fill_enqueue_lag_seconds.with_label_values(&[path]).observe(duration.as_secs_f64());
+}
+
+pub fn observe_tob_fill_listener_to_publisher(path: &'static str, duration: Duration) {
+    get().tob_fill_listener_to_publisher_seconds.with_label_values(&[path]).observe(duration.as_secs_f64());
+}
+
 pub fn observe_tob_queue_delay(message_type: &'static str, duration: Duration) {
     get().tob_queue_delay_seconds.with_label_values(&[message_type]).observe(duration.as_secs_f64());
 }
@@ -366,6 +409,15 @@ pub fn inc_tob_suppressed(message_type: &'static str) {
 
 pub fn inc_tob_receiver_lag(kind: &'static str, count: u64) {
     get().tob_receiver_lag_total.with_label_values(&[kind]).inc_by(count);
+}
+
+pub fn inc_tob_fill_pair(outcome: &'static str, count: u64) {
+    get().tob_fill_pair_total.with_label_values(&[outcome]).inc_by(count);
+}
+
+pub fn set_tob_fill_pair_pending(count: usize) {
+    let value = i64::try_from(count).unwrap_or(i64::MAX);
+    get().tob_fill_pair_pending.with_label_values(&[]).set(value);
 }
 
 pub fn observe_dob_queue_delay(event_type: &'static str, duration: Duration) {
@@ -426,10 +478,14 @@ mod tests {
         observe_stream_reorder_delay("diffs", Duration::from_millis(7));
         observe_tob_snapshot_compute("diffs", Duration::from_millis(6));
         observe_tob_snapshot_enqueue_lag("diffs", Duration::from_millis(7));
+        observe_tob_fill_enqueue_lag("main_listener", Duration::from_millis(8));
+        observe_tob_fill_listener_to_publisher("main_listener", Duration::from_millis(9));
         observe_tob_queue_delay("snapshot", Duration::from_millis(2));
         observe_tob_source_lag("snapshot", "published", Duration::from_millis(3));
         observe_tob_socket_send("marketdata", Duration::from_micros(10));
         inc_tob_packet("quote");
+        inc_tob_fill_pair("paired", 1);
+        set_tob_fill_pair_pending(1);
         observe_dob_queue_delay("order_add", Duration::from_millis(1));
         observe_dob_encode("order_add", Duration::from_micros(5));
         observe_dob_socket_send("mktdata", Duration::from_micros(7));
@@ -449,7 +505,11 @@ mod tests {
         assert!(body.contains("orderbook_stream_reorder_delay_seconds"));
         assert!(body.contains("orderbook_tob_snapshot_compute_seconds"));
         assert!(body.contains("orderbook_tob_snapshot_enqueue_lag_seconds"));
+        assert!(body.contains("orderbook_tob_fill_enqueue_lag_seconds"));
+        assert!(body.contains("orderbook_tob_fill_listener_to_publisher_seconds"));
         assert!(body.contains("orderbook_tob_queue_delay_seconds"));
+        assert!(body.contains("orderbook_tob_fill_pair_total"));
+        assert!(body.contains("orderbook_tob_fill_pair_pending"));
         assert!(body.contains("orderbook_dob_channel_drops_total"));
     }
 }

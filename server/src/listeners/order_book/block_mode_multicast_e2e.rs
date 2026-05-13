@@ -22,7 +22,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use super::{EventSource, IngestMode, InternalMessage, OrderBookListener, utils::EventBatch};
+use super::{EventSource, IngestMode, InternalMessage, OrderBookListener, now_ms, utils::EventBatch};
 use crate::{
     instruments::{InstrumentInfo, RegistryState, UniverseEntry, make_symbol, new_shared_registry},
     listeners::{
@@ -45,7 +45,7 @@ use crate::{
     types::{
         L4Order, OrderDiff,
         inner::InnerL4Order,
-        node_data::{Batch, NodeDataOrderDiff, NodeDataOrderStatus},
+        node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
 
@@ -324,6 +324,49 @@ async fn streaming_l4_flood_does_not_starve_tob_marketdata() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streaming_live_shape_split_fill_rows_match_block_tob_trades() {
+    let root = fixture_root();
+    let block = capture_fixture_replay(&root, IngestMode::Block, "BTC").await;
+    let stream = capture_fixture_replay(&root, IngestMode::Stream, "BTC").await;
+
+    let block_trades = tob_trade_messages(&block.tob_marketdata);
+    let stream_trades = tob_trade_messages(&stream.tob_marketdata);
+
+    assert!(!block_trades.is_empty(), "block replay emits TOB trades");
+    assert!(!stream_trades.is_empty(), "live-shape streaming replay emits TOB trades from split fill rows");
+    assert_message_stream_eq("TOB trade payload parity for split streaming fills", &block_trades, &stream_trades);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn separate_fill_path_split_rows_emit_tob_trades() {
+    let root = fixture_root();
+    let registry = new_shared_registry(test_registry_state());
+    let (market_tx, _) = broadcast_channel::<Arc<InternalMessage>>(512);
+    let tob_market = UdpCollector::bind().await;
+    let tob_refdata = UdpCollector::bind().await;
+    let tob_handle =
+        spawn_tob_publisher(market_tx.subscribe(), registry.clone(), tob_market.port(), tob_refdata.port()).await;
+
+    for line in fs::read_to_string(stream_file(&root, "node_fills_streaming")).unwrap().lines() {
+        let batch: Batch<NodeDataFill> = serde_json::from_str(line).unwrap();
+        if batch.events_ref().is_empty() {
+            continue;
+        }
+        let _unused = market_tx.send(Arc::new(InternalMessage::Fills {
+            batch,
+            enqueued_at_ms: now_ms(),
+            path: "separate_listener",
+        }));
+    }
+
+    sleep(Duration::from_millis(700)).await;
+    tob_handle.abort();
+
+    let packets = normalize_tob(tob_market.finish());
+    assert_has_msg_type(&packets, tob_const::MSG_TYPE_TRADE, "separate fill path TOB trade");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires HL_STREAM_CAPTURE_ROOT pointing at a real hl-node _streaming capture"]
 async fn live_stream_capture_replays_expected_multicast_packets() {
     let root = PathBuf::from(
@@ -455,6 +498,12 @@ async fn dual_validator_fixture_matches_block_and_stream_goldens() {
     let stream_dob_orders = dob_order_messages(&stream.dob_mktdata);
     assert_message_stream_eq("dual DoB order-event payload parity", &block_dob_orders, &stream_dob_orders);
 
+    let block_tob_trades = tob_trade_messages(&block.tob_marketdata);
+    let stream_tob_trades = tob_trade_messages(&stream.tob_marketdata);
+    assert!(!block_tob_trades.is_empty(), "dual block replay emits TOB trades");
+    assert!(!stream_tob_trades.is_empty(), "dual streaming replay emits TOB trades");
+    assert_message_stream_eq("dual TOB trade payload parity", &block_tob_trades, &stream_tob_trades);
+
     let expected_boundary_delta = manifest["expected_boundary_delta"]["count"]
         .as_u64()
         .expect("dual manifest has expected boundary delta") as usize;
@@ -501,6 +550,7 @@ async fn dual_validator_fixture_matches_block_and_stream_goldens() {
             "tob": {
                 "block_marketdata_packets": block.tob_marketdata.len(),
                 "stream_marketdata_packets": stream.tob_marketdata.len(),
+                "trade_count": block_tob_trades.len(),
                 "block_end_quote_count": block_end_quote_map.len(),
                 "stream_end_quote_count": stream_end_quote_map.len(),
                 "matched_end_quote_count": common_end_quotes.len(),
@@ -2183,6 +2233,15 @@ fn dob_order_messages(packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
                 )
             )
         })
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+fn tob_trade_messages(packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    packets
+        .iter()
+        .flat_map(|packet| frame_messages(packet))
+        .filter(|msg| msg.first().copied() == Some(tob_const::MSG_TYPE_TRADE))
         .map(<[u8]>::to_vec)
         .collect()
 }

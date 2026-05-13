@@ -76,11 +76,11 @@
         "lines": 146
       },
       "fills": {
-        "bytes": 6862,
+        "bytes": 7118,
         "events": 4,
         "first_block": 978995377,
         "last_block": 978995416,
-        "lines": 41
+        "lines": 43
       },
       "statuses": {
         "bytes": 4688574,
@@ -96,7 +96,7 @@
       "fills": "hl/data/node_fills_streaming/hourly/20260430/20",
       "statuses": "hl/data/node_order_statuses_streaming/hourly/20260430/20"
     },
-    "fills_grouping": "pairs preserved for trade reconstruction",
+    "fills_grouping": "one event per line; live streaming can split the two sides of a trade across rows",
     "generation": "derived from filtered by-block fixture",
     "statuses_grouping": "one event per line"
   },

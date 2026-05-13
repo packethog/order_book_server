@@ -22,7 +22,7 @@ use crate::{
     instruments::{RegistryState, SharedRegistry},
     listeners::order_book::{
         DobReplayTaps, InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots,
-        dob_tap::DobApplyTap, hl_listen,
+        dob_tap::DobApplyTap, hl_listen, hl_listen_fills_only,
     },
     multicast::{
         config::{DobConfig, MulticastConfig},
@@ -58,7 +58,12 @@ pub async fn run_websocket_server(
     dob_config: Option<DobConfig>,
     ingest_mode: IngestMode,
     hl_data_root: Option<PathBuf>,
+    separate_fill_ingest: bool,
 ) -> Result<()> {
+    if separate_fill_ingest && ingest_mode != IngestMode::Stream {
+        return Err("--separate-fill-ingest requires streaming ingest mode".into());
+    }
+
     let (market_message_tx, _) = channel::<Arc<InternalMessage>>(100);
     let (l4_message_tx, _) = channel::<Arc<InternalMessage>>(4096);
 
@@ -76,9 +81,22 @@ pub async fn run_websocket_server(
     let listener = Arc::new(Mutex::new(listener));
     {
         let listener = listener.clone();
+        let listen_hl_data_root = hl_data_root.clone();
         tokio::spawn(async move {
-            if let Err(err) = hl_listen(listener, home_dir, hl_data_root, ingest_mode).await {
+            if let Err(err) =
+                hl_listen(listener, home_dir, listen_hl_data_root, ingest_mode, !separate_fill_ingest).await
+            {
                 error!("Listener fatal error: {err}");
+                std::process::exit(1);
+            }
+        });
+    }
+    if separate_fill_ingest {
+        let market_message_tx = market_message_tx.clone();
+        let fill_hl_data_root = hl_data_root.clone();
+        tokio::spawn(async move {
+            if let Err(err) = hl_listen_fills_only(market_message_tx, fill_hl_data_root).await {
+                error!("Fill listener fatal error: {err}");
                 std::process::exit(1);
             }
         });
@@ -647,5 +665,19 @@ impl Subscription {
             return Err("Snapshot Failed".into());
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn separate_fill_ingest_rejects_block_mode_before_startup() {
+        let err = run_websocket_server("127.0.0.1:0", true, 1, None, None, IngestMode::Block, None, true)
+            .await
+            .err()
+            .map(|err| err.to_string());
+        assert_eq!(err.as_deref(), Some("--separate-fill-ingest requires streaming ingest mode"));
     }
 }

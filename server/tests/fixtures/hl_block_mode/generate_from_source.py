@@ -106,11 +106,6 @@ def filter_events(source_root: Path, coins: set[str]) -> dict:
 
 
 def split_events_for_streaming(name: str, events: list) -> list[list]:
-    if name == "fills":
-        # The publisher's trade conversion currently expects buy/sell fill
-        # pairs in one batch, so keep fill pairs together while still emitting
-        # multiple streaming lines for active blocks.
-        return [events[idx : idx + 2] for idx in range(0, len(events), 2)]
     return [[event] for event in events]
 
 
@@ -167,7 +162,7 @@ def write_manifest(
         "generation": "derived from filtered by-block fixture",
         "files": STREAMING_EVENT_FILES,
         "counts": streaming_counts,
-        "fills_grouping": "pairs preserved for trade reconstruction",
+        "fills_grouping": "one event per line; live streaming can split the two sides of a trade across rows",
         "diffs_grouping": "one event per line",
         "statuses_grouping": "one event per line",
     }

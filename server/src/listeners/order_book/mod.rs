@@ -114,19 +114,29 @@ fn seek_to_recent_jsonl_boundary(file: &mut File) -> Result<bool> {
 
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
 // if there are scripts running, this may not work as intended
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn hl_listen(
     listener: Arc<Mutex<OrderBookListener>>,
     snapshot_dir: PathBuf,
     hl_data_root: PathBuf,
     ingest_mode: IngestMode,
+    watch_fills: bool,
 ) -> Result<()> {
     let order_statuses_dir =
         EventSource::OrderStatuses.event_source_dir_for(&hl_data_root, ingest_mode).canonicalize()?;
-    let fills_dir = EventSource::Fills.event_source_dir_for(&hl_data_root, ingest_mode).canonicalize()?;
+    let fills_dir = if watch_fills {
+        Some(EventSource::Fills.event_source_dir_for(&hl_data_root, ingest_mode).canonicalize()?)
+    } else {
+        None
+    };
     let order_diffs_dir = EventSource::OrderDiffs.event_source_dir_for(&hl_data_root, ingest_mode).canonicalize()?;
     info!("Monitoring order status directory: {}", order_statuses_dir.display());
     info!("Monitoring order diffs directory: {}", order_diffs_dir.display());
-    info!("Monitoring fills directory: {}", fills_dir.display());
+    if let Some(fills_dir) = &fills_dir {
+        info!("Monitoring fills directory: {}", fills_dir.display());
+    } else {
+        info!("Fills directory handled by separate streaming fill listener");
+    }
 
     // monitoring the directory via the notify crate (gives file system events)
     let (fs_event_tx, mut fs_event_rx) = unbounded_channel();
@@ -149,7 +159,9 @@ pub(crate) async fn hl_listen(
     let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<Result<()>>();
 
     watcher.watch(&order_statuses_dir, RecursiveMode::Recursive)?;
-    watcher.watch(&fills_dir, RecursiveMode::Recursive)?;
+    if let Some(fills_dir) = &fills_dir {
+        watcher.watch(fills_dir, RecursiveMode::Recursive)?;
+    }
     watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
     let start = Instant::now() + Duration::from_secs(5);
     let mut ticker = interval_at(start, Duration::from_secs(60));
@@ -160,7 +172,7 @@ pub(crate) async fn hl_listen(
     let classify_path = |path: &Path| -> Option<EventSource> {
         if path.starts_with(&order_statuses_dir) {
             Some(EventSource::OrderStatuses)
-        } else if path.starts_with(&fills_dir) {
+        } else if fills_dir.as_ref().is_some_and(|fills_dir| path.starts_with(fills_dir)) {
             Some(EventSource::Fills)
         } else if path.starts_with(&order_diffs_dir) {
             Some(EventSource::OrderDiffs)
@@ -263,6 +275,63 @@ pub(crate) async fn hl_listen(
                 let listener = listener.clone();
                 let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
                 fetch_snapshot(snapshot_dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
+            }
+        }
+    }
+}
+
+pub(crate) async fn hl_listen_fills_only(
+    market_message_tx: Sender<Arc<InternalMessage>>,
+    hl_data_root: PathBuf,
+) -> Result<()> {
+    let fills_dir = EventSource::Fills.event_source_dir_for(&hl_data_root, IngestMode::Stream).canonicalize()?;
+    info!("Monitoring fills directory with separate listener: {}", fills_dir.display());
+
+    let (fs_event_tx, mut fs_event_rx) = unbounded_channel();
+    let mut watcher = recommended_watcher(move |res| {
+        let fs_event_tx = fs_event_tx.clone();
+        if let Err(err) = fs_event_tx.send(res) {
+            error!("Error sending fill fs event to processor via channel: {err}");
+        }
+    })?;
+    watcher.watch(&fills_dir, RecursiveMode::Recursive)?;
+
+    let mut listener = FillOnlyListener::new(market_message_tx);
+    loop {
+        match fs_event_rx.recv().await {
+            Some(Ok(first_event)) => {
+                if first_event.kind.is_create() || first_event.kind.is_modify() {
+                    if let Some(path) = first_event.paths.first() {
+                        if path.is_file() && path.starts_with(&fills_dir) {
+                            listener.process_update(&first_event, path)?;
+                        }
+                    }
+                }
+                while let Ok(next) = fs_event_rx.try_recv() {
+                    match next {
+                        Ok(ev) if ev.kind.is_create() || ev.kind.is_modify() => {
+                            if let Some(path) = ev.paths.first() {
+                                if path.is_file() && path.starts_with(&fills_dir) {
+                                    listener.process_update(&ev, path)?;
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            error!("Fill watcher error (drained): {err}");
+                            return Err(format!("Fill watcher error: {err}").into());
+                        }
+                    }
+                }
+                let _reported = listener.progress.report_if_due();
+            }
+            Some(Err(err)) => {
+                error!("Fill watcher error: {err}");
+                return Err(format!("Fill watcher error: {err}").into());
+            }
+            None => {
+                error!("Fill watcher channel closed. Listener exiting");
+                return Err("Fill watcher channel closed.".into());
             }
         }
     }
@@ -678,11 +747,13 @@ impl OrderBookListener {
                 if self.last_fill.is_none_or(|height| height < batch.block_number()) {
                     // send fill updates if we received a new update
                     if let Some(tx) = &self.internal_message_tx {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let snapshot = Arc::new(InternalMessage::Fills { batch, enqueued_at_ms: now_ms() });
-                            let _unused = tx.send(snapshot);
-                        });
+                        let enqueued_at_ms = now_ms();
+                        crate::metrics::observe_tob_fill_enqueue_lag(
+                            "main_listener",
+                            Duration::from_millis(enqueued_at_ms.saturating_sub(batch.block_time())),
+                        );
+                        let _unused =
+                            tx.send(Arc::new(InternalMessage::Fills { batch, enqueued_at_ms, path: "main_listener" }));
                     }
                 }
             }
@@ -727,11 +798,12 @@ impl OrderBookListener {
 
     fn publish_fills(&mut self, batch: Batch<NodeDataFill>) -> Result<()> {
         if let Some(tx) = &self.internal_message_tx {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let snapshot = Arc::new(InternalMessage::Fills { batch, enqueued_at_ms: now_ms() });
-                let _unused = tx.send(snapshot);
-            });
+            let enqueued_at_ms = now_ms();
+            crate::metrics::observe_tob_fill_enqueue_lag(
+                "main_listener",
+                Duration::from_millis(enqueued_at_ms.saturating_sub(batch.block_time())),
+            );
+            let _unused = tx.send(Arc::new(InternalMessage::Fills { batch, enqueued_at_ms, path: "main_listener" }));
         }
         Ok(())
     }
@@ -1444,6 +1516,212 @@ impl OrderBookListener {
     }
 }
 
+struct FillOnlyListener {
+    file: Option<File>,
+    discard_fragment: bool,
+    last_file_mtime_ms: Option<u64>,
+    market_message_tx: Sender<Arc<InternalMessage>>,
+    progress: IngestProgress,
+}
+
+impl FillOnlyListener {
+    fn new(market_message_tx: Sender<Arc<InternalMessage>>) -> Self {
+        Self {
+            file: None,
+            discard_fragment: false,
+            last_file_mtime_ms: None,
+            market_message_tx,
+            progress: IngestProgress::new(),
+        }
+    }
+
+    fn process_update(&mut self, event: &Event, new_path: &Path) -> Result<()> {
+        self.last_file_mtime_ms = OrderBookListener::record_file_mtime_lag(new_path, EventSource::Fills);
+        if event.kind.is_create() {
+            info!("-- Fill event: {} created --", new_path.display());
+            if let Some(file) = self.file.as_mut() {
+                let mut buf = String::new();
+                file.read_to_string(&mut buf)?;
+                if !buf.is_empty() {
+                    self.process_data(buf)?;
+                    self.record_backlog_bytes()?;
+                }
+            }
+            self.file = Some(File::open(new_path)?);
+            self.record_backlog_bytes()?;
+            return Ok(());
+        }
+
+        if let Some(file) = self.file.as_mut() {
+            let mut buf = String::new();
+            file.read_to_string(&mut buf)?;
+            self.process_data(buf)?;
+            self.record_backlog_bytes()?;
+        } else {
+            info!("-- Fill event: {} modified, tracking it now --", new_path.display());
+            let mut new_file = File::open(new_path)?;
+            self.discard_fragment = seek_to_recent_jsonl_boundary(&mut new_file)?;
+            self.file = Some(new_file);
+            self.record_backlog_bytes()?;
+        }
+        Ok(())
+    }
+
+    fn record_backlog_bytes(&mut self) -> Result<()> {
+        let Some(file) = self.file.as_mut() else {
+            crate::metrics::set_ingest_backlog_bytes(ingest_source_label(EventSource::Fills), 0);
+            return Ok(());
+        };
+        let offset = file.stream_position()?;
+        let len = file.metadata()?.len();
+        crate::metrics::set_ingest_backlog_bytes(ingest_source_label(EventSource::Fills), len.saturating_sub(offset));
+        Ok(())
+    }
+
+    fn discard_initial_fragment_if_needed(&mut self, data: &mut String) -> bool {
+        if !self.discard_fragment {
+            return true;
+        }
+
+        let Some(newline) = data.find('\n') else {
+            self.progress.record_jsonl_deferral(EventSource::Fills);
+            return false;
+        };
+
+        data.drain(..=newline);
+        self.discard_fragment = false;
+        true
+    }
+
+    fn process_data(&mut self, mut data: String) -> Result<()> {
+        let total_len = data.len();
+        self.progress.record_read(EventSource::Fills, total_len);
+        if !self.discard_initial_fragment_if_needed(&mut data) {
+            return Ok(());
+        }
+
+        let mut consumed_bytes = 0usize;
+        for raw_line in data.split_inclusive('\n') {
+            let line_len = raw_line.len();
+            let line = raw_line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                consumed_bytes += line_len;
+                continue;
+            }
+
+            let batch = match serde_json::from_str::<Batch<NodeDataFill>>(line) {
+                Ok(batch) => batch,
+                Err(err) => {
+                    let preview: String = line.chars().take(100).collect();
+                    self.progress.record_jsonl_deferral(EventSource::Fills);
+                    debug!("fills-only JSONL deferral after serialization error {err}, line: {preview:?}");
+                    #[allow(clippy::unwrap_used)]
+                    let unread_len: i64 = (total_len - consumed_bytes).try_into().unwrap();
+                    if let Some(file) = self.file.as_mut() {
+                        file.seek_relative(-unread_len)?;
+                    }
+                    break;
+                }
+            };
+            consumed_bytes += line_len;
+
+            let block_time_ms = batch.block_time();
+            let local_time_ms = batch.local_time_ms();
+            let source_label = ingest_source_label(EventSource::Fills);
+            crate::metrics::observe_ingest_source_gossip(
+                source_label,
+                Duration::from_millis(local_time_ms.saturating_sub(block_time_ms)),
+            );
+            crate::metrics::set_ingest_file_tail_lag(
+                source_label,
+                Duration::from_millis(now_ms().saturating_sub(local_time_ms)),
+            );
+            if let Some(file_mtime_ms) = self.last_file_mtime_ms {
+                crate::metrics::observe_ingest_row_file_visibility_lag(
+                    source_label,
+                    Duration::from_millis(file_mtime_ms.saturating_sub(local_time_ms)),
+                );
+            }
+            self.progress.record_row(EventSource::Fills, batch.block_number());
+            let enqueued_at_ms = now_ms();
+            crate::metrics::observe_tob_fill_enqueue_lag(
+                "separate_listener",
+                Duration::from_millis(enqueued_at_ms.saturating_sub(block_time_ms)),
+            );
+            let _unused = self.market_message_tx.send(Arc::new(InternalMessage::Fills {
+                batch,
+                enqueued_at_ms,
+                path: "separate_listener",
+            }));
+            let _reported = self.progress.report_if_due();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fill_only_listener_tests {
+    use super::*;
+    use std::io::Write;
+    use tokio::sync::broadcast;
+
+    fn fill_line(height: u64) -> String {
+        format!(
+            r#"{{"local_time":"2026-05-13T13:48:42.414415479","block_time":"2026-05-13T13:48:01.093894836","block_number":{height},"events":[["0x162cc7c861ebd0c06b3d72319201150482518185",{{"coin":"BTC","px":"100.0","sz":"0.01","side":"A","time":1778680081093,"startPosition":"0.0","dir":"Sell","closedPnl":"0.0","hash":"0x256ba7fde56c0b7026e5043b4eba02020f1400e3806f2a42c9345350a46fe55a","oid":424080859718,"crossed":true,"fee":"0.01","tid":693955059568827,"feeToken":"USDC","liquidation":null}}]]}}"#
+        )
+    }
+
+    #[test]
+    fn fill_only_listener_sends_one_fill_message_per_complete_row() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut listener = FillOnlyListener::new(tx);
+
+        listener.process_data(format!("{}\n", fill_line(10))).unwrap();
+
+        let msg = rx.try_recv().expect("fill message");
+        let InternalMessage::Fills { batch, path, .. } = msg.as_ref() else {
+            panic!("expected fills message");
+        };
+        assert_eq!(batch.block_number(), 10);
+        assert_eq!(*path, "separate_listener");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn fill_only_listener_defers_partial_trailing_lines() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut listener = FillOnlyListener::new(tx);
+        let line = fill_line(11);
+        let split_at = line.len() - 12;
+        let path = std::env::temp_dir().join(format!("fill-only-partial-{}-{}.jsonl", std::process::id(), now_ns()));
+
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(line[..split_at].as_bytes()).unwrap();
+        }
+        let mut file = File::open(&path).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        listener.file = Some(file);
+
+        listener.process_data(line[..split_at].to_owned()).unwrap();
+        assert!(rx.try_recv().is_err());
+
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(format!("{}\n", &line[split_at..]).as_bytes()).unwrap();
+        }
+        let mut buf = String::new();
+        listener.file.as_mut().unwrap().read_to_string(&mut buf).unwrap();
+        listener.process_data(buf).unwrap();
+        let msg = rx.try_recv().expect("fill message after completing row");
+        let InternalMessage::Fills { batch, .. } = msg.as_ref() else {
+            panic!("expected fills message");
+        };
+        assert_eq!(batch.block_number(), 11);
+        drop(fs::remove_file(path));
+    }
+}
+
 impl DirectoryListener for OrderBookListener {
     fn is_reading(&self, event_source: EventSource) -> bool {
         match event_source {
@@ -1534,7 +1812,9 @@ impl DirectoryListener for OrderBookListener {
                     );
                     #[allow(clippy::unwrap_used)]
                     let unread_len: i64 = (total_len - consumed_bytes).try_into().unwrap();
-                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-unread_len));
+                    if let Some(file) = self.file_mut(event_source).as_mut() {
+                        file.seek_relative(-unread_len)?;
+                    }
                     break;
                 }
             };
@@ -1569,6 +1849,9 @@ impl DirectoryListener for OrderBookListener {
             }
             let _reported = self.progress.report_if_due();
         }
+        if self.ingest_mode == IngestMode::Stream && event_source == EventSource::Fills {
+            return Ok(());
+        }
         let snapshot_source = ingest_source_label(event_source);
         let snapshot_start = Instant::now();
         let snapshot = self.l2_snapshots(true);
@@ -1590,20 +1873,18 @@ impl DirectoryListener for OrderBookListener {
                 Duration::from_millis(source_local_time_ms.saturating_sub(source_block_time_ms)),
             );
             if let Some(tx) = &self.internal_message_tx {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let snapshot = Arc::new(InternalMessage::Snapshot {
-                        l2_snapshots: snapshot.1,
-                        time: snapshot.0,
-                        height: snapshot_height,
-                        source: snapshot_source,
-                        source_block_time_ms,
-                        source_local_time_ms,
-                        latest_heights,
-                        enqueued_at_ms: now_ms(),
-                    });
-                    let _unused = tx.send(snapshot);
+                let enqueued_at_ms = now_ms();
+                let snapshot = Arc::new(InternalMessage::Snapshot {
+                    l2_snapshots: snapshot.1,
+                    time: snapshot.0,
+                    height: snapshot_height,
+                    source: snapshot_source,
+                    source_block_time_ms,
+                    source_local_time_ms,
+                    latest_heights,
+                    enqueued_at_ms,
                 });
+                let _unused = tx.send(snapshot);
             }
         }
         Ok(())
@@ -1646,6 +1927,7 @@ pub(crate) enum InternalMessage {
     Fills {
         batch: Batch<NodeDataFill>,
         enqueued_at_ms: u64,
+        path: &'static str,
     },
     L4BookUpdates {
         diff_batch: Batch<NodeDataOrderDiff>,

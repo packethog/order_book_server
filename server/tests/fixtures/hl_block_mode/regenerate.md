@@ -80,9 +80,10 @@ server/tests/fixtures/hl_block_mode/generate_from_source.py
 The generator extracts the reduced unfiltered snapshot/block files, filters
 them to the fixture coin set, derives `_streaming` files from the filtered
 by-block lines, and rewrites `manifest.json` with source, block, and streaming
-counts. Raw book diffs and order statuses are split to one event per line.
-Fills preserve buy/sell pairs in the same line so trade reconstruction stays
-equivalent to block replay.
+counts. Raw book diffs, order statuses, and fills are split to one event per
+line. This intentionally models live streaming output, where the two sides of a
+trade can arrive in separate `node_fills_streaming` rows. Block-mode rows can
+still contain the full fill pair in one batch.
 
 ## Regenerating Goldens
 

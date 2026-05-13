@@ -62,6 +62,7 @@ Important source files:
 - Optional TOB `MulticastConfig`.
 - Optional DoB `DobConfig`.
 - Optional Prometheus metrics listener.
+- Optional streaming-only separate fill ingest.
 
 It then calls `run_websocket_server`. The function name is historical: this is
 also the top-level coordinator for multicast-only deployments.
@@ -76,6 +77,12 @@ also the top-level coordinator for multicast-only deployments.
 If TOB or DoB is enabled, a shared instrument registry is also created. TOB uses
 it to map coins to instrument definitions. DoB uses it to resolve internal coins
 to on-wire instrument IDs and quantity exponents.
+
+When `--separate-fill-ingest` is enabled with streaming mode, the coordinator
+also starts a second file listener for `node_fills_streaming`. The normal
+book listener stops watching fills in that mode, so trades are not duplicated.
+Status and raw-diff processing, snapshots, DoB, and validation stay on the
+normal listener.
 
 ## Hyperliquid Disk Inputs
 
@@ -157,6 +164,8 @@ Key properties:
   mutations.
 - Fills publish TOB trades but do not mutate book state.
 - TOB snapshots are emitted once per file-read chunk, not per individual diff.
+- In streaming mode, optional separate fill ingest sends fills directly to the
+  market broadcast and does not compute book snapshots for fill-only rows.
 
 Block mode should remain backward-compatible. The streaming implementation uses
 separate code to accumulate rows, but both modes eventually call the same raw
@@ -187,8 +196,41 @@ sequenceDiagram
     S->>D: immediate DoB mutation event
     L->>M: Snapshot after read chunk
     L->>M: Fills as fill rows arrive
+    M->>T: pair fill sides by tid
     M->>T: freshness decision, then Quote/Trade or suppression
 ```
+
+With `--separate-fill-ingest`, fill rows use a parallel path:
+
+```mermaid
+sequenceDiagram
+    participant HL as hl-node node_fills_streaming
+    participant F as FillOnlyListener
+    participant M as market broadcast
+    participant T as TOB publisher
+
+    HL->>F: fill row append
+    F->>F: parse Batch<NodeDataFill>
+    F->>M: InternalMessage::Fills
+    M->>T: freshness decision, then Trade or suppression
+```
+
+This path is intentionally narrow: fills do not mutate the book, do not affect
+DoB boundaries, and do not produce TOB quotes. It exists to keep TOB trades
+from waiting behind status/diff bursts and snapshot production. It cannot
+reduce TOB quote latency or snapshot suppression, because quotes still come
+from snapshots produced by the normal status/raw-diff listener.
+
+TOB trade publication has one extra stage that is easy to miss in streaming
+mode: a Hyperliquid trade is represented by two fill sides. Block-mode batches
+usually carry both sides together, but live `node_fills_streaming` output can
+place the ask and bid sides in separate JSONL rows. The TOB publisher therefore
+accumulates pending fills by `tid`, validates that the matched pair has
+opposite sides and matching coin/hash/price/size/time, and emits one `Trade`
+message as soon as the opposite side arrives. This is publisher-local state; it
+does not mutate the book and does not affect DoB. Live validator output can
+also contain stable one-sided `#...` token-alias fills; those are counted as
+`one_sided_token_alias` rather than as missing normal trade pairs.
 
 Streaming accumulation rules:
 
@@ -241,6 +283,7 @@ traffic cannot evict TOB snapshots from the TOB receiver.
 flowchart LR
     Listener["OrderBookListener"] -->|"Snapshot"| MarketTx["market broadcast"]
     Listener -->|"Fills"| MarketTx
+    FillOnly["FillOnlyListener (optional)"] -->|"Fills"| MarketTx
     MarketTx --> TOB["MulticastPublisher"]
     Registry["instrument registry"] --> TOB
     TOB --> Fresh{"source lag <= threshold?"}
@@ -270,6 +313,10 @@ Important latency components:
 - Snapshot source block lag: newest source row block time minus emitted snapshot
   block time.
 - Listener-to-publisher lag: source row `local_time` to TOB publisher receive.
+- Fill enqueue lag: fill source block time to listener enqueue, labeled by
+  `main_listener` or `separate_listener`.
+- Fill pair metrics: paired, orphaned, one-sided token aliases, malformed,
+  duplicate, and pending one-sided fills before TOB trade encoding.
 - TOB queue delay: listener enqueue to publisher receive.
 - Socket send time: UDP send call duration.
 
@@ -277,7 +324,11 @@ When TOB suppression occurs, compare these metrics before changing the
 freshness threshold. High validator/source lag with low file-tail lag means the
 row is already old when the validator writes it. High queue delay points at
 internal publisher contention. High snapshot source block lag points at book
-finalization or snapshot production falling behind the newest source rows.
+finalization or snapshot production falling behind the newest source rows. For
+fills, high listener-to-publisher delay with low queue delay points at local
+delay before TOB enqueue; `--separate-fill-ingest` removes that trade path from
+the normal status/raw-diff listener. For snapshots, investigate the normal book
+listener and streaming finalization instead.
 
 ## DoB Publishing Hot Path
 
@@ -400,6 +451,13 @@ Root-cause with:
 - `orderbook_tob_snapshot_source_block_lag_seconds`.
 - `orderbook_ingest_file_tail_lag_seconds`.
 
+If suppressed fills show high `listener_to_publisher_ms` while
+`publisher_queue_ms` is low, the fill row is being delayed before TOB enqueue;
+streaming deployments can isolate that path with `--separate-fill-ingest`.
+If suppressed snapshots show the same pattern, split fill ingest will not help:
+quotes depend on the status/raw-diff listener applying book mutations and
+emitting snapshots.
+
 ### `multicast: caught up ..., publishing quotes`
 
 This means the TOB publisher was suppressing stale snapshots, then saw a
@@ -444,4 +502,3 @@ emitted for that coin.
 - DoB drops are correctness-significant.
 - Metrics labels must stay low-cardinality. Do not add coin, oid, block height,
   or subscription labels.
-

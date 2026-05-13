@@ -150,6 +150,20 @@ struct Args {
     /// Disable the Prometheus metrics HTTP listener.
     #[arg(long, default_value_t = false)]
     disable_metrics: bool,
+
+    /// In streaming mode, tail fills on an independent listener so TOB trades do not wait behind book processing.
+    #[arg(long, default_value_t = false)]
+    separate_fill_ingest: bool,
+}
+
+impl Args {
+    fn validate(&self) -> std::result::Result<IngestMode, String> {
+        let ingest_mode: IngestMode = self.ingest_mode.into();
+        if self.separate_fill_ingest && ingest_mode != IngestMode::Stream {
+            return Err("--separate-fill-ingest requires --ingest-mode stream".to_owned());
+        }
+        Ok(ingest_mode)
+    }
 }
 
 #[tokio::main]
@@ -157,6 +171,13 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     let args = Args::parse();
+    let ingest_mode = match args.validate() {
+        Ok(ingest_mode) => ingest_mode,
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
+    };
 
     let full_address = format!("{}:{}", args.address, args.port);
     println!("Running websocket server on {full_address}");
@@ -220,8 +241,9 @@ async fn main() -> Result<()> {
         compression_level,
         multicast_config,
         dob_config,
-        args.ingest_mode.into(),
+        ingest_mode,
         args.hl_data_root,
+        args.separate_fill_ingest,
     )
     .await?;
 
@@ -257,5 +279,34 @@ mod tests {
         assert_eq!(args.metrics_address, Ipv4Addr::UNSPECIFIED);
         assert_eq!(args.metrics_port, 19090);
         assert!(args.disable_metrics);
+    }
+
+    #[test]
+    fn separate_fill_ingest_defaults_off() {
+        let args = Args::parse_from(["dz_hl_publisher", "--address", "127.0.0.1", "--port", "8000"]);
+        assert!(!args.separate_fill_ingest);
+    }
+
+    #[test]
+    fn separate_fill_ingest_cli_flag_parses() {
+        let args = Args::parse_from([
+            "dz_hl_publisher",
+            "--address",
+            "127.0.0.1",
+            "--port",
+            "8000",
+            "--ingest-mode",
+            "stream",
+            "--separate-fill-ingest",
+        ]);
+        assert!(args.separate_fill_ingest);
+        assert!(matches!(IngestMode::from(args.ingest_mode), IngestMode::Stream));
+    }
+
+    #[test]
+    fn separate_fill_ingest_rejects_block_mode() {
+        let args =
+            Args::parse_from(["dz_hl_publisher", "--address", "127.0.0.1", "--port", "8000", "--separate-fill-ingest"]);
+        assert_eq!(args.validate().err().as_deref(), Some("--separate-fill-ingest requires --ingest-mode stream"));
     }
 }
