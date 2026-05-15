@@ -46,9 +46,13 @@ impl<O: InnerOrder> OrderBooks<O> {
         }
     }
 
-    pub(crate) fn add_order(&mut self, order: O) {
+    pub(crate) fn add_resting_order_from_diff(&mut self, order: O) {
         let coin = &order.coin();
-        self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).add_order(order);
+        self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).add_resting_order_from_diff(order);
+    }
+
+    pub(crate) fn contains_order(&self, oid: &Oid, coin: &Coin) -> bool {
+        self.order_books.get(coin).is_some_and(|book| book.contains_order(oid))
     }
 
     /// Replaces the book for a single coin with a fresh one built from the given snapshot.
@@ -434,8 +438,7 @@ mod tests {
 
     #[test]
     fn clone_coin_orders_returns_none_for_unknown_coin() {
-        let books: OrderBooks<InnerL4Order> =
-            OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), false);
+        let books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), false);
         assert!(books.clone_coin_orders(&Coin::new("NOPE")).is_none());
     }
 }

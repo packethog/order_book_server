@@ -11,11 +11,10 @@
 use std::collections::BTreeMap;
 
 use crate::protocol::dob::constants::{
-    FRAME_HEADER_SIZE, MSG_TYPE_BATCH_BOUNDARY, MSG_TYPE_END_OF_SESSION, MSG_TYPE_HEARTBEAT,
-    MSG_TYPE_INSTRUMENT_DEF, MSG_TYPE_INSTRUMENT_RESET, MSG_TYPE_MANIFEST_SUMMARY,
-    MSG_TYPE_ORDER_ADD, MSG_TYPE_ORDER_CANCEL, MSG_TYPE_ORDER_EXECUTE,
-    MSG_TYPE_SNAPSHOT_BEGIN, MSG_TYPE_SNAPSHOT_END, MSG_TYPE_SNAPSHOT_ORDER,
-    MSG_TYPE_TRADE, SIDE_BID,
+    FRAME_HEADER_SIZE, MSG_TYPE_BATCH_BOUNDARY, MSG_TYPE_END_OF_SESSION, MSG_TYPE_HEARTBEAT, MSG_TYPE_INSTRUMENT_DEF,
+    MSG_TYPE_INSTRUMENT_RESET, MSG_TYPE_MANIFEST_SUMMARY, MSG_TYPE_ORDER_ADD, MSG_TYPE_ORDER_CANCEL,
+    MSG_TYPE_ORDER_EXECUTE, MSG_TYPE_SNAPSHOT_BEGIN, MSG_TYPE_SNAPSHOT_END, MSG_TYPE_SNAPSHOT_ORDER, MSG_TYPE_TRADE,
+    SIDE_BID,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -158,11 +157,7 @@ impl ReferenceSubscriber {
     fn apply_snapshot_order(&mut self, body: &[u8]) {
         let snapshot_id = u32::from_le_bytes(body[4..8].try_into().unwrap());
         // Find the instrument whose active snapshot matches this snapshot_id.
-        let instrument_id = self
-            .active_snapshot
-            .iter()
-            .find(|&(_, &sid)| sid == snapshot_id)
-            .map(|(&iid, _)| iid);
+        let instrument_id = self.active_snapshot.iter().find(|&(_, &sid)| sid == snapshot_id).map(|(&iid, _)| iid);
         let Some(instrument_id) = instrument_id else {
             return;
         };
@@ -182,14 +177,7 @@ impl ReferenceSubscriber {
         }
     }
 
-    fn add_resting_order(
-        &mut self,
-        instrument_id: u32,
-        order_id: u64,
-        side: u8,
-        price: i64,
-        qty: u64,
-    ) {
+    fn add_resting_order(&mut self, instrument_id: u32, order_id: u64, side: u8, price: i64, qty: u64) {
         if qty == 0 {
             return;
         }
@@ -199,13 +187,7 @@ impl ReferenceSubscriber {
         *level.entry(price).or_insert(0) += qty;
     }
 
-    fn remove_resting_qty(
-        &mut self,
-        instrument_id: u32,
-        side: u8,
-        price: i64,
-        qty: u64,
-    ) {
+    fn remove_resting_qty(&mut self, instrument_id: u32, side: u8, price: i64, qty: u64) {
         let Some(book) = self.books.get_mut(&instrument_id) else {
             return;
         };
@@ -223,14 +205,13 @@ impl ReferenceSubscriber {
 mod tests {
     use super::*;
     use crate::protocol::dob::constants::{
-        DEFAULT_MTU, ORDER_ADD_SIZE, ORDER_CANCEL_SIZE, ORDER_EXECUTE_SIZE,
-        SIDE_ASK, SIDE_BID, SNAPSHOT_BEGIN_SIZE, SNAPSHOT_END_SIZE, SNAPSHOT_ORDER_SIZE,
+        DEFAULT_MTU, ORDER_ADD_SIZE, ORDER_CANCEL_SIZE, ORDER_EXECUTE_SIZE, SIDE_ASK, SIDE_BID, SNAPSHOT_BEGIN_SIZE,
+        SNAPSHOT_END_SIZE, SNAPSHOT_ORDER_SIZE,
     };
     use crate::protocol::dob::frame::DobFrameBuilder;
     use crate::protocol::dob::messages::{
-        OrderAdd, OrderCancel, OrderExecute, SnapshotBegin, SnapshotEnd, SnapshotOrder,
-        encode_order_add, encode_order_cancel, encode_order_execute,
-        encode_snapshot_begin, encode_snapshot_end, encode_snapshot_order,
+        OrderAdd, OrderCancel, OrderExecute, SnapshotBegin, SnapshotEnd, SnapshotOrder, encode_order_add,
+        encode_order_cancel, encode_order_execute, encode_snapshot_begin, encode_snapshot_end, encode_snapshot_order,
     };
 
     /// Build a single-message mktdata frame containing the given OrderAdd.
@@ -382,11 +363,7 @@ mod tests {
             last_instrument_seq: 99,
             timestamp_ns: 0,
         };
-        let end = SnapshotEnd {
-            instrument_id: 42,
-            anchor_seq: 100,
-            snapshot_id: 7,
-        };
+        let end = SnapshotEnd { instrument_id: 42, anchor_seq: 100, snapshot_id: 7 };
         let orders = vec![
             SnapshotOrder {
                 snapshot_id: 7,
@@ -444,12 +421,7 @@ mod tests {
         let buf = fb.message_buffer(INSTRUMENT_RESET_SIZE).unwrap();
         encode_instrument_reset(
             buf,
-            &InstrumentReset {
-                instrument_id: 42,
-                reason: 1,
-                new_anchor_seq: 200,
-                timestamp_ns: 0,
-            },
+            &InstrumentReset { instrument_id: 42, reason: 1, new_anchor_seq: 200, timestamp_ns: 0 },
         );
         fb.commit_message();
         let frame = fb.finalize().to_vec();

@@ -1,0 +1,351 @@
+{
+  "by_block_source_host": "ubuntu@aws-tyo-hl-mainnet",
+  "coin_filter": [
+    "BTC"
+  ],
+  "counts": {
+    "by_block": {
+      "diffs": {
+        "bytes": 199595,
+        "events": 1332,
+        "first_block": 985148182,
+        "last_block": 985148232,
+        "rows": 51
+      },
+      "fills": {
+        "bytes": 15293,
+        "events": 22,
+        "first_block": 985148182,
+        "last_block": 985148232,
+        "rows": 51
+      },
+      "statuses": {
+        "bytes": 19770765,
+        "events": 41592,
+        "first_block": 985148182,
+        "last_block": 985148232,
+        "rows": 51
+      }
+    },
+    "streaming": {
+      "diffs": {
+        "bytes": 363555,
+        "events": 1332,
+        "first_block": 985148182,
+        "last_block": 985148232,
+        "rows": 1332
+      },
+      "fills": {
+        "bytes": 11541,
+        "events": 22,
+        "first_block": 985148182,
+        "last_block": 985148229,
+        "rows": 22
+      },
+      "statuses": {
+        "bytes": 25087876,
+        "events": 41592,
+        "first_block": 985148182,
+        "last_block": 985148232,
+        "rows": 41592
+      }
+    }
+  },
+  "expected_boundary_delta": {
+    "count": 4,
+    "single_coin_diff_blocks": [
+      985148213,
+      985148232
+    ]
+  },
+  "fixture_block_end": 985148232,
+  "fixture_block_start": 985148182,
+  "generated_at_utc": "2026-05-05T19:11:41Z",
+  "snapshot_height": 985148181,
+  "source_archives": {
+    "by_block": {
+      "path": "source/by_block_btc_985148182_985148232.tar.gz",
+      "sha256": "d0c81d5b0c09b8100aac104d5892d159a1e4325c3b85843d0076e33de14d4e0b"
+    },
+    "snapshot": {
+      "path": "source/snapshot_985148181.json.gz",
+      "sha256": "8f34a7a467a424bfc096f1060222237c8ee864bf8881cecfaeaf007d616215d4"
+    },
+    "streaming": {
+      "path": "source/streaming_btc_985148182_985148232.tar.gz",
+      "sha256": "0e4408e2135588383f6e153f6f6dfcfa7828fd0c452aba9befd0a894d35ae6d5"
+    }
+  },
+  "source_data_base": "/data/hl-data",
+  "source_paths": {
+    "by_block": {
+      "diffs": "/data/hl-data/node_raw_book_diffs_by_block/hourly/20260505/17",
+      "fills": "/data/hl-data/node_fills_by_block/hourly/20260505/17",
+      "statuses": "/data/hl-data/node_order_statuses_by_block/hourly/20260505/17"
+    },
+    "streaming": {
+      "diffs": "/data/hl-data/node_raw_book_diffs_streaming/hourly/20260505/17",
+      "fills": "/data/hl-data/node_fills_streaming/hourly/20260505/17",
+      "statuses": "/data/hl-data/node_order_statuses_streaming/hourly/20260505/17"
+    }
+  },
+  "source_snapshot": "/home/ubuntu/out.json",
+  "streaming_source_host": "ubuntu@tyo-hl-node",
+  "unfiltered_by_block_raw_diff_counts": {
+    "985148182": {
+      "btc": 17,
+      "non_spot": 433,
+      "total": 483
+    },
+    "985148183": {
+      "btc": 8,
+      "non_spot": 489,
+      "total": 523
+    },
+    "985148184": {
+      "btc": 10,
+      "non_spot": 351,
+      "total": 372
+    },
+    "985148185": {
+      "btc": 10,
+      "non_spot": 265,
+      "total": 276
+    },
+    "985148186": {
+      "btc": 48,
+      "non_spot": 328,
+      "total": 351
+    },
+    "985148187": {
+      "btc": 221,
+      "non_spot": 767,
+      "total": 843
+    },
+    "985148188": {
+      "btc": 100,
+      "non_spot": 855,
+      "total": 935
+    },
+    "985148189": {
+      "btc": 159,
+      "non_spot": 1309,
+      "total": 1392
+    },
+    "985148190": {
+      "btc": 61,
+      "non_spot": 591,
+      "total": 637
+    },
+    "985148191": {
+      "btc": 51,
+      "non_spot": 563,
+      "total": 592
+    },
+    "985148192": {
+      "btc": 86,
+      "non_spot": 577,
+      "total": 610
+    },
+    "985148193": {
+      "btc": 0,
+      "non_spot": 0,
+      "total": 0
+    },
+    "985148194": {
+      "btc": 63,
+      "non_spot": 1536,
+      "total": 1599
+    },
+    "985148195": {
+      "btc": 53,
+      "non_spot": 621,
+      "total": 649
+    },
+    "985148196": {
+      "btc": 32,
+      "non_spot": 819,
+      "total": 849
+    },
+    "985148197": {
+      "btc": 40,
+      "non_spot": 481,
+      "total": 511
+    },
+    "985148198": {
+      "btc": 19,
+      "non_spot": 646,
+      "total": 661
+    },
+    "985148199": {
+      "btc": 48,
+      "non_spot": 908,
+      "total": 938
+    },
+    "985148200": {
+      "btc": 18,
+      "non_spot": 272,
+      "total": 305
+    },
+    "985148201": {
+      "btc": 8,
+      "non_spot": 442,
+      "total": 456
+    },
+    "985148202": {
+      "btc": 18,
+      "non_spot": 137,
+      "total": 150
+    },
+    "985148203": {
+      "btc": 8,
+      "non_spot": 275,
+      "total": 284
+    },
+    "985148204": {
+      "btc": 7,
+      "non_spot": 406,
+      "total": 429
+    },
+    "985148205": {
+      "btc": 12,
+      "non_spot": 289,
+      "total": 295
+    },
+    "985148206": {
+      "btc": 13,
+      "non_spot": 212,
+      "total": 243
+    },
+    "985148207": {
+      "btc": 8,
+      "non_spot": 369,
+      "total": 381
+    },
+    "985148208": {
+      "btc": 11,
+      "non_spot": 217,
+      "total": 236
+    },
+    "985148209": {
+      "btc": 12,
+      "non_spot": 236,
+      "total": 241
+    },
+    "985148210": {
+      "btc": 3,
+      "non_spot": 273,
+      "total": 275
+    },
+    "985148211": {
+      "btc": 8,
+      "non_spot": 229,
+      "total": 241
+    },
+    "985148212": {
+      "btc": 7,
+      "non_spot": 364,
+      "total": 395
+    },
+    "985148213": {
+      "btc": 1,
+      "non_spot": 213,
+      "total": 213
+    },
+    "985148214": {
+      "btc": 7,
+      "non_spot": 629,
+      "total": 636
+    },
+    "985148215": {
+      "btc": 3,
+      "non_spot": 210,
+      "total": 221
+    },
+    "985148216": {
+      "btc": 9,
+      "non_spot": 262,
+      "total": 266
+    },
+    "985148217": {
+      "btc": 26,
+      "non_spot": 222,
+      "total": 234
+    },
+    "985148218": {
+      "btc": 14,
+      "non_spot": 254,
+      "total": 268
+    },
+    "985148219": {
+      "btc": 5,
+      "non_spot": 451,
+      "total": 465
+    },
+    "985148220": {
+      "btc": 5,
+      "non_spot": 254,
+      "total": 258
+    },
+    "985148221": {
+      "btc": 9,
+      "non_spot": 299,
+      "total": 322
+    },
+    "985148222": {
+      "btc": 8,
+      "non_spot": 260,
+      "total": 277
+    },
+    "985148223": {
+      "btc": 7,
+      "non_spot": 315,
+      "total": 325
+    },
+    "985148224": {
+      "btc": 3,
+      "non_spot": 221,
+      "total": 231
+    },
+    "985148225": {
+      "btc": 13,
+      "non_spot": 203,
+      "total": 207
+    },
+    "985148226": {
+      "btc": 14,
+      "non_spot": 299,
+      "total": 311
+    },
+    "985148227": {
+      "btc": 19,
+      "non_spot": 310,
+      "total": 324
+    },
+    "985148228": {
+      "btc": 0,
+      "non_spot": 164,
+      "total": 164
+    },
+    "985148229": {
+      "btc": 12,
+      "non_spot": 731,
+      "total": 769
+    },
+    "985148230": {
+      "btc": 14,
+      "non_spot": 218,
+      "total": 227
+    },
+    "985148231": {
+      "btc": 3,
+      "non_spot": 287,
+      "total": 296
+    },
+    "985148232": {
+      "btc": 1,
+      "non_spot": 178,
+      "total": 184
+    }
+  }
+}

@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+
 use crate::{
     listeners::order_book::{L2Snapshots, TimedSnapshots, dob_tap::DobApplyTap, utils::compute_l2_snapshots},
     order_book::{
@@ -10,7 +12,6 @@ use crate::{
         node_data::{Batch, NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
-use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(super) struct OrderBookState {
     order_book: OrderBooks<InnerL4Order>,
@@ -22,6 +23,23 @@ pub(super) struct OrderBookState {
     /// the cloned copy used for snapshot validation (validation reads only; no
     /// events should be emitted from it).
     dob_tap: Option<DobApplyTap>,
+}
+
+fn resting_order_from_raw_new(
+    order: NodeDataOrderStatus,
+    diff: &NodeDataOrderDiff,
+    resting_sz: crate::order_book::Sz,
+) -> Result<InnerL4Order> {
+    let time = order.time.and_utc().timestamp_millis();
+    let mut inner_order: InnerL4Order = order.try_into()?;
+    inner_order.limit_px = diff.px()?;
+    inner_order.modify_sz(resting_sz);
+    #[allow(clippy::unwrap_used)]
+    inner_order.convert_trigger(time.try_into().unwrap());
+    if inner_order.tif.as_deref() == Some("Ioc") {
+        inner_order.tif = Some("Gtc".to_string());
+    }
+    Ok(inner_order)
 }
 
 impl Clone for OrderBookState {
@@ -81,6 +99,11 @@ impl OrderBookState {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn compute_l2_snapshots_for_test(&self) -> (u64, L2Snapshots) {
+        (self.time, compute_l2_snapshots(&self.order_book))
+    }
+
     pub(super) fn compute_universe(&self) -> HashSet<Coin> {
         self.order_book.as_ref().keys().cloned().collect()
     }
@@ -135,7 +158,7 @@ impl OrderBookState {
             .events()
             .into_iter()
             .filter_map(|order_status| {
-                if order_status.is_inserted_into_book() {
+                if order_status.is_opening_status_for_raw_diff() {
                     Some((Oid::new(order_status.order.oid), order_status))
                 } else {
                     None
@@ -166,27 +189,24 @@ impl OrderBookState {
             match inner_diff {
                 InnerOrderDiff::New { sz } => {
                     if let Some(order) = order_map.remove(&oid) {
-                        let time = order.time.and_utc().timestamp_millis();
-                        let mut inner_order: InnerL4Order = order.try_into()?;
-                        inner_order.modify_sz(sz);
-                        // must replace time with time of entering book, which is the timestamp of the order status update
-                        #[allow(clippy::unwrap_used)]
-                        inner_order.convert_trigger(time.try_into().unwrap());
-                        // Clone before moving into add_order so we can emit after.
-                        // add_order always succeeds for New (returns ()), so emitting
-                        // after the successful insert is safe and avoids a phantom event.
+                        let inner_order = resting_order_from_raw_new(order, &diff, sz)?;
                         let order_for_tap = inner_order.clone();
-                        self.order_book.add_order(inner_order);
+                        self.order_book.add_resting_order_from_diff(inner_order);
+                        if !self.order_book.contains_order(&oid, &coin) {
+                            log::warn!(
+                                "apply_updates: New order did not rest after raw-diff insert, later updates will be missing; \
+                                 height={height} oid={oid:?} coin={coin:?} order={order_for_tap:?}"
+                            );
+                        }
                         if let Some(tap) = self.dob_tap.as_mut() {
                             tap.emit_order_add(&coin, &order_for_tap, time_ns);
                         }
                     } else {
-                        if emittable_count >= 2 {
-                            if let Some(tap) = self.dob_tap.as_mut() {
-                                tap.emit_batch_boundary(1 /* close */, height, time_ns);
-                            }
-                        }
-                        return Err(format!("Unable to find order opening status {diff:?}").into());
+                        // Soft-tolerance: New diff without matching opening status.
+                        // We can't add the order without the user/time/cloid info from
+                        // the status, so skip and let snapshot validation reconcile.
+                        // Same shape as the Update/Remove missing-order branches below.
+                        log::warn!("apply_updates: New diff without matching opening status, skipping {diff:?}");
                     }
                 }
                 InnerOrderDiff::Update { new_sz, .. } => {
@@ -194,19 +214,19 @@ impl OrderBookState {
                         Some((old_sz, px)) => {
                             if let Some(tap) = self.dob_tap.as_mut() {
                                 // exec_quantity = reduction in resting size
-                                let exec_quantity = crate::order_book::Sz::new(
-                                    old_sz.value().saturating_sub(new_sz.value()),
-                                );
+                                let exec_quantity =
+                                    crate::order_book::Sz::new(old_sz.value().saturating_sub(new_sz.value()));
                                 tap.emit_order_execute(&coin, oid, px, exec_quantity, time_ns);
                             }
                         }
                         None => {
-                            if emittable_count >= 2 {
-                                if let Some(tap) = self.dob_tap.as_mut() {
-                                    tap.emit_batch_boundary(1 /* close */, height, time_ns);
-                                }
-                            }
-                            return Err(format!("Unable to find order on the book {diff:?}").into());
+                            // Soft-tolerance: the order isn't on our book, but the venue
+                            // has an Update for it. Snapshot validation runs every 60s
+                            // and applies surgical recovery on divergence; missing this
+                            // event won't permanently corrupt state. Crashing here would
+                            // turn what's likely a transient ordering race into a hard
+                            // failure cycle.
+                            log::warn!("apply_updates: Update for missing order at height {height}, skipping {diff:?}");
                         }
                     }
                 }
@@ -216,12 +236,8 @@ impl OrderBookState {
                             tap.emit_order_cancel(&coin, oid, time_ns);
                         }
                     } else {
-                        if emittable_count >= 2 {
-                            if let Some(tap) = self.dob_tap.as_mut() {
-                                tap.emit_batch_boundary(1 /* close */, height, time_ns);
-                            }
-                        }
-                        return Err(format!("Unable to find order on the book {diff:?}").into());
+                        // Soft-tolerance — see Update branch above.
+                        log::warn!("apply_updates: Remove for missing order at height {height}, skipping {diff:?}");
                     }
                 }
             }
@@ -237,5 +253,94 @@ impl OrderBookState {
         self.time = time;
         self.snapped = false;
         Ok(())
+    }
+
+    pub(super) fn emit_batch_boundary(&mut self, phase: u8, block_number: u64, block_time_ms: u64) {
+        if let Some(tap) = self.dob_tap.as_mut() {
+            tap.emit_batch_boundary(phase, block_number, block_time_ms * 1_000_000);
+        }
+    }
+
+    pub(super) fn apply_stream_diff(
+        &mut self,
+        block_number: u64,
+        block_time_ms: u64,
+        diff: NodeDataOrderDiff,
+        order_status: Option<NodeDataOrderStatus>,
+    ) -> Result<bool> {
+        if block_number < self.height {
+            return Err(
+                format!("Received finalized streaming block {}, current height {}", block_number, self.height).into()
+            );
+        }
+
+        let time_ns = block_time_ms * 1_000_000;
+        let oid = diff.oid();
+        let coin = diff.coin();
+        if coin.is_spot() && self.ignore_spot {
+            self.height = self.height.max(block_number);
+            self.time = block_time_ms;
+            return Ok(false);
+        }
+
+        let inner_diff = diff.diff().try_into()?;
+        match inner_diff {
+            InnerOrderDiff::New { sz } => {
+                let Some(order) = order_status else {
+                    // Soft-tolerance: New diff without matching opening status.
+                    // Snapshot validation will reconcile. Advance height anyway so
+                    // we don't replay this diff and so subsequent diffs apply.
+                    log::warn!("apply_stream_diff: New diff without matching opening status, skipping {diff:?}");
+                    self.height = self.height.max(block_number);
+                    self.time = block_time_ms;
+                    self.snapped = false;
+                    return Ok(false);
+                };
+                let inner_order = resting_order_from_raw_new(order, &diff, sz)?;
+                let order_for_tap = inner_order.clone();
+                self.order_book.add_resting_order_from_diff(inner_order);
+                if !self.order_book.contains_order(&oid, &coin) {
+                    log::warn!(
+                        "apply_stream_diff: New order did not rest after raw-diff insert, later updates will be missing; \
+                         block_number={block_number} oid={oid:?} coin={coin:?} order={order_for_tap:?}"
+                    );
+                }
+                if let Some(tap) = self.dob_tap.as_mut() {
+                    tap.emit_order_add(&coin, &order_for_tap, time_ns);
+                }
+            }
+            InnerOrderDiff::Update { new_sz, .. } => match self.order_book.modify_sz(oid.clone(), coin.clone(), new_sz)
+            {
+                Some((old_sz, px)) => {
+                    if let Some(tap) = self.dob_tap.as_mut() {
+                        let exec_quantity = crate::order_book::Sz::new(old_sz.value().saturating_sub(new_sz.value()));
+                        tap.emit_order_execute(&coin, oid, px, exec_quantity, time_ns);
+                    }
+                }
+                None => {
+                    // Soft-tolerance: see apply_updates' matching branch.
+                    log::warn!(
+                        "apply_stream_diff: Update for missing order at block {block_number}, skipping {diff:?}"
+                    );
+                }
+            },
+            InnerOrderDiff::Remove => {
+                if self.order_book.cancel_order(oid.clone(), coin.clone()) {
+                    if let Some(tap) = self.dob_tap.as_mut() {
+                        tap.emit_order_cancel(&coin, oid, time_ns);
+                    }
+                } else {
+                    // Soft-tolerance — see apply_updates.
+                    log::warn!(
+                        "apply_stream_diff: Remove for missing order at block {block_number}, skipping {diff:?}"
+                    );
+                }
+            }
+        }
+
+        self.height = self.height.max(block_number);
+        self.time = block_time_ms;
+        self.snapped = false;
+        Ok(true)
     }
 }

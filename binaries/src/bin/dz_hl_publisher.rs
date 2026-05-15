@@ -1,9 +1,27 @@
 #![allow(unused_crate_dependencies)]
-use std::net::Ipv4Addr;
-use std::time::Duration;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+    time::Duration,
+};
 
-use clap::Parser;
-use server::{DobConfig, MulticastConfig, Result, run_websocket_server};
+use clap::{Parser, ValueEnum};
+use server::{DobConfig, IngestMode, MulticastConfig, Result, run_websocket_server};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliIngestMode {
+    Block,
+    Stream,
+}
+
+impl From<CliIngestMode> for IngestMode {
+    fn from(value: CliIngestMode) -> Self {
+        match value {
+            CliIngestMode::Block => Self::Block,
+            CliIngestMode::Stream => Self::Stream,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -19,6 +37,14 @@ struct Args {
     /// Compression level for WebSocket connections (0-9, default 1).
     #[arg(long)]
     websocket_compression_level: Option<u32>,
+
+    /// Ingest mode for hl-node disk output.
+    #[arg(long, value_enum, default_value_t = CliIngestMode::Block)]
+    ingest_mode: CliIngestMode,
+
+    /// Root containing hl-node node_* output directories. Defaults to $HOME/hl/data.
+    #[arg(long)]
+    hl_data_root: Option<PathBuf>,
 
     /// Multicast group address (e.g., 239.0.0.1). Enables multicast when set.
     #[arg(long)]
@@ -112,6 +138,32 @@ struct Args {
     /// the mktdata stream.
     #[arg(long, default_value_t = 1232)]
     dob_snapshot_mtu: u16,
+
+    /// Address for the Prometheus metrics HTTP listener.
+    #[arg(long, default_value_t = Ipv4Addr::LOCALHOST)]
+    metrics_address: Ipv4Addr,
+
+    /// Port for the Prometheus metrics HTTP listener.
+    #[arg(long, default_value_t = 9090)]
+    metrics_port: u16,
+
+    /// Disable the Prometheus metrics HTTP listener.
+    #[arg(long, default_value_t = false)]
+    disable_metrics: bool,
+
+    /// In streaming mode, tail fills on an independent listener so TOB trades do not wait behind book processing.
+    #[arg(long, default_value_t = false)]
+    separate_fill_ingest: bool,
+}
+
+impl Args {
+    fn validate(&self) -> std::result::Result<IngestMode, String> {
+        let ingest_mode: IngestMode = self.ingest_mode.into();
+        if self.separate_fill_ingest && ingest_mode != IngestMode::Stream {
+            return Err("--separate-fill-ingest requires --ingest-mode stream".to_owned());
+        }
+        Ok(ingest_mode)
+    }
 }
 
 #[tokio::main]
@@ -119,11 +171,26 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     let args = Args::parse();
+    let ingest_mode = match args.validate() {
+        Ok(ingest_mode) => ingest_mode,
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
+    };
 
     let full_address = format!("{}:{}", args.address, args.port);
     println!("Running websocket server on {full_address}");
 
     let compression_level = args.websocket_compression_level.unwrap_or(1);
+    if !args.disable_metrics {
+        let metrics_address = SocketAddr::new(IpAddr::V4(args.metrics_address), args.metrics_port);
+        tokio::spawn(async move {
+            if let Err(err) = server::metrics::run_metrics_server(metrics_address).await {
+                eprintln!("metrics server stopped: {err}");
+            }
+        });
+    }
 
     let multicast_config = if let Some(group_addr) = args.multicast_group {
         let Some(bind_addr) = args.multicast_bind_addr else {
@@ -168,7 +235,78 @@ async fn main() -> Result<()> {
         }
     });
 
-    run_websocket_server(&full_address, true, compression_level, multicast_config, dob_config).await?;
+    run_websocket_server(
+        &full_address,
+        true,
+        compression_level,
+        multicast_config,
+        dob_config,
+        ingest_mode,
+        args.hl_data_root,
+        args.separate_fill_ingest,
+    )
+    .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_cli_defaults_to_localhost_9090_enabled() {
+        let args = Args::parse_from(["dz_hl_publisher", "--address", "127.0.0.1", "--port", "8000"]);
+        assert_eq!(args.metrics_address, Ipv4Addr::LOCALHOST);
+        assert_eq!(args.metrics_port, 9090);
+        assert!(!args.disable_metrics);
+    }
+
+    #[test]
+    fn metrics_cli_accepts_disable_and_custom_address() {
+        let args = Args::parse_from([
+            "dz_hl_publisher",
+            "--address",
+            "127.0.0.1",
+            "--port",
+            "8000",
+            "--metrics-address",
+            "0.0.0.0",
+            "--metrics-port",
+            "19090",
+            "--disable-metrics",
+        ]);
+        assert_eq!(args.metrics_address, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(args.metrics_port, 19090);
+        assert!(args.disable_metrics);
+    }
+
+    #[test]
+    fn separate_fill_ingest_defaults_off() {
+        let args = Args::parse_from(["dz_hl_publisher", "--address", "127.0.0.1", "--port", "8000"]);
+        assert!(!args.separate_fill_ingest);
+    }
+
+    #[test]
+    fn separate_fill_ingest_cli_flag_parses() {
+        let args = Args::parse_from([
+            "dz_hl_publisher",
+            "--address",
+            "127.0.0.1",
+            "--port",
+            "8000",
+            "--ingest-mode",
+            "stream",
+            "--separate-fill-ingest",
+        ]);
+        assert!(args.separate_fill_ingest);
+        assert!(matches!(IngestMode::from(args.ingest_mode), IngestMode::Stream));
+    }
+
+    #[test]
+    fn separate_fill_ingest_rejects_block_mode() {
+        let args =
+            Args::parse_from(["dz_hl_publisher", "--address", "127.0.0.1", "--port", "8000", "--separate-fill-ingest"]);
+        assert_eq!(args.validate().err().as_deref(), Some("--separate-fill-ingest requires --ingest-mode stream"));
+    }
 }

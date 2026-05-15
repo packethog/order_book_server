@@ -66,5 +66,39 @@
   },
   "source_host": "ubuntu@tyo-hl-node",
   "source_snapshot": "/home/ubuntu/out.json",
+  "streaming_fixture": {
+    "counts": {
+      "diffs": {
+        "bytes": 39064,
+        "events": 140,
+        "first_block": 978995377,
+        "last_block": 978995416,
+        "lines": 146
+      },
+      "fills": {
+        "bytes": 7118,
+        "events": 4,
+        "first_block": 978995377,
+        "last_block": 978995416,
+        "lines": 43
+      },
+      "statuses": {
+        "bytes": 4688574,
+        "events": 7769,
+        "first_block": 978995377,
+        "last_block": 978995416,
+        "lines": 7774
+      }
+    },
+    "diffs_grouping": "one event per line",
+    "files": {
+      "diffs": "hl/data/node_raw_book_diffs_streaming/hourly/20260430/20",
+      "fills": "hl/data/node_fills_streaming/hourly/20260430/20",
+      "statuses": "hl/data/node_order_statuses_streaming/hourly/20260430/20"
+    },
+    "fills_grouping": "one event per line; live streaming can split the two sides of a trade across rows",
+    "generation": "derived from filtered by-block fixture",
+    "statuses_grouping": "one event per line"
+  },
   "touched_coin_count": 256
 }

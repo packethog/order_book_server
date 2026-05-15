@@ -21,7 +21,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use server::multicast::dob::{channel, run_dob_emitter, DobEmitter, DobEvent, DobMktdataConfig};
+use server::multicast::dob::{DobEmitter, DobEvent, DobMktdataConfig, channel, run_dob_emitter};
 use server::protocol::dob::messages::{BatchBoundary, OrderAdd, OrderCancel, OrderExecute};
 use tokio::net::UdpSocket;
 
@@ -89,9 +89,7 @@ async fn collect_test_datagrams() -> Vec<Vec<u8>> {
     let handle = tokio::spawn(run_dob_emitter(emitter, rx));
 
     // 5 events that exactly fill the TEST_MTU frame.
-    tx.send(DobEvent::BatchBoundary(BatchBoundary { channel_id: 3, phase: 0, batch_id: 1_000 }))
-        .await
-        .unwrap();
+    tx.send(DobEvent::BatchBoundary(BatchBoundary { channel_id: 3, phase: 0, batch_id: 1_000 })).await.unwrap();
     tx.send(DobEvent::OrderAdd(OrderAdd {
         instrument_id: 0,
         source_id: 1,
@@ -129,9 +127,7 @@ async fn collect_test_datagrams() -> Vec<Vec<u8>> {
     }))
     .await
     .unwrap();
-    tx.send(DobEvent::BatchBoundary(BatchBoundary { channel_id: 3, phase: 1, batch_id: 1_000 }))
-        .await
-        .unwrap();
+    tx.send(DobEvent::BatchBoundary(BatchBoundary { channel_id: 3, phase: 1, batch_id: 1_000 })).await.unwrap();
 
     // This event does not fit in the now-full frame, so append() flushes the
     // 5-event frame above, then starts a new incomplete frame for this event.

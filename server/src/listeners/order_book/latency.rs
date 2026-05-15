@@ -62,13 +62,7 @@ impl LatencyStats {
     /// - `t_wakeup` / `t_done`: monotonic instants bracketing our processing
     /// - `block_time_ms`: validator consensus timestamp (ms since epoch)
     /// - `local_time_ms`: hl-node wall-clock when it wrote the batch (ms since epoch)
-    pub(super) fn record(
-        &self,
-        t_wakeup: Instant,
-        t_done: Instant,
-        block_time_ms: u64,
-        local_time_ms: u64,
-    ) {
+    pub(super) fn record(&self, t_wakeup: Instant, t_done: Instant, block_time_ms: u64, local_time_ms: u64) {
         let gossip_ms = local_time_ms.saturating_sub(block_time_ms);
 
         // Wall-clock at wakeup for comparison with local_time.
@@ -80,6 +74,11 @@ impl LatencyStats {
 
         let process_us = process_duration.as_micros() as u64;
         let e2e_ms = now_ms.saturating_sub(block_time_ms);
+
+        crate::metrics::observe_listener_latency("gossip", gossip_ms as f64 / 1_000.0);
+        crate::metrics::observe_listener_latency("hl_to_wake", hl_to_wake_ms as f64 / 1_000.0);
+        crate::metrics::observe_listener_latency("process", process_duration.as_secs_f64());
+        crate::metrics::observe_listener_latency("e2e", e2e_ms as f64 / 1_000.0);
 
         update_bucket(&self.gossip_min, &self.gossip_max, &self.gossip_sum, gossip_ms);
         update_bucket(&self.hl_to_wake_min, &self.hl_to_wake_max, &self.hl_to_wake_sum, hl_to_wake_ms);
@@ -117,10 +116,18 @@ impl LatencyStats {
              hl→wake ms min/avg/max={}/{}/{} | \
              process µs min/avg/max={}/{}/{} | \
              e2e ms min/avg/max={}/{}/{}",
-            gossip.0, gossip.2 / n, gossip.1,
-            hl_to_wake.0, hl_to_wake.2 / n, hl_to_wake.1,
-            process.0, process.2 / n, process.1,
-            e2e.0, e2e.2 / n, e2e.1,
+            gossip.0,
+            gossip.2 / n,
+            gossip.1,
+            hl_to_wake.0,
+            hl_to_wake.2 / n,
+            hl_to_wake.1,
+            process.0,
+            process.2 / n,
+            process.1,
+            e2e.0,
+            e2e.2 / n,
+            e2e.1,
         );
 
         n
@@ -128,10 +135,7 @@ impl LatencyStats {
 }
 
 fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
 fn update_bucket(min: &AtomicU64, max: &AtomicU64, sum: &AtomicU64, val: u64) {

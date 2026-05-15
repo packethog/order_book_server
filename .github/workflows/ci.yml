@@ -35,3 +35,24 @@ jobs:
 
       - name: run tests
         run: cargo test --workspace
+
+  tob-parser-e2e:
+    name: tob parser e2e
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: checkout edge multicast ref
+        uses: actions/checkout@v4
+        with:
+          repository: malbeclabs/edge-multicast-ref
+          ref: fa98eb78255f9d8492902db4b04c23aa04b074b8
+          path: edge-multicast-ref
+          token: ${{ secrets.EDGE_MULTICAST_REF_TOKEN || github.token }}
+
+      - name: run tob parser e2e in docker
+        env:
+          EDGE_MULTICAST_REF_DIR: ${{ github.workspace }}/edge-multicast-ref
+        run: server/tests/fixtures/hl_dual_validator/run_tob_parser_e2e_in_docker.sh

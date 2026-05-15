@@ -22,25 +22,11 @@ pub struct DobFrameBuilder {
 }
 
 impl DobFrameBuilder {
-    pub fn new(
-        channel_id: u8,
-        sequence_number: u64,
-        send_timestamp_ns: u64,
-        reset_count: u8,
-        mtu: u16,
-    ) -> Self {
+    pub fn new(channel_id: u8, sequence_number: u64, send_timestamp_ns: u64, reset_count: u8, mtu: u16) -> Self {
         let mtu = mtu as usize;
         let mut buf = Vec::with_capacity(mtu);
         buf.resize(FRAME_HEADER_SIZE, 0);
-        Self {
-            buf,
-            channel_id,
-            sequence_number,
-            send_timestamp_ns,
-            reset_count,
-            mtu,
-            msg_count: 0,
-        }
+        Self { buf, channel_id, sequence_number, send_timestamp_ns, reset_count, mtu, msg_count: 0 }
     }
 
     #[must_use]
@@ -58,10 +44,7 @@ impl DobFrameBuilder {
             return Err(DobFrameError::MaxMessages);
         }
         if size > self.remaining() {
-            return Err(DobFrameError::ExceedsMtu {
-                msg_size: size,
-                remaining: self.remaining(),
-            });
+            return Err(DobFrameError::ExceedsMtu { msg_size: size, remaining: self.remaining() });
         }
         let start = self.buf.len();
         self.buf.resize(start + size, 0);

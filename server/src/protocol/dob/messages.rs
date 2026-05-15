@@ -5,11 +5,7 @@
 //! so DoB call sites have a single import path.
 
 pub use crate::protocol::messages::{
-    encode_end_of_session,
-    encode_heartbeat,
-    encode_instrument_definition,
-    encode_manifest_summary,
-    encode_trade,
+    encode_end_of_session, encode_heartbeat, encode_instrument_definition, encode_manifest_summary, encode_trade,
 };
 
 #[cfg(test)]
@@ -24,11 +20,7 @@ mod tests {
         assert_eq!(buf[0], MSG_TYPE_HEARTBEAT, "type byte");
         assert_eq!(buf[1] as usize, HEARTBEAT_SIZE, "length byte");
         assert_eq!(buf[4], 3, "channel id");
-        assert_eq!(
-            u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-            1_700_000_000_000_000_000,
-            "timestamp"
-        );
+        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 1_700_000_000_000_000_000, "timestamp");
     }
 }
 
@@ -69,9 +61,7 @@ pub fn encode_order_add(out: &mut [u8], msg: &OrderAdd) {
 #[cfg(test)]
 mod order_add_tests {
     use super::*;
-    use crate::protocol::dob::constants::{
-        MSG_TYPE_ORDER_ADD, ORDER_ADD_SIZE, ORDER_FLAG_POST_ONLY, SIDE_BID,
-    };
+    use crate::protocol::dob::constants::{MSG_TYPE_ORDER_ADD, ORDER_ADD_SIZE, ORDER_FLAG_POST_ONLY, SIDE_BID};
 
     #[test]
     fn round_trip_order_add() {
@@ -109,9 +99,15 @@ mod order_add_tests {
     fn wrong_buffer_size_panics() {
         let mut buf = [0u8; 10];
         let msg = OrderAdd {
-            instrument_id: 0, source_id: 0, side: 0, order_flags: 0,
-            per_instrument_seq: 0, order_id: 0, enter_timestamp_ns: 0,
-            price: 0, quantity: 0,
+            instrument_id: 0,
+            source_id: 0,
+            side: 0,
+            order_flags: 0,
+            per_instrument_seq: 0,
+            order_id: 0,
+            enter_timestamp_ns: 0,
+            price: 0,
+            quantity: 0,
         };
         encode_order_add(&mut buf, &msg);
     }
@@ -146,9 +142,7 @@ pub fn encode_order_cancel(out: &mut [u8], msg: &OrderCancel) {
 #[cfg(test)]
 mod order_cancel_tests {
     use super::*;
-    use crate::protocol::dob::constants::{
-        CANCEL_REASON_USER_CANCEL, MSG_TYPE_ORDER_CANCEL, ORDER_CANCEL_SIZE,
-    };
+    use crate::protocol::dob::constants::{CANCEL_REASON_USER_CANCEL, MSG_TYPE_ORDER_CANCEL, ORDER_CANCEL_SIZE};
 
     #[test]
     fn round_trip_order_cancel() {
@@ -359,9 +353,7 @@ pub struct SnapshotBegin {
 }
 
 pub fn encode_snapshot_begin(out: &mut [u8], msg: &SnapshotBegin) {
-    use crate::protocol::dob::constants::{
-        FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_BEGIN, SNAPSHOT_BEGIN_SIZE,
-    };
+    use crate::protocol::dob::constants::{FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_BEGIN, SNAPSHOT_BEGIN_SIZE};
     assert_eq!(out.len(), SNAPSHOT_BEGIN_SIZE, "SnapshotBegin buffer size mismatch");
 
     out[0] = MSG_TYPE_SNAPSHOT_BEGIN;
@@ -378,9 +370,7 @@ pub fn encode_snapshot_begin(out: &mut [u8], msg: &SnapshotBegin) {
 #[cfg(test)]
 mod snapshot_begin_tests {
     use super::*;
-    use crate::protocol::dob::constants::{
-        FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_BEGIN, SNAPSHOT_BEGIN_SIZE,
-    };
+    use crate::protocol::dob::constants::{FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_BEGIN, SNAPSHOT_BEGIN_SIZE};
 
     #[test]
     fn round_trip_snapshot_begin() {
@@ -404,10 +394,7 @@ mod snapshot_begin_tests {
         assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 0x0001_0203);
         assert_eq!(u32::from_le_bytes(buf[20..24].try_into().unwrap()), 0x0405_0607);
         assert_eq!(u32::from_le_bytes(buf[24..28].try_into().unwrap()), 0x0809_0A0B);
-        assert_eq!(
-            u64::from_le_bytes(buf[28..36].try_into().unwrap()),
-            1_700_000_000_000_000_001
-        );
+        assert_eq!(u64::from_le_bytes(buf[28..36].try_into().unwrap()), 1_700_000_000_000_000_001);
     }
 }
 
@@ -428,9 +415,7 @@ pub struct SnapshotOrder {
 }
 
 pub fn encode_snapshot_order(out: &mut [u8], msg: &SnapshotOrder) {
-    use crate::protocol::dob::constants::{
-        FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_ORDER, SNAPSHOT_ORDER_SIZE,
-    };
+    use crate::protocol::dob::constants::{FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_ORDER, SNAPSHOT_ORDER_SIZE};
     assert_eq!(out.len(), SNAPSHOT_ORDER_SIZE, "SnapshotOrder buffer size mismatch");
 
     out[0] = MSG_TYPE_SNAPSHOT_ORDER;
@@ -450,8 +435,7 @@ pub fn encode_snapshot_order(out: &mut [u8], msg: &SnapshotOrder) {
 mod snapshot_order_tests {
     use super::*;
     use crate::protocol::dob::constants::{
-        FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_ORDER, ORDER_FLAG_POST_ONLY, SIDE_ASK,
-        SNAPSHOT_ORDER_SIZE,
+        FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_ORDER, ORDER_FLAG_POST_ONLY, SIDE_ASK, SNAPSHOT_ORDER_SIZE,
     };
 
     #[test]
@@ -472,16 +456,8 @@ mod snapshot_order_tests {
         assert_eq!(buf[1] as usize, SNAPSHOT_ORDER_SIZE, "length");
         assert_eq!(&buf[2..4], &FLAG_SNAPSHOT.to_le_bytes(), "flags");
         assert_eq!(&buf[2..4], &[0x01, 0x00], "flags bytes");
-        assert_eq!(
-            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
-            0x0405_0607,
-            "snapshot_id"
-        );
-        assert_eq!(
-            u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-            0xDEAD_BEEF_CAFE_BABE,
-            "order_id"
-        );
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 0x0405_0607, "snapshot_id");
+        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 0xDEAD_BEEF_CAFE_BABE, "order_id");
         assert_eq!(buf[16], SIDE_ASK, "side");
         assert_eq!(buf[17], ORDER_FLAG_POST_ONLY, "order_flags");
         assert_eq!(&buf[18..20], &[0, 0], "reserved");
@@ -495,11 +471,7 @@ mod snapshot_order_tests {
             -12_345_678,
             "price (negative, exercises i64 sign)"
         );
-        assert_eq!(
-            u64::from_le_bytes(buf[36..44].try_into().unwrap()),
-            98_765_432,
-            "quantity"
-        );
+        assert_eq!(u64::from_le_bytes(buf[36..44].try_into().unwrap()), 98_765_432, "quantity");
     }
 }
 
@@ -515,9 +487,7 @@ pub struct SnapshotEnd {
 }
 
 pub fn encode_snapshot_end(out: &mut [u8], msg: &SnapshotEnd) {
-    use crate::protocol::dob::constants::{
-        FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_END, SNAPSHOT_END_SIZE,
-    };
+    use crate::protocol::dob::constants::{FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_END, SNAPSHOT_END_SIZE};
     assert_eq!(out.len(), SNAPSHOT_END_SIZE, "SnapshotEnd buffer size mismatch");
 
     out[0] = MSG_TYPE_SNAPSHOT_END;
@@ -531,17 +501,12 @@ pub fn encode_snapshot_end(out: &mut [u8], msg: &SnapshotEnd) {
 #[cfg(test)]
 mod snapshot_end_tests {
     use super::*;
-    use crate::protocol::dob::constants::{
-        FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_END, SNAPSHOT_END_SIZE,
-    };
+    use crate::protocol::dob::constants::{FLAG_SNAPSHOT, MSG_TYPE_SNAPSHOT_END, SNAPSHOT_END_SIZE};
 
     #[test]
     fn round_trip_snapshot_end() {
-        let msg = SnapshotEnd {
-            instrument_id: 0xAABB_CCDD,
-            anchor_seq: 0x1122_3344_5566_7788,
-            snapshot_id: 0x0405_0607,
-        };
+        let msg =
+            SnapshotEnd { instrument_id: 0xAABB_CCDD, anchor_seq: 0x1122_3344_5566_7788, snapshot_id: 0x0405_0607 };
         let mut buf = [0u8; SNAPSHOT_END_SIZE];
         encode_snapshot_end(&mut buf, &msg);
 
@@ -549,20 +514,8 @@ mod snapshot_end_tests {
         assert_eq!(buf[1] as usize, SNAPSHOT_END_SIZE, "length");
         assert_eq!(&buf[2..4], &FLAG_SNAPSHOT.to_le_bytes(), "flags");
         assert_eq!(&buf[2..4], &[0x01, 0x00], "flags bytes");
-        assert_eq!(
-            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
-            0xAABB_CCDD,
-            "instrument_id"
-        );
-        assert_eq!(
-            u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-            0x1122_3344_5566_7788,
-            "anchor_seq"
-        );
-        assert_eq!(
-            u32::from_le_bytes(buf[16..20].try_into().unwrap()),
-            0x0405_0607,
-            "snapshot_id"
-        );
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 0xAABB_CCDD, "instrument_id");
+        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 0x1122_3344_5566_7788, "anchor_seq");
+        assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 0x0405_0607, "snapshot_id");
     }
 }

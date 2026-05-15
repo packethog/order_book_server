@@ -1,36 +1,17 @@
-use crate::{
-    HL_NODE,
-    listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
-    multicast::dob::{
-        DobEvent, DobEventSender, DobSnapshotRequest, DobSnapshotRequestSender, SharedMktdataSeq,
-    },
-    order_book::{
-        Coin, Snapshot,
-        multi_book::{Snapshots, load_snapshots_from_json},
-    },
-    prelude::*,
-    protocol::dob::{
-        constants::RESET_REASON_PUBLISHER_INCONSISTENCY, messages::InstrumentReset,
-    },
-    types::{
-        L4Order,
-        inner::{InnerL4Order, InnerLevel},
-        node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
-    },
-};
-use alloy::primitives::Address;
-use fs::File;
-use latency::LatencyStats;
-use log::{error, info};
-use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::{Read, Seek, SeekFrom},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use alloy::primitives::Address;
+use fs::File;
+use latency::LatencyStats;
+use log::{debug, error, info};
+use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use tokio::{
     sync::{
         Mutex,
@@ -41,35 +22,121 @@ use tokio::{
 };
 use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
 
+use crate::{
+    HL_NODE,
+    listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
+    multicast::dob::{DobEvent, DobEventSender, DobSnapshotRequest, DobSnapshotRequestSender, SharedMktdataSeq},
+    order_book::{
+        Coin, Oid, Snapshot,
+        multi_book::{Snapshots, load_snapshots_from_json},
+    },
+    prelude::*,
+    protocol::dob::{constants::RESET_REASON_PUBLISHER_INCONSISTENCY, messages::InstrumentReset},
+    types::{
+        L4Order, OrderDiff,
+        inner::{InnerL4Order, InnerLevel},
+        node_data::{Batch, EventSource, IngestMode, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+    },
+};
+
+use self::progress::IngestProgress;
+
 #[cfg(test)]
 mod block_mode_multicast_e2e;
 pub(crate) mod dob_tap;
 pub(crate) mod latency;
 #[cfg(test)]
 mod parity_tests;
+mod progress;
 mod state;
 mod utils;
+
+#[cfg(not(test))]
+const UNRESOLVED_STREAM_NEW_SKIP_AFTER: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const UNRESOLVED_STREAM_NEW_SKIP_AFTER: Duration = Duration::from_millis(0);
+
+#[cfg(not(test))]
+const DEFAULT_STREAM_BLOCK_FINALIZE_GRACE: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const DEFAULT_STREAM_BLOCK_FINALIZE_GRACE: Duration = Duration::from_millis(0);
+
+#[cfg(not(test))]
+const STREAM_REORDER_FALLBACK_WINDOW: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const STREAM_REORDER_FALLBACK_WINDOW: Duration = Duration::from_millis(50);
 
 /// Wall-clock nanoseconds since the Unix epoch. Mirrors the helper in
 /// `multicast::dob` (kept module-local there) so `apply_recovery` can stamp
 /// `InstrumentReset.timestamp_ns` without crossing a privacy boundary.
 #[inline]
 fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+}
+
+#[inline]
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+fn system_time_ms(time: SystemTime) -> Option<u64> {
+    let millis = time.duration_since(UNIX_EPOCH).ok()?.as_millis();
+    millis.try_into().ok()
+}
+
+const fn ingest_source_label(source: EventSource) -> &'static str {
+    match source {
+        EventSource::Fills => "fills",
+        EventSource::OrderStatuses => "statuses",
+        EventSource::OrderDiffs => "diffs",
+    }
+}
+
+fn seek_to_recent_jsonl_boundary(file: &mut File) -> Result<bool> {
+    let end = file.seek(SeekFrom::End(0))?;
+    let backtrack = end.min(8192);
+    if backtrack == 0 {
+        return Ok(false);
+    }
+
+    file.seek(SeekFrom::End(-(backtrack as i64)))?;
+    let mut buf = vec![0u8; backtrack as usize];
+    file.read_exact(&mut buf)?;
+    if let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') {
+        let rewind = backtrack - (last_nl as u64) - 1;
+        file.seek(SeekFrom::End(-(rewind as i64)))?;
+        Ok(false)
+    } else {
+        file.seek(SeekFrom::End(0))?;
+        Ok(true)
+    }
 }
 
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
 // if there are scripts running, this may not work as intended
-pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: PathBuf) -> Result<()> {
-    let order_statuses_dir = EventSource::OrderStatuses.event_source_dir(&dir).canonicalize()?;
-    let fills_dir = EventSource::Fills.event_source_dir(&dir).canonicalize()?;
-    let order_diffs_dir = EventSource::OrderDiffs.event_source_dir(&dir).canonicalize()?;
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn hl_listen(
+    listener: Arc<Mutex<OrderBookListener>>,
+    snapshot_dir: PathBuf,
+    hl_data_root: PathBuf,
+    ingest_mode: IngestMode,
+    watch_fills: bool,
+) -> Result<()> {
+    let order_statuses_dir =
+        EventSource::OrderStatuses.event_source_dir_for(&hl_data_root, ingest_mode).canonicalize()?;
+    let fills_dir = if watch_fills {
+        Some(EventSource::Fills.event_source_dir_for(&hl_data_root, ingest_mode).canonicalize()?)
+    } else {
+        None
+    };
+    let order_diffs_dir = EventSource::OrderDiffs.event_source_dir_for(&hl_data_root, ingest_mode).canonicalize()?;
     info!("Monitoring order status directory: {}", order_statuses_dir.display());
     info!("Monitoring order diffs directory: {}", order_diffs_dir.display());
-    info!("Monitoring fills directory: {}", fills_dir.display());
+    if let Some(fills_dir) = &fills_dir {
+        info!("Monitoring fills directory: {}", fills_dir.display());
+    } else {
+        info!("Fills directory handled by separate streaming fill listener");
+    }
 
     // monitoring the directory via the notify crate (gives file system events)
     let (fs_event_tx, mut fs_event_rx) = unbounded_channel();
@@ -92,7 +159,9 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<Result<()>>();
 
     watcher.watch(&order_statuses_dir, RecursiveMode::Recursive)?;
-    watcher.watch(&fills_dir, RecursiveMode::Recursive)?;
+    if let Some(fills_dir) = &fills_dir {
+        watcher.watch(fills_dir, RecursiveMode::Recursive)?;
+    }
     watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
     let start = Instant::now() + Duration::from_secs(5);
     let mut ticker = interval_at(start, Duration::from_secs(60));
@@ -100,11 +169,10 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     // that was recreating a Sleep future on every select! iteration)
     let mut last_event_time: Option<Instant> = None;
 
-    // Classify an fs path into its EventSource (avoids repeating starts_with checks)
-    let classify_path = |path: &std::path::Path| -> Option<EventSource> {
+    let classify_path = |path: &Path| -> Option<EventSource> {
         if path.starts_with(&order_statuses_dir) {
             Some(EventSource::OrderStatuses)
-        } else if path.starts_with(&fills_dir) {
+        } else if fills_dir.as_ref().is_some_and(|fills_dir| path.starts_with(fills_dir)) {
             Some(EventSource::Fills)
         } else if path.starts_with(&order_diffs_dir) {
             Some(EventSource::OrderDiffs)
@@ -198,10 +266,72 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 }
 
                 latency_stats.report();
+                {
+                    let mut guard = listener.lock().await;
+                    guard.progress.report();
+                    guard.report_streaming_health();
+                }
 
                 let listener = listener.clone();
                 let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
+                fetch_snapshot(snapshot_dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
+            }
+        }
+    }
+}
+
+pub(crate) async fn hl_listen_fills_only(
+    market_message_tx: Sender<Arc<InternalMessage>>,
+    hl_data_root: PathBuf,
+) -> Result<()> {
+    let fills_dir = EventSource::Fills.event_source_dir_for(&hl_data_root, IngestMode::Stream).canonicalize()?;
+    info!("Monitoring fills directory with separate listener: {}", fills_dir.display());
+
+    let (fs_event_tx, mut fs_event_rx) = unbounded_channel();
+    let mut watcher = recommended_watcher(move |res| {
+        let fs_event_tx = fs_event_tx.clone();
+        if let Err(err) = fs_event_tx.send(res) {
+            error!("Error sending fill fs event to processor via channel: {err}");
+        }
+    })?;
+    watcher.watch(&fills_dir, RecursiveMode::Recursive)?;
+
+    let mut listener = FillOnlyListener::new(market_message_tx);
+    loop {
+        match fs_event_rx.recv().await {
+            Some(Ok(first_event)) => {
+                if first_event.kind.is_create() || first_event.kind.is_modify() {
+                    if let Some(path) = first_event.paths.first() {
+                        if path.is_file() && path.starts_with(&fills_dir) {
+                            listener.process_update(&first_event, path)?;
+                        }
+                    }
+                }
+                while let Ok(next) = fs_event_rx.try_recv() {
+                    match next {
+                        Ok(ev) if ev.kind.is_create() || ev.kind.is_modify() => {
+                            if let Some(path) = ev.paths.first() {
+                                if path.is_file() && path.starts_with(&fills_dir) {
+                                    listener.process_update(&ev, path)?;
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            error!("Fill watcher error (drained): {err}");
+                            return Err(format!("Fill watcher error: {err}").into());
+                        }
+                    }
+                }
+                let _reported = listener.progress.report_if_due();
+            }
+            Some(Err(err)) => {
+                error!("Fill watcher error: {err}");
+                return Err(format!("Fill watcher error: {err}").into());
+            }
+            None => {
+                error!("Fill watcher channel closed. Listener exiting");
+                return Err("Fill watcher channel closed.".into());
             }
         }
     }
@@ -228,17 +358,15 @@ fn fetch_snapshot(
                         // cycle (we'll catch the next one).
                         let mut guard = listener.lock().await;
                         if guard.is_ready() {
-                            let our_height = guard.order_book_state.as_ref()
-                                .map(|s| s.height())
-                                .unwrap_or(0);
+                            let our_height = guard.order_book_state.as_ref().map(|s| s.height()).unwrap_or(0);
                             if our_height < height {
                                 // We haven't reached the snapshot height yet;
                                 // skip — we'll validate on a future cycle.
-                                info!("Validation skipped: our height {our_height} < snapshot height {height}");
+                                debug!("Validation skipped: our height {our_height} < snapshot height {height}");
                                 Ok(())
                             } else if our_height > height {
                                 // We've moved past — snapshot is stale, skip.
-                                info!("Validation skipped: our height {our_height} > snapshot height {height}");
+                                debug!("Validation skipped: our height {our_height} > snapshot height {height}");
                                 Ok(())
                             } else {
                                 // Heights match — clone state under lock, then
@@ -246,13 +374,12 @@ fn fetch_snapshot(
                                 // so we don't block the hot path. If divergence
                                 // is found, re-lock and apply surgical per-coin
                                 // recovery rather than tearing down the feed.
-                                let state = guard.order_book_state
-                                    .clone()
-                                    .expect("is_ready checked above");
+                                let state = guard.order_book_state.clone().expect("is_ready checked above");
                                 drop(guard);
                                 let stored_snapshot = state.compute_snapshot().snapshot;
                                 info!("Validating snapshot at height {height}");
-                                let report = validate_snapshot_consistency(&stored_snapshot, &expected_snapshot, ignore_spot);
+                                let report =
+                                    validate_snapshot_consistency(&stored_snapshot, &expected_snapshot, ignore_spot);
                                 if report.is_clean() {
                                     Ok(())
                                 } else {
@@ -300,7 +427,59 @@ pub(crate) struct DobReplayTaps {
     pub(crate) instrument_id_for: Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync>,
 }
 
+#[derive(Default)]
+struct StreamingBlock {
+    block_time_ms: Option<u64>,
+    local_time_ms: Option<u64>,
+    last_received_at: Option<Instant>,
+    statuses: HashMap<Oid, NodeDataOrderStatus>,
+    diffs: VecDeque<Batch<NodeDataOrderDiff>>,
+    boundary_open: bool,
+}
+
+#[derive(Default)]
+struct StreamingState {
+    blocks: BTreeMap<u64, StreamingBlock>,
+    finalized_height: Option<u64>,
+    diff_watermark: Option<u64>,
+    status_watermark: Option<u64>,
+    startup_sync_height: Option<u64>,
+    diff_watermark_local_time_ms: Option<u64>,
+    status_watermark_local_time_ms: Option<u64>,
+    grace_fallback_until: Option<Instant>,
+    out_of_order_rows: u64,
+    late_finalized_rows: u64,
+    grace_fallback_activations: u64,
+    finalized_watermark_blocks: u64,
+    finalized_grace_blocks: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum StreamFinalizationMode {
+    Watermark,
+    GraceFallback,
+}
+
+impl StreamFinalizationMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Watermark => "watermark",
+            Self::GraceFallback => "grace_fallback",
+        }
+    }
+}
+
+struct UnresolvedStreamNewDebug {
+    height: u64,
+    oid: Oid,
+    first_seen_at: Instant,
+    last_logged_at: Instant,
+    last_later_block_seen: bool,
+    max_buffered_blocks_logged: usize,
+}
+
 pub(crate) struct OrderBookListener {
+    ingest_mode: IngestMode,
     ignore_spot: bool,
     fill_status_file: Option<File>,
     order_status_file: Option<File>,
@@ -313,20 +492,46 @@ pub(crate) struct OrderBookListener {
     // Only Some when we want it to collect updates
     fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+    l4_message_tx: Option<Sender<Arc<InternalMessage>>>,
     // Timestamps from the most recently deserialized batch (for latency tracking)
     last_batch_block_time_ms: Option<u64>,
     last_batch_local_time_ms: Option<u64>,
+    last_fill_height: Option<u64>,
+    last_status_height: Option<u64>,
+    last_diff_height: Option<u64>,
+    last_fill_file_mtime_ms: Option<u64>,
+    last_status_file_mtime_ms: Option<u64>,
+    last_diff_file_mtime_ms: Option<u64>,
+    discard_fill_fragment: bool,
+    discard_status_fragment: bool,
+    discard_diff_fragment: bool,
     // Held until the first snapshot is ready, then attached to the state.
     pending_dob_tap: Option<dob_tap::DobApplyTap>,
     // Channels into the DoB pipeline, used by `apply_recovery` to emit
     // `InstrumentReset` and schedule priority snapshots. `None` until
     // `attach_dob_replay_taps` is called; recovery still runs without it.
     dob_replay_taps: Option<DobReplayTaps>,
+    streaming_state: StreamingState,
+    last_unresolved_stream_new: Option<UnresolvedStreamNewDebug>,
+    progress: IngestProgress,
+    #[cfg(test)]
+    stream_block_finalize_grace: Duration,
 }
 
 impl OrderBookListener {
-    pub(crate) const fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
+    /// Constructs a listener with the given ingest mode. There is intentionally
+    /// no default-ingest-mode convenience constructor: every call site must
+    /// state which mode it wants. A previous default-to-Block constructor
+    /// silently created Block-mode listeners in the streaming code path,
+    /// breaking the streaming pipeline (file watcher pointed at streaming dirs
+    /// but events routed to receive_block_batch).
+    pub(crate) fn new_with_ingest_mode(
+        internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+        ignore_spot: bool,
+        ingest_mode: IngestMode,
+    ) -> Self {
         Self {
+            ingest_mode,
             ignore_spot,
             fill_status_file: None,
             order_status_file: None,
@@ -335,13 +540,59 @@ impl OrderBookListener {
             last_fill: None,
             fetched_snapshot_cache: None,
             internal_message_tx,
+            l4_message_tx: None,
             order_diff_cache: BatchQueue::new(),
             order_status_cache: BatchQueue::new(),
             last_batch_block_time_ms: None,
             last_batch_local_time_ms: None,
+            last_fill_height: None,
+            last_status_height: None,
+            last_diff_height: None,
+            last_fill_file_mtime_ms: None,
+            last_status_file_mtime_ms: None,
+            last_diff_file_mtime_ms: None,
+            discard_fill_fragment: false,
+            discard_status_fragment: false,
+            discard_diff_fragment: false,
             pending_dob_tap: None,
             dob_replay_taps: None,
+            streaming_state: StreamingState::default(),
+            last_unresolved_stream_new: None,
+            progress: IngestProgress::new(),
+            #[cfg(test)]
+            stream_block_finalize_grace: DEFAULT_STREAM_BLOCK_FINALIZE_GRACE,
         }
+    }
+
+    #[cfg(not(test))]
+    const fn stream_block_finalize_grace(&self) -> Duration {
+        DEFAULT_STREAM_BLOCK_FINALIZE_GRACE
+    }
+
+    #[cfg(test)]
+    const fn stream_block_finalize_grace(&self) -> Duration {
+        self.stream_block_finalize_grace
+    }
+
+    #[cfg(test)]
+    fn set_stream_block_finalize_grace_for_test(&mut self, grace: Duration) {
+        self.stream_block_finalize_grace = grace;
+    }
+
+    #[cfg(test)]
+    fn stream_finalization_mode_for_test(&mut self) -> StreamFinalizationMode {
+        self.effective_stream_finalization_mode()
+    }
+
+    #[cfg(test)]
+    fn complete_stream_startup_sync_for_test(&mut self) {
+        let current_height = self
+            .order_book_state
+            .as_ref()
+            .map(OrderBookState::height)
+            .or(self.streaming_state.finalized_height)
+            .unwrap_or(0);
+        self.streaming_state.startup_sync_height = Some(current_height);
     }
 
     /// Returns (block_time_ms, local_time_ms) from the most recently
@@ -357,6 +608,14 @@ impl OrderBookListener {
 
     pub(crate) const fn is_ready(&self) -> bool {
         self.order_book_state.is_some()
+    }
+
+    pub(crate) fn set_l4_message_tx(&mut self, tx: Sender<Arc<InternalMessage>>) {
+        self.l4_message_tx = Some(tx);
+    }
+
+    fn l4_message_tx(&self) -> Option<&Sender<Arc<InternalMessage>>> {
+        self.l4_message_tx.as_ref().or(self.internal_message_tx.as_ref())
     }
 
     pub(crate) fn universe(&self) -> HashSet<Coin> {
@@ -432,19 +691,13 @@ impl OrderBookListener {
         };
 
         if let Err(err) = taps.mktdata_tx.try_send(DobEvent::InstrumentReset(msg)) {
-            log::warn!(
-                "dob taps: dropped InstrumentReset for {}: {err}",
-                coin.value()
-            );
+            log::warn!("dob taps: dropped InstrumentReset for {}: {err}", coin.value());
         }
-        if let Err(err) = taps.snapshot_request_tx.try_send(DobSnapshotRequest::Priority {
-            instrument_id,
-            anchor_seq: new_anchor_seq,
-        }) {
-            log::warn!(
-                "dob taps: dropped priority snapshot request for {}: {err}",
-                coin.value()
-            );
+        if let Err(err) = taps
+            .snapshot_request_tx
+            .try_send(DobSnapshotRequest::Priority { instrument_id, anchor_seq: new_anchor_seq })
+        {
+            log::warn!("dob taps: dropped priority snapshot request for {}: {err}", coin.value());
         }
     }
 
@@ -476,6 +729,13 @@ impl OrderBookListener {
     }
 
     fn receive_batch(&mut self, updates: EventBatch) -> Result<()> {
+        match self.ingest_mode {
+            IngestMode::Block => self.receive_block_batch(updates),
+            IngestMode::Stream => self.receive_stream_batch(updates),
+        }
+    }
+
+    fn receive_block_batch(&mut self, updates: EventBatch) -> Result<()> {
         match updates {
             EventBatch::Orders(batch) => {
                 self.order_status_cache.push(batch);
@@ -487,11 +747,13 @@ impl OrderBookListener {
                 if self.last_fill.is_none_or(|height| height < batch.block_number()) {
                     // send fill updates if we received a new update
                     if let Some(tx) = &self.internal_message_tx {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let snapshot = Arc::new(InternalMessage::Fills { batch });
-                            let _unused = tx.send(snapshot);
-                        });
+                        let enqueued_at_ms = now_ms();
+                        crate::metrics::observe_tob_fill_enqueue_lag(
+                            "main_listener",
+                            Duration::from_millis(enqueued_at_ms.saturating_sub(batch.block_time())),
+                        );
+                        let _unused =
+                            tx.send(Arc::new(InternalMessage::Fills { batch, enqueued_at_ms, path: "main_listener" }));
                     }
                 }
             }
@@ -505,7 +767,7 @@ impl OrderBookListener {
                 if let Some(cache) = &mut self.fetched_snapshot_cache {
                     cache.push_back((order_statuses.clone(), order_diffs.clone()));
                 }
-                if let Some(tx) = &self.internal_message_tx {
+                if let Some(tx) = self.l4_message_tx() {
                     let tx = tx.clone();
                     tokio::spawn(async move {
                         let updates = Arc::new(InternalMessage::L4BookUpdates {
@@ -518,6 +780,487 @@ impl OrderBookListener {
             }
         }
         Ok(())
+    }
+
+    fn receive_stream_batch(&mut self, updates: EventBatch) -> Result<()> {
+        match updates {
+            EventBatch::Fills(batch) => self.publish_fills(batch),
+            EventBatch::Orders(batch) => {
+                self.receive_stream_statuses(batch)?;
+                self.drain_streaming_blocks()
+            }
+            EventBatch::BookDiffs(batch) => {
+                self.receive_stream_diffs(batch)?;
+                self.drain_streaming_blocks()
+            }
+        }
+    }
+
+    fn publish_fills(&mut self, batch: Batch<NodeDataFill>) -> Result<()> {
+        if let Some(tx) = &self.internal_message_tx {
+            let enqueued_at_ms = now_ms();
+            crate::metrics::observe_tob_fill_enqueue_lag(
+                "main_listener",
+                Duration::from_millis(enqueued_at_ms.saturating_sub(batch.block_time())),
+            );
+            let _unused = tx.send(Arc::new(InternalMessage::Fills { batch, enqueued_at_ms, path: "main_listener" }));
+        }
+        Ok(())
+    }
+
+    fn is_meaningful_stream_status(&self, status: &NodeDataOrderStatus) -> bool {
+        if !status.is_opening_status_for_raw_diff() {
+            return false;
+        }
+        !(Coin::new(&status.order.coin).is_spot() && self.ignore_spot)
+    }
+
+    fn stream_batch_has_meaningful_statuses(&self, batch: &Batch<NodeDataOrderStatus>) -> bool {
+        batch.events_ref().iter().any(|status| self.is_meaningful_stream_status(status))
+    }
+
+    fn stream_batch_has_meaningful_diffs(&self, batch: &Batch<NodeDataOrderDiff>) -> bool {
+        batch.events_ref().iter().any(|diff| !(diff.coin().is_spot() && self.ignore_spot))
+    }
+
+    fn current_stream_finalization_mode(&mut self) -> StreamFinalizationMode {
+        if self.streaming_state.grace_fallback_until.is_some_and(|deadline| deadline > Instant::now()) {
+            StreamFinalizationMode::GraceFallback
+        } else {
+            self.streaming_state.grace_fallback_until = None;
+            StreamFinalizationMode::Watermark
+        }
+    }
+
+    fn stream_startup_sync_height(&mut self) -> Option<u64> {
+        if self.streaming_state.startup_sync_height.is_none()
+            && let (Some(diff_watermark), Some(status_watermark)) =
+                (self.streaming_state.diff_watermark, self.streaming_state.status_watermark)
+        {
+            let startup_sync_height = diff_watermark.max(status_watermark);
+            self.streaming_state.startup_sync_height = Some(startup_sync_height);
+            info!(
+                "stream startup sync established: height={startup_sync_height} \
+                 diff_watermark={diff_watermark} status_watermark={status_watermark}"
+            );
+        }
+
+        self.streaming_state.startup_sync_height
+    }
+
+    fn stream_startup_sync_complete(&mut self) -> bool {
+        let Some(startup_sync_height) = self.stream_startup_sync_height() else {
+            return false;
+        };
+        self.streaming_state.finalized_height.is_some_and(|finalized| finalized >= startup_sync_height)
+    }
+
+    fn stream_block_requires_startup_sync(&mut self, height: u64) -> bool {
+        match self.stream_startup_sync_height() {
+            Some(startup_sync_height) => height <= startup_sync_height,
+            None => true,
+        }
+    }
+
+    fn stream_block_finalization_mode(&mut self, height: u64) -> StreamFinalizationMode {
+        if self.stream_block_requires_startup_sync(height) {
+            StreamFinalizationMode::GraceFallback
+        } else {
+            self.current_stream_finalization_mode()
+        }
+    }
+
+    fn effective_stream_finalization_mode(&mut self) -> StreamFinalizationMode {
+        if self.stream_startup_sync_complete() {
+            self.current_stream_finalization_mode()
+        } else {
+            StreamFinalizationMode::GraceFallback
+        }
+    }
+
+    fn report_streaming_health(&mut self) {
+        if self.ingest_mode != IngestMode::Stream {
+            return;
+        }
+        let mode = self.effective_stream_finalization_mode();
+        let startup_sync_height = self.stream_startup_sync_height();
+        let startup_sync_complete = startup_sync_height
+            .is_some_and(|height| self.streaming_state.finalized_height.is_some_and(|finalized| finalized >= height));
+        crate::metrics::set_stream_finalization_mode(mode.label());
+        if self.streaming_state.out_of_order_rows == 0
+            && self.streaming_state.late_finalized_rows == 0
+            && self.streaming_state.grace_fallback_activations == 0
+            && self.streaming_state.finalized_watermark_blocks == 0
+            && self.streaming_state.finalized_grace_blocks == 0
+            && startup_sync_complete
+        {
+            return;
+        }
+        info!(
+            "stream finalization | mode={} diff_watermark={:?} status_watermark={:?} \
+             startup_sync_height={:?} startup_sync_complete={} out_of_order_rows={} \
+             late_finalized_rows={} grace_fallback_activations={} \
+             finalized_watermark_blocks={} finalized_grace_blocks={}",
+            mode.label(),
+            self.streaming_state.diff_watermark,
+            self.streaming_state.status_watermark,
+            startup_sync_height,
+            startup_sync_complete,
+            self.streaming_state.out_of_order_rows,
+            self.streaming_state.late_finalized_rows,
+            self.streaming_state.grace_fallback_activations,
+            self.streaming_state.finalized_watermark_blocks,
+            self.streaming_state.finalized_grace_blocks,
+        );
+    }
+
+    fn activate_stream_grace_fallback(&mut self) {
+        self.streaming_state.grace_fallback_until = Some(Instant::now() + STREAM_REORDER_FALLBACK_WINDOW);
+        self.streaming_state.grace_fallback_activations += 1;
+    }
+
+    fn update_stream_watermark(&mut self, source: EventSource, height: u64, local_time_ms: u64, meaningful: bool) {
+        let source_label = ingest_source_label(source);
+        let (current_watermark, current_watermark_local_time_ms) = match source {
+            EventSource::OrderDiffs => {
+                (self.streaming_state.diff_watermark, self.streaming_state.diff_watermark_local_time_ms)
+            }
+            EventSource::OrderStatuses => {
+                (self.streaming_state.status_watermark, self.streaming_state.status_watermark_local_time_ms)
+            }
+            EventSource::Fills => return,
+        };
+
+        if current_watermark.is_some_and(|current| height < current) {
+            self.streaming_state.out_of_order_rows += 1;
+            crate::metrics::inc_stream_out_of_order_row(source_label);
+            if let Some(latest_local_time_ms) = current_watermark_local_time_ms {
+                crate::metrics::observe_stream_reorder_delay(
+                    source_label,
+                    Duration::from_millis(latest_local_time_ms.saturating_sub(local_time_ms)),
+                );
+            }
+            if meaningful {
+                self.activate_stream_grace_fallback();
+                log::warn!(
+                    "streaming source out of order: source={source} block={height} watermark={:?}; using grace fallback",
+                    current_watermark
+                );
+            } else {
+                debug!(
+                    "ignored out-of-order streaming row: source={source} block={height} watermark={current_watermark:?}"
+                );
+            }
+        }
+
+        if current_watermark.is_none_or(|current| height >= current) {
+            match source {
+                EventSource::OrderDiffs => {
+                    self.streaming_state.diff_watermark = Some(height);
+                    self.streaming_state.diff_watermark_local_time_ms = Some(local_time_ms);
+                }
+                EventSource::OrderStatuses => {
+                    self.streaming_state.status_watermark = Some(height);
+                    self.streaming_state.status_watermark_local_time_ms = Some(local_time_ms);
+                }
+                EventSource::Fills => {}
+            }
+        }
+    }
+
+    fn handle_late_finalized_stream_statuses(&mut self, height: u64, batch: &Batch<NodeDataOrderStatus>) -> Result<()> {
+        let meaningful = self.stream_batch_has_meaningful_statuses(batch);
+        self.streaming_state.late_finalized_rows += 1;
+        crate::metrics::inc_stream_late_finalized_row(ingest_source_label(EventSource::OrderStatuses), "ignored");
+        if meaningful {
+            debug!(
+                "ignoring late finalized streaming opening statuses for block {height}; \
+                 statuses are metadata-only without a pending raw diff"
+            );
+        } else {
+            debug!("ignoring late non-meaningful streaming statuses for finalized block {height}");
+        }
+        Ok(())
+    }
+
+    fn handle_late_finalized_stream_diffs(&mut self, height: u64, batch: &Batch<NodeDataOrderDiff>) -> Result<()> {
+        let meaningful = self.stream_batch_has_meaningful_diffs(batch);
+        let action = if meaningful { "fatal" } else { "ignored" };
+        self.streaming_state.late_finalized_rows += 1;
+        crate::metrics::inc_stream_late_finalized_row(ingest_source_label(EventSource::OrderDiffs), action);
+        if meaningful {
+            Err(format!("late streaming diffs for finalized block {height}").into())
+        } else {
+            debug!("ignoring late non-meaningful streaming diffs for finalized block {height}");
+            Ok(())
+        }
+    }
+
+    fn status_watermark_proves_missing(&self, height: u64) -> bool {
+        self.streaming_state.status_watermark.is_some_and(|watermark| watermark > height)
+    }
+
+    fn stream_block_can_finalize(
+        &mut self,
+        height: u64,
+        block: &StreamingBlock,
+        later_block_seen: bool,
+        mode: StreamFinalizationMode,
+    ) -> bool {
+        crate::metrics::set_stream_finalization_mode(mode.label());
+        match mode {
+            StreamFinalizationMode::Watermark => {
+                self.streaming_state.diff_watermark.is_some_and(|watermark| watermark > height)
+            }
+            StreamFinalizationMode::GraceFallback => {
+                let startup_sync_ready = !self.stream_block_requires_startup_sync(height)
+                    || (self.streaming_state.diff_watermark.is_some_and(|watermark| watermark > height)
+                        && self.streaming_state.status_watermark.is_some_and(|watermark| watermark > height));
+                later_block_seen
+                    && startup_sync_ready
+                    && block
+                        .last_received_at
+                        .is_none_or(|last_received_at| last_received_at.elapsed() >= self.stream_block_finalize_grace())
+            }
+        }
+    }
+
+    fn finalize_stream_block(&mut self, height: u64, block: StreamingBlock, mode: StreamFinalizationMode) {
+        if block.boundary_open
+            && let (Some(state), Some(block_time_ms)) = (self.order_book_state.as_mut(), block.block_time_ms)
+        {
+            state.emit_batch_boundary(1, height, block_time_ms);
+        }
+        if let Some(last_received_at) = block.last_received_at {
+            crate::metrics::observe_stream_finalization_lag(mode.label(), last_received_at.elapsed());
+        }
+        match mode {
+            StreamFinalizationMode::Watermark => self.streaming_state.finalized_watermark_blocks += 1,
+            StreamFinalizationMode::GraceFallback => self.streaming_state.finalized_grace_blocks += 1,
+        }
+        self.streaming_state.finalized_height = Some(height);
+    }
+
+    fn receive_stream_statuses(&mut self, batch: Batch<NodeDataOrderStatus>) -> Result<()> {
+        let height = batch.block_number();
+        if self.streaming_state.finalized_height.is_some_and(|finalized| height <= finalized) {
+            return self.handle_late_finalized_stream_statuses(height, &batch);
+        }
+        self.last_batch_block_time_ms = Some(batch.block_time());
+        self.last_batch_local_time_ms = Some(batch.local_time_ms());
+        self.update_stream_watermark(
+            EventSource::OrderStatuses,
+            height,
+            batch.local_time_ms(),
+            self.stream_batch_has_meaningful_statuses(&batch),
+        );
+
+        let block = self.streaming_state.blocks.entry(height).or_default();
+        block.block_time_ms.get_or_insert(batch.block_time());
+        block.local_time_ms = Some(batch.local_time_ms());
+        block.last_received_at = Some(Instant::now());
+        for status in batch.events() {
+            if status.is_opening_status_for_raw_diff() {
+                block.statuses.insert(Oid::new(status.order.oid), status);
+            }
+        }
+        Ok(())
+    }
+
+    fn receive_stream_diffs(&mut self, batch: Batch<NodeDataOrderDiff>) -> Result<()> {
+        let height = batch.block_number();
+        if self.streaming_state.finalized_height.is_some_and(|finalized| height <= finalized) {
+            return self.handle_late_finalized_stream_diffs(height, &batch);
+        }
+        self.last_batch_block_time_ms = Some(batch.block_time());
+        self.last_batch_local_time_ms = Some(batch.local_time_ms());
+        self.update_stream_watermark(
+            EventSource::OrderDiffs,
+            height,
+            batch.local_time_ms(),
+            self.stream_batch_has_meaningful_diffs(&batch),
+        );
+
+        let block = self.streaming_state.blocks.entry(height).or_default();
+        block.block_time_ms.get_or_insert(batch.block_time());
+        block.local_time_ms = Some(batch.local_time_ms());
+        block.last_received_at = Some(Instant::now());
+        for diff in batch.events_ref() {
+            block.diffs.push_back(batch.with_events(vec![diff.clone()]));
+        }
+        Ok(())
+    }
+
+    fn drain_streaming_blocks(&mut self) -> Result<()> {
+        loop {
+            let Some((&height, _)) = self.streaming_state.blocks.iter().next() else {
+                return Ok(());
+            };
+            let later_block_seen = self.streaming_state.blocks.range((height + 1)..).next().is_some();
+            let mut block = self.streaming_state.blocks.remove(&height).expect("block key exists");
+            if !self.is_ready() {
+                self.streaming_state.blocks.insert(height, block);
+                return Ok(());
+            }
+            let mut blocked_on_missing_status = false;
+
+            while let Some(diff_batch) = block.diffs.front() {
+                let diff = diff_batch.events_ref().first().expect("stream diff batch has one event");
+                let needs_status =
+                    matches!(diff.raw_book_diff, OrderDiff::New { .. }) && !(diff.coin().is_spot() && self.ignore_spot);
+                let status = if needs_status {
+                    let oid = diff.oid();
+                    match block.statuses.remove(&oid) {
+                        Some(status) => {
+                            if self
+                                .last_unresolved_stream_new
+                                .as_ref()
+                                .is_some_and(|prev| prev.height == height && prev.oid == oid)
+                            {
+                                self.last_unresolved_stream_new = None;
+                            }
+                            Some(status)
+                        }
+                        None => {
+                            let now = Instant::now();
+                            let buffered_blocks = self.streaming_state.blocks.len() + 1;
+                            let highest_buffered_height =
+                                self.streaming_state.blocks.keys().next_back().copied().unwrap_or(height).max(height);
+                            let (first_seen_at, should_log) = match self.last_unresolved_stream_new.as_ref() {
+                                Some(prev) if prev.height == height && prev.oid == oid => (
+                                    prev.first_seen_at,
+                                    (later_block_seen && !prev.last_later_block_seen)
+                                        || now.duration_since(prev.last_logged_at) >= Duration::from_secs(5)
+                                        || buffered_blocks >= prev.max_buffered_blocks_logged.saturating_add(100),
+                                ),
+                                _ => (now, true),
+                            };
+                            let waited = now.duration_since(first_seen_at);
+
+                            if self.status_watermark_proves_missing(height) {
+                                log::warn!(
+                                    "streaming drain skipping New diff without matching opening status after status watermark: \
+                                     height={height} oid={oid:?} coin={:?} status_watermark={:?} \
+                                     pending_diffs={} available_statuses={} buffered_blocks={buffered_blocks} \
+                                     highest_buffered_height={highest_buffered_height}",
+                                    diff.coin(),
+                                    self.streaming_state.status_watermark,
+                                    block.diffs.len(),
+                                    block.statuses.len(),
+                                );
+                                if self
+                                    .last_unresolved_stream_new
+                                    .as_ref()
+                                    .is_some_and(|prev| prev.height == height && prev.oid == oid)
+                                {
+                                    self.last_unresolved_stream_new = None;
+                                }
+                                None
+                            } else if self.stream_block_finalization_mode(height)
+                                == StreamFinalizationMode::GraceFallback
+                                && later_block_seen
+                                && waited >= UNRESOLVED_STREAM_NEW_SKIP_AFTER
+                            {
+                                log::warn!(
+                                    "streaming drain skipping New diff without matching opening status after timeout: \
+                                     height={height} oid={oid:?} coin={:?} waited_ms={} \
+                                     pending_diffs={} available_statuses={} buffered_blocks={buffered_blocks} \
+                                     highest_buffered_height={highest_buffered_height}",
+                                    diff.coin(),
+                                    waited.as_millis(),
+                                    block.diffs.len(),
+                                    block.statuses.len(),
+                                );
+                                if self
+                                    .last_unresolved_stream_new
+                                    .as_ref()
+                                    .is_some_and(|prev| prev.height == height && prev.oid == oid)
+                                {
+                                    self.last_unresolved_stream_new = None;
+                                }
+                                None
+                            } else {
+                                if should_log {
+                                    let state_height = self.order_book_state.as_ref().map(OrderBookState::height);
+                                    let waited_ms = waited.as_millis();
+                                    log::debug!(
+                                        "streaming drain blocked waiting for New status: height={height} oid={oid:?} coin={:?} \
+                                     waited_ms={waited_ms} \
+                                     pending_diffs={} available_statuses={} later_block_seen={} state_height={state_height:?} \
+                                     finalized_height={:?} buffered_blocks={buffered_blocks} highest_buffered_height={highest_buffered_height}",
+                                        diff.coin(),
+                                        block.diffs.len(),
+                                        block.statuses.len(),
+                                        later_block_seen,
+                                        self.streaming_state.finalized_height,
+                                    );
+                                    self.last_unresolved_stream_new = Some(UnresolvedStreamNewDebug {
+                                        height,
+                                        oid,
+                                        first_seen_at,
+                                        last_logged_at: now,
+                                        last_later_block_seen: later_block_seen,
+                                        max_buffered_blocks_logged: buffered_blocks,
+                                    });
+                                }
+                                blocked_on_missing_status = true;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let diff_batch = block.diffs.pop_front().expect("front diff exists");
+                let diff = diff_batch.events_ref().first().expect("stream diff batch has one event").clone();
+                let block_time_ms = diff_batch.block_time();
+
+                if self.is_ready() {
+                    if !block.boundary_open && !(diff.coin().is_spot() && self.ignore_spot) {
+                        if let Some(state) = self.order_book_state.as_mut() {
+                            state.emit_batch_boundary(0, height, block_time_ms);
+                        }
+                        block.boundary_open = true;
+                    }
+
+                    let status_batch = diff_batch.with_events(status.iter().cloned().collect());
+                    self.order_book_state.as_mut().ok_or("streaming order book state not ready")?.apply_stream_diff(
+                        height,
+                        block_time_ms,
+                        diff,
+                        status,
+                    )?;
+                    self.publish_l4_update(diff_batch, status_batch);
+                    // L2 snapshot publishing is intentionally NOT done per-diff: it
+                    // recomputes top-of-book for every instrument and was the dominant
+                    // cost in stream mode (per-block compute scaled with diffs/block).
+                    // process_data calls l2_snapshots(true) once at the end of every
+                    // file-read chunk, which is the same cadence block-mode uses.
+                }
+            }
+
+            let mode = self.stream_block_finalization_mode(height);
+            if block.diffs.is_empty()
+                && !blocked_on_missing_status
+                && self.stream_block_can_finalize(height, &block, later_block_seen, mode)
+            {
+                self.finalize_stream_block(height, block, mode);
+            } else {
+                self.streaming_state.blocks.insert(height, block);
+                return Ok(());
+            }
+        }
+    }
+
+    fn publish_l4_update(&self, diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus>) {
+        if let Some(tx) = self.l4_message_tx() {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let updates = Arc::new(InternalMessage::L4BookUpdates { diff_batch, status_batch });
+                let _unused = tx.send(updates);
+            });
+        }
     }
 
     /// Applies surgical per-coin recovery based on a `ValidationReport`.
@@ -578,6 +1321,20 @@ impl OrderBookListener {
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
         info!("No existing snapshot");
         let mut new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
+        // In stream mode, drop any buffered stream events at heights <= snapshot
+        // height — those are already reflected in the snapshot. Replaying them
+        // would either dup orders (New) or get rejected by apply_stream_diff's
+        // `block_number < self.height` check (Update/Remove). The streaming file
+        // watcher races ahead of the snapshot fetch, so this queue is non-empty
+        // on every cold start.
+        if self.ingest_mode == IngestMode::Stream {
+            let before = self.streaming_state.blocks.len();
+            self.streaming_state.blocks.retain(|&h, _| h > height);
+            let dropped = before - self.streaming_state.blocks.len();
+            if dropped > 0 {
+                info!("init_from_snapshot: dropped {dropped} stale streaming block(s) at height <= {height}");
+            }
+        }
         let mut retry = false;
         while let Some((order_statuses, order_diffs)) = self.pop_cache() {
             if new_order_book.apply_updates(order_statuses, order_diffs).is_err() {
@@ -593,6 +1350,13 @@ impl OrderBookListener {
                 new_order_book.attach_dob_tap(tap);
             }
             self.order_book_state = Some(new_order_book);
+            if self.ingest_mode == IngestMode::Stream
+                && let Err(err) = self.drain_streaming_blocks()
+            {
+                error!("Failed to apply cached streaming updates after snapshot: {err}");
+                self.order_book_state = None;
+                return;
+            }
             info!("Order book ready");
         }
     }
@@ -602,7 +1366,7 @@ impl OrderBookListener {
     /// `init_from_snapshot` makes during normal startup.
     #[cfg(test)]
     pub(crate) fn for_test_with_snapshot(snapshot: Snapshots<InnerL4Order>, height: u64) -> Self {
-        let mut listener = Self::new(None, false);
+        let mut listener = Self::new_with_ingest_mode(None, false, IngestMode::Block);
         listener.init_from_snapshot(snapshot, height);
         listener
     }
@@ -629,8 +1393,26 @@ impl OrderBookListener {
     /// can derive what the TOB publisher would emit without spinning up the
     /// full publisher loop.
     #[cfg(test)]
-    pub(crate) fn l2_snapshots_for_test(&mut self) -> Option<(u64, L2Snapshots)> {
-        self.l2_snapshots(false)
+    pub(crate) fn l2_snapshots_for_test(&self) -> Option<(u64, L2Snapshots)> {
+        self.order_book_state.as_ref().map(|o| o.compute_l2_snapshots_for_test())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finalize_streaming_for_test(&mut self) -> Result<()> {
+        self.drain_streaming_blocks()?;
+        while let Some((&height, _)) = self.streaming_state.blocks.iter().next() {
+            let block = self.streaming_state.blocks.remove(&height).expect("block key exists");
+            if !block.diffs.is_empty() {
+                return Err(format!("streaming block {height} still has unresolved diffs").into());
+            }
+            if block.boundary_open
+                && let (Some(state), Some(block_time_ms)) = (self.order_book_state.as_mut(), block.block_time_ms)
+            {
+                state.emit_batch_boundary(1, height, block_time_ms);
+            }
+            self.streaming_state.finalized_height = Some(height);
+        }
+        Ok(())
     }
 
     // forcibly grab current snapshot
@@ -642,10 +1424,73 @@ impl OrderBookListener {
     fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
         self.order_book_state.as_mut().and_then(|o| o.l2_snapshots(prevent_future_snaps))
     }
+
+    const fn ingest_heights(&self) -> IngestHeights {
+        IngestHeights { statuses: self.last_status_height, diffs: self.last_diff_height, fills: self.last_fill_height }
+    }
 }
 
 impl OrderBookListener {
+    fn record_file_mtime_lag(path: &Path, source: EventSource) -> Option<u64> {
+        let Ok(metadata) = path.metadata() else { return None };
+        let Ok(modified) = metadata.modified() else { return None };
+        let lag = SystemTime::now().duration_since(modified).unwrap_or_default();
+        crate::metrics::observe_ingest_file_mtime_lag(ingest_source_label(source), lag);
+        system_time_ms(modified)
+    }
+
+    fn file_mtime_mut(&mut self, source: EventSource) -> &mut Option<u64> {
+        match source {
+            EventSource::Fills => &mut self.last_fill_file_mtime_ms,
+            EventSource::OrderStatuses => &mut self.last_status_file_mtime_ms,
+            EventSource::OrderDiffs => &mut self.last_diff_file_mtime_ms,
+        }
+    }
+
+    const fn file_mtime(&self, source: EventSource) -> Option<u64> {
+        match source {
+            EventSource::Fills => self.last_fill_file_mtime_ms,
+            EventSource::OrderStatuses => self.last_status_file_mtime_ms,
+            EventSource::OrderDiffs => self.last_diff_file_mtime_ms,
+        }
+    }
+
+    fn record_backlog_bytes(&mut self, source: EventSource) -> Result<()> {
+        let Some(file) = self.file_mut(source).as_mut() else {
+            crate::metrics::set_ingest_backlog_bytes(ingest_source_label(source), 0);
+            return Ok(());
+        };
+        let offset = file.stream_position()?;
+        let len = file.metadata()?.len();
+        crate::metrics::set_ingest_backlog_bytes(ingest_source_label(source), len.saturating_sub(offset));
+        Ok(())
+    }
+
+    const fn discard_fragment_mut(&mut self, source: EventSource) -> &mut bool {
+        match source {
+            EventSource::Fills => &mut self.discard_fill_fragment,
+            EventSource::OrderStatuses => &mut self.discard_status_fragment,
+            EventSource::OrderDiffs => &mut self.discard_diff_fragment,
+        }
+    }
+
+    fn discard_initial_fragment_if_needed(&mut self, data: &mut String, source: EventSource) -> bool {
+        if !*self.discard_fragment_mut(source) {
+            return true;
+        }
+
+        let Some(newline) = data.find('\n') else {
+            self.progress.record_jsonl_deferral(source);
+            return false;
+        };
+
+        data.drain(..=newline);
+        *self.discard_fragment_mut(source) = false;
+        true
+    }
+
     fn process_update(&mut self, event: &Event, new_path: &PathBuf, event_source: EventSource) -> Result<()> {
+        *self.file_mtime_mut(event_source) = Self::record_file_mtime_lag(new_path, event_source);
         if event.kind.is_create() {
             info!("-- Event: {} created --", new_path.display());
             self.on_file_creation(new_path.clone(), event_source)?;
@@ -659,28 +1504,221 @@ impl OrderBookListener {
                 self.on_file_modification(event_source)?;
             } else {
                 info!("-- Event: {} modified, tracking it now --", new_path.display());
-                let file = self.file_mut(event_source);
                 let mut new_file = File::open(new_path)?;
-                // Seek to end, then back up to the last newline so we start
-                // on a clean line boundary.  Without this, we can land mid-JSON
-                // if hl-node is mid-write, producing a permanent deser error.
-                let end = new_file.seek(SeekFrom::End(0))?;
-                let backtrack = end.min(8192);
-                if backtrack > 0 {
-                    new_file.seek(SeekFrom::End(-(backtrack as i64)))?;
-                    let mut buf = vec![0u8; backtrack as usize];
-                    new_file.read_exact(&mut buf)?;
-                    if let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') {
-                        // Position right after the last newline
-                        let rewind = backtrack - (last_nl as u64) - 1;
-                        new_file.seek(SeekFrom::End(-(rewind as i64)))?;
-                    }
-                    // else: no newline in last 8KB, stay at end
-                }
-                *file = Some(new_file);
+                // Start on a clean JSONL boundary even when hl-node is in the
+                // middle of writing a very long streaming row.
+                *self.discard_fragment_mut(event_source) = seek_to_recent_jsonl_boundary(&mut new_file)?;
+                *self.file_mut(event_source) = Some(new_file);
+                self.record_backlog_bytes(event_source)?;
             }
         }
         Ok(())
+    }
+}
+
+struct FillOnlyListener {
+    file: Option<File>,
+    discard_fragment: bool,
+    last_file_mtime_ms: Option<u64>,
+    market_message_tx: Sender<Arc<InternalMessage>>,
+    progress: IngestProgress,
+}
+
+impl FillOnlyListener {
+    fn new(market_message_tx: Sender<Arc<InternalMessage>>) -> Self {
+        Self {
+            file: None,
+            discard_fragment: false,
+            last_file_mtime_ms: None,
+            market_message_tx,
+            progress: IngestProgress::new(),
+        }
+    }
+
+    fn process_update(&mut self, event: &Event, new_path: &Path) -> Result<()> {
+        self.last_file_mtime_ms = OrderBookListener::record_file_mtime_lag(new_path, EventSource::Fills);
+        if event.kind.is_create() {
+            info!("-- Fill event: {} created --", new_path.display());
+            if let Some(file) = self.file.as_mut() {
+                let mut buf = String::new();
+                file.read_to_string(&mut buf)?;
+                if !buf.is_empty() {
+                    self.process_data(buf)?;
+                    self.record_backlog_bytes()?;
+                }
+            }
+            self.file = Some(File::open(new_path)?);
+            self.record_backlog_bytes()?;
+            return Ok(());
+        }
+
+        if let Some(file) = self.file.as_mut() {
+            let mut buf = String::new();
+            file.read_to_string(&mut buf)?;
+            self.process_data(buf)?;
+            self.record_backlog_bytes()?;
+        } else {
+            info!("-- Fill event: {} modified, tracking it now --", new_path.display());
+            let mut new_file = File::open(new_path)?;
+            self.discard_fragment = seek_to_recent_jsonl_boundary(&mut new_file)?;
+            self.file = Some(new_file);
+            self.record_backlog_bytes()?;
+        }
+        Ok(())
+    }
+
+    fn record_backlog_bytes(&mut self) -> Result<()> {
+        let Some(file) = self.file.as_mut() else {
+            crate::metrics::set_ingest_backlog_bytes(ingest_source_label(EventSource::Fills), 0);
+            return Ok(());
+        };
+        let offset = file.stream_position()?;
+        let len = file.metadata()?.len();
+        crate::metrics::set_ingest_backlog_bytes(ingest_source_label(EventSource::Fills), len.saturating_sub(offset));
+        Ok(())
+    }
+
+    fn discard_initial_fragment_if_needed(&mut self, data: &mut String) -> bool {
+        if !self.discard_fragment {
+            return true;
+        }
+
+        let Some(newline) = data.find('\n') else {
+            self.progress.record_jsonl_deferral(EventSource::Fills);
+            return false;
+        };
+
+        data.drain(..=newline);
+        self.discard_fragment = false;
+        true
+    }
+
+    fn process_data(&mut self, mut data: String) -> Result<()> {
+        let total_len = data.len();
+        self.progress.record_read(EventSource::Fills, total_len);
+        if !self.discard_initial_fragment_if_needed(&mut data) {
+            return Ok(());
+        }
+
+        let mut consumed_bytes = 0usize;
+        for raw_line in data.split_inclusive('\n') {
+            let line_len = raw_line.len();
+            let line = raw_line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                consumed_bytes += line_len;
+                continue;
+            }
+
+            let batch = match serde_json::from_str::<Batch<NodeDataFill>>(line) {
+                Ok(batch) => batch,
+                Err(err) => {
+                    let preview: String = line.chars().take(100).collect();
+                    self.progress.record_jsonl_deferral(EventSource::Fills);
+                    debug!("fills-only JSONL deferral after serialization error {err}, line: {preview:?}");
+                    #[allow(clippy::unwrap_used)]
+                    let unread_len: i64 = (total_len - consumed_bytes).try_into().unwrap();
+                    if let Some(file) = self.file.as_mut() {
+                        file.seek_relative(-unread_len)?;
+                    }
+                    break;
+                }
+            };
+            consumed_bytes += line_len;
+
+            let block_time_ms = batch.block_time();
+            let local_time_ms = batch.local_time_ms();
+            let source_label = ingest_source_label(EventSource::Fills);
+            crate::metrics::observe_ingest_source_gossip(
+                source_label,
+                Duration::from_millis(local_time_ms.saturating_sub(block_time_ms)),
+            );
+            crate::metrics::set_ingest_file_tail_lag(
+                source_label,
+                Duration::from_millis(now_ms().saturating_sub(local_time_ms)),
+            );
+            if let Some(file_mtime_ms) = self.last_file_mtime_ms {
+                crate::metrics::observe_ingest_row_file_visibility_lag(
+                    source_label,
+                    Duration::from_millis(file_mtime_ms.saturating_sub(local_time_ms)),
+                );
+            }
+            self.progress.record_row(EventSource::Fills, batch.block_number());
+            let enqueued_at_ms = now_ms();
+            crate::metrics::observe_tob_fill_enqueue_lag(
+                "separate_listener",
+                Duration::from_millis(enqueued_at_ms.saturating_sub(block_time_ms)),
+            );
+            let _unused = self.market_message_tx.send(Arc::new(InternalMessage::Fills {
+                batch,
+                enqueued_at_ms,
+                path: "separate_listener",
+            }));
+            let _reported = self.progress.report_if_due();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fill_only_listener_tests {
+    use super::*;
+    use std::io::Write;
+    use tokio::sync::broadcast;
+
+    fn fill_line(height: u64) -> String {
+        format!(
+            r#"{{"local_time":"2026-05-13T13:48:42.414415479","block_time":"2026-05-13T13:48:01.093894836","block_number":{height},"events":[["0x162cc7c861ebd0c06b3d72319201150482518185",{{"coin":"BTC","px":"100.0","sz":"0.01","side":"A","time":1778680081093,"startPosition":"0.0","dir":"Sell","closedPnl":"0.0","hash":"0x256ba7fde56c0b7026e5043b4eba02020f1400e3806f2a42c9345350a46fe55a","oid":424080859718,"crossed":true,"fee":"0.01","tid":693955059568827,"feeToken":"USDC","liquidation":null}}]]}}"#
+        )
+    }
+
+    #[test]
+    fn fill_only_listener_sends_one_fill_message_per_complete_row() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut listener = FillOnlyListener::new(tx);
+
+        listener.process_data(format!("{}\n", fill_line(10))).unwrap();
+
+        let msg = rx.try_recv().expect("fill message");
+        let InternalMessage::Fills { batch, path, .. } = msg.as_ref() else {
+            panic!("expected fills message");
+        };
+        assert_eq!(batch.block_number(), 10);
+        assert_eq!(*path, "separate_listener");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn fill_only_listener_defers_partial_trailing_lines() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut listener = FillOnlyListener::new(tx);
+        let line = fill_line(11);
+        let split_at = line.len() - 12;
+        let path = std::env::temp_dir().join(format!("fill-only-partial-{}-{}.jsonl", std::process::id(), now_ns()));
+
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(line[..split_at].as_bytes()).unwrap();
+        }
+        let mut file = File::open(&path).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        listener.file = Some(file);
+
+        listener.process_data(line[..split_at].to_owned()).unwrap();
+        assert!(rx.try_recv().is_err());
+
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(format!("{}\n", &line[split_at..]).as_bytes()).unwrap();
+        }
+        let mut buf = String::new();
+        listener.file.as_mut().unwrap().read_to_string(&mut buf).unwrap();
+        listener.process_data(buf).unwrap();
+        let msg = rx.try_recv().expect("fill message after completing row");
+        let InternalMessage::Fills { batch, .. } = msg.as_ref() else {
+            panic!("expected fills message");
+        };
+        assert_eq!(batch.block_number(), 11);
+        drop(fs::remove_file(path));
     }
 }
 
@@ -707,17 +1745,36 @@ impl DirectoryListener for OrderBookListener {
             file.read_to_string(&mut buf)?;
             if !buf.is_empty() {
                 self.process_data(buf, event_source)?;
+                self.record_backlog_bytes(event_source)?;
             }
         }
         *self.file_mut(event_source) = Some(File::open(new_file)?);
+        self.record_backlog_bytes(event_source)?;
         Ok(())
     }
 
-    fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()> {
+    fn on_file_modification(&mut self, event_source: EventSource) -> Result<()> {
+        let mut buf = String::new();
+        let file = self.file_mut(event_source).as_mut().ok_or("No file being tracked")?;
+        file.read_to_string(&mut buf)?;
+        self.process_data(buf, event_source)?;
+        self.record_backlog_bytes(event_source)?;
+        Ok(())
+    }
+
+    fn process_data(&mut self, mut data: String, event_source: EventSource) -> Result<()> {
         let total_len = data.len();
-        let lines = data.lines();
-        for line in lines {
+        self.progress.record_read(event_source, total_len);
+        if !self.discard_initial_fragment_if_needed(&mut data, event_source) {
+            return Ok(());
+        }
+        let mut last_source_times: Option<(u64, u64)> = None;
+        let mut consumed_bytes = 0usize;
+        for raw_line in data.split_inclusive('\n') {
+            let line_len = raw_line.len();
+            let line = raw_line.trim_end_matches(['\r', '\n']);
             if line.is_empty() {
+                consumed_bytes += line_len;
                 continue;
             }
             let res = match event_source {
@@ -743,37 +1800,91 @@ impl DirectoryListener for OrderBookListener {
             let (height, block_time_ms, local_time_ms, event_batch) = match res {
                 Ok(data) => data,
                 Err(err) => {
-                    // if we run into a serialization error (hitting EOF), just return to last line.
+                    // If we run into a serialization error from a partial trailing JSONL row,
+                    // rewind only the unread suffix. Previously this rewound the full read
+                    // buffer, replaying already-applied complete rows on the next append.
                     let preview: String = line.chars().take(100).collect();
-                    error!(
-                        "{event_source} serialization error {err}, height: {:?}, line: {:?}",
+                    self.progress.record_jsonl_deferral(event_source);
+                    debug!(
+                        "{event_source} JSONL deferral after serialization error {err}, height: {:?}, line: {:?}",
                         self.order_book_state.as_ref().map(OrderBookState::height),
                         preview,
                     );
                     #[allow(clippy::unwrap_used)]
-                    let total_len: i64 = total_len.try_into().unwrap();
-                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-total_len));
+                    let unread_len: i64 = (total_len - consumed_bytes).try_into().unwrap();
+                    if let Some(file) = self.file_mut(event_source).as_mut() {
+                        file.seek_relative(-unread_len)?;
+                    }
                     break;
                 }
             };
+            consumed_bytes += line_len;
+            let source_label = ingest_source_label(event_source);
+            crate::metrics::observe_ingest_source_gossip(
+                source_label,
+                Duration::from_millis(local_time_ms.saturating_sub(block_time_ms)),
+            );
+            crate::metrics::set_ingest_file_tail_lag(
+                source_label,
+                Duration::from_millis(now_ms().saturating_sub(local_time_ms)),
+            );
+            if let Some(file_mtime_ms) = self.file_mtime(event_source) {
+                crate::metrics::observe_ingest_row_file_visibility_lag(
+                    source_label,
+                    Duration::from_millis(file_mtime_ms.saturating_sub(local_time_ms)),
+                );
+            }
             self.last_batch_block_time_ms = Some(block_time_ms);
             self.last_batch_local_time_ms = Some(local_time_ms);
-            if height % 100 == 0 {
-                info!("{event_source} block: {height}");
+            last_source_times = Some((block_time_ms, local_time_ms));
+            match event_source {
+                EventSource::Fills => self.last_fill_height = Some(height),
+                EventSource::OrderStatuses => self.last_status_height = Some(height),
+                EventSource::OrderDiffs => self.last_diff_height = Some(height),
             }
+            self.progress.record_row(event_source, height);
             if let Err(err) = self.receive_batch(event_batch) {
                 self.order_book_state = None;
                 return Err(err);
             }
+            let _reported = self.progress.report_if_due();
         }
+        if self.ingest_mode == IngestMode::Stream && event_source == EventSource::Fills {
+            return Ok(());
+        }
+        let snapshot_source = ingest_source_label(event_source);
+        let snapshot_start = Instant::now();
         let snapshot = self.l2_snapshots(true);
+        crate::metrics::observe_tob_snapshot_compute(snapshot_source, snapshot_start.elapsed());
         if let Some(snapshot) = snapshot {
+            let snapshot_height = self.order_book_state.as_ref().map(OrderBookState::height).unwrap_or(0);
+            let latest_heights = self.ingest_heights();
+            let (source_block_time_ms, source_local_time_ms) = last_source_times.unwrap_or((snapshot.0, snapshot.0));
+            crate::metrics::observe_tob_snapshot_enqueue_lag(
+                snapshot_source,
+                Duration::from_millis(now_ms().saturating_sub(snapshot.0)),
+            );
+            crate::metrics::observe_tob_snapshot_source_block_lag(
+                snapshot_source,
+                Duration::from_millis(source_block_time_ms.saturating_sub(snapshot.0)),
+            );
+            crate::metrics::observe_tob_snapshot_validator_write_lag(
+                snapshot_source,
+                Duration::from_millis(source_local_time_ms.saturating_sub(source_block_time_ms)),
+            );
             if let Some(tx) = &self.internal_message_tx {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
-                    let _unused = tx.send(snapshot);
+                let enqueued_at_ms = now_ms();
+                let snapshot = Arc::new(InternalMessage::Snapshot {
+                    l2_snapshots: snapshot.1,
+                    time: snapshot.0,
+                    height: snapshot_height,
+                    source: snapshot_source,
+                    source_block_time_ms,
+                    source_local_time_ms,
+                    latest_heights,
+                    enqueued_at_ms,
                 });
+                let _unused = tx.send(snapshot);
             }
         }
         Ok(())
@@ -794,14 +1905,37 @@ pub(crate) struct TimedSnapshots {
     pub(crate) snapshot: Snapshots<InnerL4Order>,
 }
 
-// Messages sent from node data listener to websocket dispatch to support streaming
-pub(crate) enum InternalMessage {
-    Snapshot { l2_snapshots: L2Snapshots, time: u64 },
-    Fills { batch: Batch<NodeDataFill> },
-    L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct IngestHeights {
+    pub(crate) statuses: Option<u64>,
+    pub(crate) diffs: Option<u64>,
+    pub(crate) fills: Option<u64>,
 }
 
-#[derive(Eq, PartialEq, Hash)]
+// Messages sent from node data listener to websocket dispatch to support streaming
+pub(crate) enum InternalMessage {
+    Snapshot {
+        l2_snapshots: L2Snapshots,
+        time: u64,
+        height: u64,
+        source: &'static str,
+        source_block_time_ms: u64,
+        source_local_time_ms: u64,
+        latest_heights: IngestHeights,
+        enqueued_at_ms: u64,
+    },
+    Fills {
+        batch: Batch<NodeDataFill>,
+        enqueued_at_ms: u64,
+        path: &'static str,
+    },
+    L4BookUpdates {
+        diff_batch: Batch<NodeDataOrderDiff>,
+        status_batch: Batch<NodeDataOrderStatus>,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq, Hash)]
 pub(crate) struct L2SnapshotParams {
     n_sig_figs: Option<u32>,
     mantissa: Option<u64>,
@@ -826,24 +1960,28 @@ mod instrument_reset_recovery_tests {
     //! This test wires the real recovery path (no mocks beyond the UDP
     //! collectors and a synchronous instrument resolver) and asserts all
     //! three observable contract clauses on the wire / shared counter.
+    use std::{
+        net::{Ipv4Addr, SocketAddrV4},
+        sync::{Mutex as StdMutex, atomic::AtomicU64},
+        time::Duration,
+    };
+
+    use tokio::{net::UdpSocket, time::Instant};
+
     use super::*;
-    use crate::listeners::order_book::dob_tap::SharedSeqCounter;
-    use crate::multicast::dob::{
-        DobMktdataConfig, DobSnapshotConfig, DobSnapshotEmitter, DobEmitter, channel,
-        run_dob_emitter, run_dob_snapshot_task, snapshot_request_channel,
+    use crate::{
+        listeners::order_book::dob_tap::SharedSeqCounter,
+        multicast::dob::{
+            DobEmitter, DobMktdataConfig, DobSnapshotConfig, DobSnapshotEmitter, channel, run_dob_emitter,
+            run_dob_snapshot_task, snapshot_request_channel,
+        },
+        order_book::{Coin, PerInstrumentSeqCounter},
+        protocol::dob::constants::{
+            DEFAULT_MTU, FRAME_HEADER_SIZE, INSTRUMENT_RESET_SIZE, MSG_TYPE_HEARTBEAT, MSG_TYPE_INSTRUMENT_RESET,
+            MSG_TYPE_SNAPSHOT_BEGIN, RESET_REASON_PUBLISHER_INCONSISTENCY, SNAPSHOT_BEGIN_SIZE,
+        },
+        test_fixtures::{build_one_coin_snapshot, build_registry_with_one_instrument},
     };
-    use crate::order_book::{Coin, PerInstrumentSeqCounter};
-    use crate::protocol::dob::constants::{
-        DEFAULT_MTU, FRAME_HEADER_SIZE, INSTRUMENT_RESET_SIZE, MSG_TYPE_HEARTBEAT,
-        MSG_TYPE_INSTRUMENT_RESET, MSG_TYPE_SNAPSHOT_BEGIN, RESET_REASON_PUBLISHER_INCONSISTENCY,
-        SNAPSHOT_BEGIN_SIZE,
-    };
-    use crate::test_fixtures::{build_one_coin_snapshot, build_registry_with_one_instrument};
-    use std::net::{Ipv4Addr, SocketAddrV4};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex as StdMutex;
-    use std::time::Duration;
-    use tokio::net::UdpSocket;
 
     async fn bind_collector() -> (UdpSocket, SocketAddrV4) {
         let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -865,22 +2003,16 @@ mod instrument_reset_recovery_tests {
         skip_types: &[u8],
         timeout: Duration,
     ) -> Vec<u8> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         let mut buf = [0u8; 2048];
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            assert!(
-                !remaining.is_zero(),
-                "timed out waiting for msg_type 0x{target_type:02X}",
-            );
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for msg_type 0x{target_type:02X}",);
             let (n, _) = tokio::time::timeout(remaining, sock.recv_from(&mut buf))
                 .await
                 .expect("recv timed out")
                 .expect("recv error");
-            assert!(
-                n >= FRAME_HEADER_SIZE + 1,
-                "frame too short to contain a message type byte",
-            );
+            assert!(n > FRAME_HEADER_SIZE, "frame too short to contain a message type byte",);
             assert_eq!(&buf[0..2], &[0x44, 0x44], "DoB magic on wire");
             let msg_type = buf[FRAME_HEADER_SIZE];
             if msg_type == target_type {
@@ -896,8 +2028,7 @@ mod instrument_reset_recovery_tests {
     }
 
     #[tokio::test]
-    async fn instrument_reset_emits_on_mktdata_then_priority_snapshot_then_resumes_with_continuing_seq()
-    {
+    async fn instrument_reset_emits_on_mktdata_then_priority_snapshot_then_resumes_with_continuing_seq() {
         // 1. Two collector sockets standing in for the mktdata and snapshot
         //    multicast subscribers.
         let (mktdata_collector, mktdata_addr) = bind_collector().await;
@@ -926,7 +2057,7 @@ mod instrument_reset_recovery_tests {
         let coin = Coin::new(coin_str);
         let initial = build_one_coin_snapshot(coin_str, 3, /* oid_offset = */ 0);
         let listener = OrderBookListener::for_test_with_snapshot(initial, /* height = */ 1);
-        let listener = Arc::new(tokio::sync::Mutex::new(listener));
+        let listener = Arc::new(Mutex::new(listener));
 
         // 4. Mktdata pipeline: bounded mpsc -> run_dob_emitter -> mktdata UDP
         //    socket. The emitter shares the same SharedMktdataSeq atomic as
@@ -989,9 +2120,7 @@ mod instrument_reset_recovery_tests {
                 mktdata_tx: mkt_tx.clone(),
                 snapshot_request_tx: snap_tx.clone(),
                 mktdata_seq: mktdata_seq.clone(),
-                instrument_id_for: Box::new(|c: &Coin| {
-                    if c.value() == "BTC" { Some(0) } else { None }
-                }),
+                instrument_id_for: Box::new(|c: &Coin| if c.value() == "BTC" { Some(0) } else { None }),
             });
 
             let mut report = utils::ValidationReport::default();
@@ -1029,23 +2158,12 @@ mod instrument_reset_recovery_tests {
         let reason = body[8];
         let new_anchor_seq = u64::from_le_bytes(body[12..20].try_into().unwrap());
         assert_eq!(instrument_id, 0, "instrument_id from coin resolver");
-        assert_eq!(
-            reason, RESET_REASON_PUBLISHER_INCONSISTENCY,
-            "reason byte must be 1 (publisher-inconsistency)",
-        );
-        assert_eq!(
-            new_anchor_seq, 101,
-            "new_anchor_seq must be the pre-mismatch mktdata_seq + 1 (100 + 1)",
-        );
+        assert_eq!(reason, RESET_REASON_PUBLISHER_INCONSISTENCY, "reason byte must be 1 (publisher-inconsistency)",);
+        assert_eq!(new_anchor_seq, 101, "new_anchor_seq must be the pre-mismatch mktdata_seq + 1 (100 + 1)",);
 
         // 8. Snapshot port: expect a SnapshotBegin with anchor_seq == 101.
-        let frame = recv_first_with_msg_type(
-            &snapshot_collector,
-            MSG_TYPE_SNAPSHOT_BEGIN,
-            &[],
-            Duration::from_secs(2),
-        )
-        .await;
+        let frame =
+            recv_first_with_msg_type(&snapshot_collector, MSG_TYPE_SNAPSHOT_BEGIN, &[], Duration::from_secs(2)).await;
         assert!(
             frame.len() >= FRAME_HEADER_SIZE + SNAPSHOT_BEGIN_SIZE,
             "snapshot frame too short for SnapshotBegin (got {} bytes)",
@@ -1055,23 +2173,41 @@ mod instrument_reset_recovery_tests {
         let snap_instrument_id = u32::from_le_bytes(body[4..8].try_into().unwrap());
         let snap_anchor_seq = u64::from_le_bytes(body[8..16].try_into().unwrap());
         assert_eq!(snap_instrument_id, 0, "SnapshotBegin instrument_id");
-        assert_eq!(
-            snap_anchor_seq, 101,
-            "SnapshotBegin anchor_seq must match the InstrumentReset new_anchor_seq",
-        );
+        assert_eq!(snap_anchor_seq, 101, "SnapshotBegin anchor_seq must match the InstrumentReset new_anchor_seq",);
 
         // 9. Wire-spec invariant: per-instrument seq is NOT reset on
         //    InstrumentReset. The next delta must carry seq = 6 (not 1).
         let next = seq_counter.lock().unwrap().next(0);
-        assert_eq!(
-            next, 6,
-            "post-recovery per-instrument seq must continue from pre-mismatch baseline (5 + 1)",
-        );
+        assert_eq!(next, 6, "post-recovery per-instrument seq must continue from pre-mismatch baseline (5 + 1)",);
 
         // Clean shutdown: drop senders so the emitter loop exits, then abort
         // the snapshot task (which sleeps in its round-robin path).
         drop(mkt_tx);
-        let _ = tokio::time::timeout(Duration::from_secs(1), mkt_handle).await;
+        drop(tokio::time::timeout(Duration::from_secs(1), mkt_handle).await);
         snap_handle.abort();
+    }
+
+    #[test]
+    fn startup_tail_fragment_is_discarded_until_next_jsonl_boundary() {
+        let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Stream);
+        *listener.discard_fragment_mut(EventSource::OrderStatuses) = true;
+
+        let mut data = "partial status row suffix\n{\"local_time\":\"ok\"}\n".to_string();
+        assert!(listener.discard_initial_fragment_if_needed(&mut data, EventSource::OrderStatuses));
+
+        assert_eq!(data, "{\"local_time\":\"ok\"}\n");
+        assert!(!*listener.discard_fragment_mut(EventSource::OrderStatuses));
+    }
+
+    #[test]
+    fn startup_tail_fragment_without_newline_is_dropped_without_rewind() {
+        let mut listener = OrderBookListener::new_with_ingest_mode(None, false, IngestMode::Stream);
+        *listener.discard_fragment_mut(EventSource::OrderStatuses) = true;
+
+        let mut data = "partial status row suffix".to_string();
+        assert!(!listener.discard_initial_fragment_if_needed(&mut data, EventSource::OrderStatuses));
+
+        assert_eq!(data, "partial status row suffix");
+        assert!(*listener.discard_fragment_mut(EventSource::OrderStatuses));
     }
 }

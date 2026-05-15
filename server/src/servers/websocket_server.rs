@@ -1,15 +1,35 @@
+use std::{
+    collections::{HashMap, HashSet},
+    env::home_dir,
+    path::PathBuf,
+    sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, atomic::AtomicU64},
+};
+
+use axum::{Router, response::IntoResponse, routing::get};
+use futures_util::{SinkExt, StreamExt};
+use log::{error, info, warn};
+use tokio::{
+    net::TcpListener,
+    select,
+    sync::{
+        Mutex,
+        broadcast::{Sender, channel},
+    },
+};
+use yawc::{FrameView, OpCode, WebSocket};
+
 use crate::{
     instruments::{RegistryState, SharedRegistry},
     listeners::order_book::{
-        DobReplayTaps, InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener,
-        TimedSnapshots, dob_tap::DobApplyTap, hl_listen,
+        DobReplayTaps, InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots,
+        dob_tap::DobApplyTap, hl_listen, hl_listen_fills_only,
     },
     multicast::{
         config::{DobConfig, MulticastConfig},
         dob::{
-            DobEmitter, DobEvent, DobMktdataConfig, DobRefdataConfig, DobSnapshotConfig,
-            DobSnapshotEmitter, channel as dob_channel, run_dob_emitter, run_dob_refdata_task,
-            run_dob_snapshot_task, snapshot_request_channel,
+            DobEmitter, DobEvent, DobMktdataConfig, DobRefdataConfig, DobSnapshotConfig, DobSnapshotEmitter,
+            channel as dob_channel, run_dob_emitter, run_dob_refdata_task, run_dob_snapshot_task,
+            snapshot_request_channel,
         },
         publisher::MulticastPublisher,
     },
@@ -18,27 +38,10 @@ use crate::{
     types::{
         L2Book, L4Book, L4BookUpdates, L4Order, Trade,
         inner::InnerLevel,
-        node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+        node_data::{Batch, IngestMode, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::{ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager},
     },
 };
-use axum::{Router, response::IntoResponse, routing::get};
-use futures_util::{SinkExt, StreamExt};
-use log::{error, info};
-use std::{
-    collections::{HashMap, HashSet},
-    env::home_dir,
-    sync::{Arc, RwLock as StdRwLock, atomic::AtomicU64},
-};
-use tokio::select;
-use tokio::{
-    net::TcpListener,
-    sync::{
-        Mutex,
-        broadcast::{Sender, channel},
-    },
-};
-use yawc::{FrameView, OpCode, WebSocket};
 
 /// Starts the WebSocket server and, optionally, TOB and/or DoB UDP multicast publishers.
 ///
@@ -53,21 +56,47 @@ pub async fn run_websocket_server(
     compression_level: u32,
     multicast_config: Option<MulticastConfig>,
     dob_config: Option<DobConfig>,
+    ingest_mode: IngestMode,
+    hl_data_root: Option<PathBuf>,
+    separate_fill_ingest: bool,
 ) -> Result<()> {
-    let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(100);
+    if separate_fill_ingest && ingest_mode != IngestMode::Stream {
+        return Err("--separate-fill-ingest requires streaming ingest mode".into());
+    }
 
-    // Central task: listen to messages and forward them for distribution
+    let (market_message_tx, _) = channel::<Arc<InternalMessage>>(100);
+    let (l4_message_tx, _) = channel::<Arc<InternalMessage>>(4096);
+
+    // Central task: listen to messages and forward them for distribution.
+    // Keep snapshots under $HOME/out.json for default compatibility while
+    // allowing event files to live under /data/hl-data on production nodes.
     let home_dir = home_dir().ok_or("Could not find home directory")?;
+    let hl_data_root = hl_data_root.unwrap_or_else(|| home_dir.join("hl/data"));
     let listener = {
-        let internal_message_tx = internal_message_tx.clone();
-        OrderBookListener::new(Some(internal_message_tx), ignore_spot)
+        let market_message_tx = market_message_tx.clone();
+        let mut listener = OrderBookListener::new_with_ingest_mode(Some(market_message_tx), ignore_spot, ingest_mode);
+        listener.set_l4_message_tx(l4_message_tx.clone());
+        listener
     };
     let listener = Arc::new(Mutex::new(listener));
     {
         let listener = listener.clone();
+        let listen_hl_data_root = hl_data_root.clone();
         tokio::spawn(async move {
-            if let Err(err) = hl_listen(listener, home_dir).await {
+            if let Err(err) =
+                hl_listen(listener, home_dir, listen_hl_data_root, ingest_mode, !separate_fill_ingest).await
+            {
                 error!("Listener fatal error: {err}");
+                std::process::exit(1);
+            }
+        });
+    }
+    if separate_fill_ingest {
+        let market_message_tx = market_message_tx.clone();
+        let fill_hl_data_root = hl_data_root.clone();
+        tokio::spawn(async move {
+            if let Err(err) = hl_listen_fills_only(market_message_tx, fill_hl_data_root).await {
+                error!("Fill listener fatal error: {err}");
                 std::process::exit(1);
             }
         });
@@ -110,7 +139,7 @@ pub async fn run_websocket_server(
 
     if let Some(mcast_config) = multicast_config {
         let registry = registry.clone().expect("registry was created above");
-        let mcast_rx = internal_message_tx.subscribe();
+        let mcast_rx = market_message_tx.subscribe();
         tokio::spawn(async move {
             let bind_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(mcast_config.bind_addr), 0);
             match tokio::net::UdpSocket::bind(bind_addr).await {
@@ -161,16 +190,8 @@ pub async fn run_websocket_server(
         };
         // Shared per-instrument seq counter: bumped by the apply tap, read by
         // the snapshot emitter when populating SnapshotBegin.last_instrument_seq.
-        let seq_counter = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::order_book::PerInstrumentSeqCounter::new(),
-        ));
-        let tap = DobApplyTap::new(
-            dob_tx.clone(),
-            cfg.source_id,
-            cfg.channel_id,
-            seq_counter.clone(),
-            coin_resolver,
-        );
+        let seq_counter = Arc::new(StdMutex::new(crate::order_book::PerInstrumentSeqCounter::new()));
+        let tap = DobApplyTap::new(dob_tx.clone(), cfg.source_id, cfg.channel_id, seq_counter.clone(), coin_resolver);
         listener.lock().await.set_dob_tap(tap);
 
         // Synchronous instrument-id cache for the recovery path. The
@@ -199,9 +220,7 @@ pub async fn run_websocket_server(
         };
         let instrument_id_for: Box<dyn Fn(&Coin) -> Option<u32> + Send + Sync> = {
             let cache = instrument_id_cache.clone();
-            Box::new(move |coin: &Coin| -> Option<u32> {
-                cache.read().ok()?.get(coin).copied()
-            })
+            Box::new(move |coin: &Coin| -> Option<u32> { cache.read().ok()?.get(coin).copied() })
         };
 
         let dob_replay_taps = DobReplayTaps {
@@ -283,7 +302,7 @@ pub async fn run_websocket_server(
             t.tick().await; // skip the first immediate tick
             loop {
                 t.tick().await;
-                if hb_tx.send(DobEvent::HeartbeatTick).await.is_err() {
+                if hb_tx.send(DobEvent::HeartbeatTick.with_enqueue_timestamp()).await.is_err() {
                     break;
                 }
             }
@@ -295,9 +314,17 @@ pub async fn run_websocket_server(
     let app = Router::new().route(
         "/ws",
         get({
-            let internal_message_tx = internal_message_tx.clone();
+            let market_message_tx = market_message_tx.clone();
+            let l4_message_tx = l4_message_tx.clone();
             async move |ws_upgrade| {
-                ws_handler(ws_upgrade, internal_message_tx.clone(), listener.clone(), ignore_spot, websocket_opts)
+                ws_handler(
+                    ws_upgrade,
+                    market_message_tx.clone(),
+                    l4_message_tx.clone(),
+                    listener.clone(),
+                    ignore_spot,
+                    websocket_opts,
+                )
             }
         }),
     );
@@ -315,7 +342,8 @@ pub async fn run_websocket_server(
 
 fn ws_handler(
     incoming: yawc::IncomingUpgrade,
-    internal_message_tx: Sender<Arc<InternalMessage>>,
+    market_message_tx: Sender<Arc<InternalMessage>>,
+    l4_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
     ignore_spot: bool,
     websocket_opts: yawc::Options,
@@ -330,7 +358,7 @@ fn ws_handler(
             }
         };
 
-        handle_socket(ws, internal_message_tx, listener, ignore_spot).await
+        handle_socket(ws, market_message_tx, l4_message_tx, listener, ignore_spot).await
     });
 
     resp
@@ -338,11 +366,13 @@ fn ws_handler(
 
 async fn handle_socket(
     mut socket: WebSocket,
-    internal_message_tx: Sender<Arc<InternalMessage>>,
+    market_message_tx: Sender<Arc<InternalMessage>>,
+    l4_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
     ignore_spot: bool,
 ) {
-    let mut internal_message_rx = internal_message_tx.subscribe();
+    let mut market_message_rx = market_message_tx.subscribe();
+    let mut l4_message_rx = l4_message_tx.subscribe();
     let is_ready = listener.lock().await.is_ready();
     let mut manager = SubscriptionManager::default();
     let mut universe = listener.lock().await.universe().into_iter().map(|c| c.value()).collect();
@@ -353,33 +383,51 @@ async fn handle_socket(
     }
     loop {
         select! {
-            recv_result = internal_message_rx.recv() => {
+            recv_result = market_message_rx.recv() => {
                 match recv_result {
                     Ok(msg) => {
                         match msg.as_ref() {
-                            InternalMessage::Snapshot{ l2_snapshots, time } => {
+                            InternalMessage::Snapshot { l2_snapshots, time, .. } => {
                                 universe = new_universe(l2_snapshots, ignore_spot);
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time).await;
                                 }
                             },
-                            InternalMessage::Fills{ batch } => {
+                            InternalMessage::Fills { batch, .. } => {
                                 let mut trades = coin_to_trades(batch);
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
                                 }
                             },
-                            InternalMessage::L4BookUpdates{ diff_batch, status_batch } => {
-                                let mut book_updates = coin_to_book_updates(diff_batch, status_batch);
-                                for sub in manager.subscriptions() {
-                                    send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
-                                }
-                            },
+                            InternalMessage::L4BookUpdates{ .. } => {}
                         }
 
                     }
-                    Err(err) => {
-                        error!("Receiver error: {err}");
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("websocket market receiver lagged by {n} messages");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        error!("WebSocket market receiver closed");
+                        return;
+                    }
+                }
+            }
+
+            recv_result = l4_message_rx.recv() => {
+                match recv_result {
+                    Ok(msg) => {
+                        if let InternalMessage::L4BookUpdates{ diff_batch, status_batch } = msg.as_ref() {
+                            let mut book_updates = coin_to_book_updates(diff_batch, status_batch);
+                            for sub in manager.subscriptions() {
+                                send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("websocket l4 receiver lagged by {n} messages");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        error!("WebSocket l4 receiver closed");
                         return;
                     }
                 }
@@ -527,9 +575,16 @@ pub(crate) fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec
                 let mut fills = HashMap::new();
                 fills.insert(f1.1.side, f1);
                 fills.insert(f2.1.side, f2);
-                let trade = Trade::from_fills(fills);
-                let coin = trade.coin.clone();
-                trades.entry(coin).or_insert_with(Vec::new).push(trade);
+                // from_fills returns None if the pair has two same-side fills
+                // (one overwrites the other in the HashMap by Side key) or if
+                // coin/tid don't match across the pair. Log and skip the pair —
+                // upstream the pair-up by adjacent batch order is best-effort.
+                if let Some(trade) = Trade::from_fills(fills) {
+                    let coin = trade.coin.clone();
+                    trades.entry(coin).or_insert_with(Vec::new).push(trade);
+                } else {
+                    log::warn!("coin_to_trades: skipping malformed fill pair (duplicate side or coin/tid mismatch)");
+                }
             }
         }
     }
@@ -610,5 +665,19 @@ impl Subscription {
             return Err("Snapshot Failed".into());
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn separate_fill_ingest_rejects_block_mode_before_startup() {
+        let err = run_websocket_server("127.0.0.1:0", true, 1, None, None, IngestMode::Block, None, true)
+            .await
+            .err()
+            .map(|err| err.to_string());
+        assert_eq!(err.as_deref(), Some("--separate-fill-ingest requires streaming ingest mode"));
     }
 }

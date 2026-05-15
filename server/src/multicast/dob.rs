@@ -7,26 +7,23 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
-use crate::multicast::publisher::{split_legs, make_leg};
+use crate::multicast::publisher::{make_leg, split_legs};
 
 use crate::protocol::dob::constants::{
-    BATCH_BOUNDARY_SIZE, HEARTBEAT_SIZE, INSTRUMENT_RESET_SIZE,
-    ORDER_ADD_SIZE, ORDER_CANCEL_SIZE, ORDER_EXECUTE_SIZE,
-    SNAPSHOT_BEGIN_SIZE, SNAPSHOT_END_SIZE, SNAPSHOT_ORDER_SIZE,
-    SIDE_ASK, SIDE_BID,
+    BATCH_BOUNDARY_SIZE, HEARTBEAT_SIZE, INSTRUMENT_RESET_SIZE, ORDER_ADD_SIZE, ORDER_CANCEL_SIZE, ORDER_EXECUTE_SIZE,
+    SIDE_ASK, SIDE_BID, SNAPSHOT_BEGIN_SIZE, SNAPSHOT_END_SIZE, SNAPSHOT_ORDER_SIZE,
 };
 use crate::protocol::dob::frame::DobFrameBuilder;
 use crate::protocol::dob::messages::{
-    BatchBoundary, InstrumentReset, OrderAdd, OrderCancel, OrderExecute,
-    SnapshotBegin, SnapshotEnd, SnapshotOrder, encode_batch_boundary, encode_heartbeat,
-    encode_instrument_reset, encode_order_add, encode_order_cancel, encode_order_execute,
-    encode_snapshot_begin, encode_snapshot_end, encode_snapshot_order,
+    BatchBoundary, InstrumentReset, OrderAdd, OrderCancel, OrderExecute, SnapshotBegin, SnapshotEnd, SnapshotOrder,
+    encode_batch_boundary, encode_heartbeat, encode_instrument_reset, encode_order_add, encode_order_cancel,
+    encode_order_execute, encode_snapshot_begin, encode_snapshot_end, encode_snapshot_order,
 };
 
 /// Events produced by the L4 apply step, consumed by the DoB emitter.
@@ -45,6 +42,38 @@ pub enum DobEvent {
     HeartbeatTick,
     /// Signals the emitter to flush and emit `EndOfSession` on shutdown.
     Shutdown,
+    /// Carries enqueue time from producer edge to emitter for queue-delay metrics.
+    Timed {
+        event: Box<DobEvent>,
+        enqueued_at_ns: u64,
+    },
+}
+
+impl DobEvent {
+    #[must_use]
+    pub(crate) fn with_enqueue_timestamp(self) -> Self {
+        Self::Timed { event: Box::new(self), enqueued_at_ns: now_ns() }
+    }
+
+    pub(crate) fn event_type_label(&self) -> &'static str {
+        match self {
+            Self::OrderAdd(_) => "order_add",
+            Self::OrderCancel(_) => "order_cancel",
+            Self::OrderExecute(_) => "order_execute",
+            Self::BatchBoundary(_) => "batch_boundary",
+            Self::InstrumentReset(_) => "instrument_reset",
+            Self::HeartbeatTick => "heartbeat",
+            Self::Shutdown => "shutdown",
+            Self::Timed { event, .. } => event.event_type_label(),
+        }
+    }
+
+    fn into_queued_parts(self) -> (Self, Option<u64>) {
+        match self {
+            Self::Timed { event, enqueued_at_ns } => (*event, Some(enqueued_at_ns)),
+            event => (event, None),
+        }
+    }
 }
 
 /// Sender half handed to the L4 apply step and control tasks.
@@ -91,9 +120,7 @@ pub type DobSnapshotRequestSender = mpsc::Sender<DobSnapshotRequest>;
 pub type DobSnapshotRequestReceiver = mpsc::Receiver<DobSnapshotRequest>;
 
 #[must_use]
-pub fn snapshot_request_channel(
-    bound: usize,
-) -> (DobSnapshotRequestSender, DobSnapshotRequestReceiver) {
+pub fn snapshot_request_channel(bound: usize) -> (DobSnapshotRequestSender, DobSnapshotRequestReceiver) {
     mpsc::channel(bound)
 }
 
@@ -140,22 +167,13 @@ impl DobEmitter {
     /// (read via `load`) and the `DobReplayTaps` (which `fetch_add`s when
     /// reserving an `InstrumentReset` anchor) so seq numbers stay coherent
     /// across the three call sites.
-    pub async fn bind_with_seq(
-        config: DobMktdataConfig,
-        seq: SharedMktdataSeq,
-    ) -> std::io::Result<Self> {
+    pub async fn bind_with_seq(config: DobMktdataConfig, seq: SharedMktdataSeq) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(SocketAddrV4::new(config.bind_addr, 0)).await?;
         socket.set_multicast_loop_v4(false)?;
         socket.set_multicast_ttl_v4(64)?;
         // Connect so send() pushes to the configured multicast group:port
         socket.connect(SocketAddrV4::new(config.group_addr, config.port)).await?;
-        Ok(Self {
-            config,
-            socket,
-            seq,
-            reset_count: 0,
-            current_frame: None,
-        })
+        Ok(Self { config, socket, seq, reset_count: 0, current_frame: None })
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -169,9 +187,7 @@ impl DobEmitter {
     fn start_frame(&mut self) -> &mut DobFrameBuilder {
         let seq = self.next_seq();
         let ts = now_ns();
-        let fb = DobFrameBuilder::new(
-            self.config.channel_id, seq, ts, self.reset_count, self.config.mtu,
-        );
+        let fb = DobFrameBuilder::new(self.config.channel_id, seq, ts, self.reset_count, self.config.mtu);
         self.current_frame = Some(fb);
         self.current_frame.as_mut().unwrap()
     }
@@ -180,7 +196,9 @@ impl DobEmitter {
         if let Some(mut fb) = self.current_frame.take() {
             if !fb.is_empty() {
                 let frame = fb.finalize();
+                let start = Instant::now();
                 self.socket.send(frame).await?;
+                crate::metrics::observe_dob_socket_send("mktdata", start.elapsed());
             }
         }
         Ok(())
@@ -202,6 +220,7 @@ impl DobEmitter {
 
         let fb = self.current_frame.as_mut().unwrap();
         let buf = fb.message_buffer(size).expect("size checked above");
+        let encode_start = Instant::now();
         match event {
             DobEvent::OrderAdd(msg) => encode_order_add(buf, msg),
             DobEvent::OrderCancel(msg) => encode_order_cancel(buf, msg),
@@ -211,6 +230,7 @@ impl DobEmitter {
             _ => unreachable!("size filter should have returned"),
         }
         fb.commit_message();
+        crate::metrics::observe_dob_encode(event.event_type_label(), encode_start.elapsed());
         Ok(())
     }
 }
@@ -223,14 +243,12 @@ fn event_size(event: &DobEvent) -> usize {
         DobEvent::BatchBoundary(_) => BATCH_BOUNDARY_SIZE,
         DobEvent::InstrumentReset(_) => INSTRUMENT_RESET_SIZE,
         DobEvent::HeartbeatTick | DobEvent::Shutdown => 0,
+        DobEvent::Timed { event, .. } => event_size(event),
     }
 }
 
 /// Runs the emitter loop until `rx` is closed or a `Shutdown` event is received.
-pub async fn run_dob_emitter(
-    mut emitter: DobEmitter,
-    mut rx: DobEventReceiver,
-) -> std::io::Result<()> {
+pub async fn run_dob_emitter(mut emitter: DobEmitter, mut rx: DobEventReceiver) -> std::io::Result<()> {
     let mut heartbeat = interval(emitter.config.heartbeat_interval);
     heartbeat.tick().await; // consume the immediate first tick
 
@@ -242,6 +260,12 @@ pub async fn run_dob_emitter(
                     // crash/restart is not a graceful shutdown).
                     return Ok(());
                 };
+                let (event, enqueued_at_ns) = event.into_queued_parts();
+                let event_type = event.event_type_label();
+                if let Some(enqueued_at_ns) = enqueued_at_ns {
+                    let delay_ns = now_ns().saturating_sub(enqueued_at_ns);
+                    crate::metrics::observe_dob_queue_delay(event_type, Duration::from_nanos(delay_ns));
+                }
                 if matches!(event, DobEvent::Shutdown) {
                     // Emit EndOfSession on mktdata before exiting so subscribers
                     // see a clean session close rather than a silent timeout.
@@ -252,8 +276,10 @@ pub async fn run_dob_emitter(
                     }
                     let fb = emitter.current_frame.as_mut().unwrap();
                     let buf = fb.message_buffer(END_OF_SESSION_SIZE).expect("size checked");
+                    let encode_start = Instant::now();
                     crate::protocol::dob::messages::encode_end_of_session(buf, now_ns());
                     fb.commit_message();
+                    crate::metrics::observe_dob_encode("shutdown", encode_start.elapsed());
                     emitter.flush().await?;
                     return Ok(());
                 }
@@ -265,8 +291,10 @@ pub async fn run_dob_emitter(
                     }
                     let fb = emitter.current_frame.as_mut().unwrap();
                     let buf = fb.message_buffer(HEARTBEAT_SIZE).expect("size checked");
+                    let encode_start = Instant::now();
                     encode_heartbeat(buf, emitter.config.channel_id, now_ns());
                     fb.commit_message();
+                    crate::metrics::observe_dob_encode("heartbeat", encode_start.elapsed());
                     emitter.flush().await?;
                     continue;
                 }
@@ -293,6 +321,36 @@ mod tests {
         tx.send(msg.clone()).await.unwrap();
         let received = rx.recv().await.unwrap();
         assert!(matches!(received, DobEvent::HeartbeatTick));
+    }
+
+    #[tokio::test]
+    async fn timed_events_record_queue_delay_and_encode_metrics() {
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = DobMktdataConfig {
+            group_addr: Ipv4Addr::LOCALHOST,
+            port: recv_socket.local_addr().unwrap().port(),
+            bind_addr: Ipv4Addr::LOCALHOST,
+            channel_id: 0,
+            mtu: 1232,
+            heartbeat_interval: Duration::from_secs(60),
+        };
+        let emitter = DobEmitter::bind(config).await.unwrap();
+        let (tx, rx) = channel(4);
+
+        let handle = tokio::spawn(run_dob_emitter(emitter, rx));
+        tx.send(DobEvent::HeartbeatTick.with_enqueue_timestamp()).await.unwrap();
+        let mut buf = [0u8; 2048];
+        tokio::time::timeout(Duration::from_secs(2), recv_socket.recv(&mut buf))
+            .await
+            .expect("timed out")
+            .expect("recv failed");
+        tx.send(DobEvent::Shutdown).await.unwrap();
+        handle.await.unwrap().unwrap();
+
+        let body = crate::metrics::render().expect("metrics render");
+        assert!(body.contains("orderbook_dob_queue_delay_seconds"));
+        assert!(body.contains("event_type=\"heartbeat\""));
+        assert!(body.contains("orderbook_dob_encode_seconds"));
     }
 }
 
@@ -322,13 +380,7 @@ impl DobSnapshotEmitter {
         socket.set_multicast_loop_v4(false)?;
         socket.set_multicast_ttl_v4(64)?;
         socket.connect(SocketAddrV4::new(config.group_addr, config.port)).await?;
-        Ok(Self {
-            config,
-            socket,
-            seq: 0,
-            reset_count: 0,
-            snapshot_id_counter: 0,
-        })
+        Ok(Self { config, socket, seq: 0, reset_count: 0, snapshot_id_counter: 0 })
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -382,13 +434,13 @@ impl DobSnapshotEmitter {
                 self.reset_count,
                 self.config.mtu,
             );
-            let buf = fb
-                .message_buffer(SNAPSHOT_BEGIN_SIZE)
-                .expect("SnapshotBegin fits in a fresh frame");
+            let buf = fb.message_buffer(SNAPSHOT_BEGIN_SIZE).expect("SnapshotBegin fits in a fresh frame");
             encode_snapshot_begin(buf, &begin);
             fb.commit_message();
             let frame = fb.finalize();
+            let start = Instant::now();
             self.socket.send(frame).await?;
+            crate::metrics::observe_dob_socket_send("snapshot", start.elapsed());
         }
 
         // 2. Pack SnapshotOrder messages into MTU-sized frames.
@@ -399,7 +451,9 @@ impl DobSnapshotEmitter {
                 if let Some(mut fb) = fb_opt.take() {
                     if !fb.is_empty() {
                         let frame = fb.finalize();
+                        let start = Instant::now();
                         self.socket.send(frame).await?;
+                        crate::metrics::observe_dob_socket_send("snapshot", start.elapsed());
                     }
                 }
                 fb_opt = Some(DobFrameBuilder::new(
@@ -411,9 +465,7 @@ impl DobSnapshotEmitter {
                 ));
             }
             let fb = fb_opt.as_mut().expect("opened above");
-            let buf = fb
-                .message_buffer(SNAPSHOT_ORDER_SIZE)
-                .expect("SnapshotOrder fits, just-checked remaining()");
+            let buf = fb.message_buffer(SNAPSHOT_ORDER_SIZE).expect("SnapshotOrder fits, just-checked remaining()");
             let side = match order.side {
                 crate::order_book::Side::Bid => SIDE_BID,
                 crate::order_book::Side::Ask => SIDE_ASK,
@@ -440,17 +492,15 @@ impl DobSnapshotEmitter {
         if let Some(mut fb) = fb_opt.take() {
             if !fb.is_empty() {
                 let frame = fb.finalize();
+                let start = Instant::now();
                 self.socket.send(frame).await?;
+                crate::metrics::observe_dob_socket_send("snapshot", start.elapsed());
             }
         }
 
         // 3. SnapshotEnd in its own frame.
         {
-            let end = SnapshotEnd {
-                instrument_id,
-                anchor_seq,
-                snapshot_id,
-            };
+            let end = SnapshotEnd { instrument_id, anchor_seq, snapshot_id };
             let mut fb = DobFrameBuilder::new(
                 self.config.channel_id,
                 self.next_seq(),
@@ -458,13 +508,13 @@ impl DobSnapshotEmitter {
                 self.reset_count,
                 self.config.mtu,
             );
-            let buf = fb
-                .message_buffer(SNAPSHOT_END_SIZE)
-                .expect("SnapshotEnd fits in a fresh frame");
+            let buf = fb.message_buffer(SNAPSHOT_END_SIZE).expect("SnapshotEnd fits in a fresh frame");
             encode_snapshot_end(buf, &end);
             fb.commit_message();
             let frame = fb.finalize();
+            let start = Instant::now();
             self.socket.send(frame).await?;
+            crate::metrics::observe_dob_socket_send("snapshot", start.elapsed());
         }
 
         Ok(())
@@ -512,15 +562,9 @@ pub(crate) async fn run_dob_snapshot_task(
         }
 
         // 2. Service one priority request per loop iteration.
-        if let Some(DobSnapshotRequest::Priority { instrument_id, anchor_seq }) =
-            priority_queue.pop_front()
-        {
-            let Some((coin, qty_exponent)) =
-                lookup_coin_for_instrument(&registry, instrument_id)
-            else {
-                log::warn!(
-                    "dob_snapshot: priority request for unknown instrument_id {instrument_id}, skipping"
-                );
+        if let Some(DobSnapshotRequest::Priority { instrument_id, anchor_seq }) = priority_queue.pop_front() {
+            let Some((coin, qty_exponent)) = lookup_coin_for_instrument(&registry, instrument_id) else {
+                log::warn!("dob_snapshot: priority request for unknown instrument_id {instrument_id}, skipping");
                 continue;
             };
             // Read last_instrument_seq BEFORE cloning orders. Between this read and
@@ -528,18 +572,9 @@ pub(crate) async fn run_dob_snapshot_task(
             // last_instrument_seq <= snapshot view is safe — subscribers may replay a
             // few deltas already reflected in the snapshot. The reverse ordering
             // would let them skip deltas, which is unsafe.
-            let last_instrument_seq = seq_counter
-                .lock()
-                .expect("seq mutex poisoned")
-                .last(instrument_id);
-            let orders = listener
-                .lock()
-                .await
-                .clone_coin_orders(&coin)
-                .unwrap_or_default();
-            emitter
-                .emit_snapshot(instrument_id, anchor_seq, last_instrument_seq, qty_exponent, orders)
-                .await?;
+            let last_instrument_seq = seq_counter.lock().expect("seq mutex poisoned").last(instrument_id);
+            let orders = listener.lock().await.clone_coin_orders(&coin).unwrap_or_default();
+            emitter.emit_snapshot(instrument_id, anchor_seq, last_instrument_seq, qty_exponent, orders).await?;
             continue;
         }
 
@@ -574,20 +609,11 @@ pub(crate) async fn run_dob_snapshot_task(
             // last_instrument_seq <= snapshot view is safe — subscribers may replay a
             // few deltas already reflected in the snapshot. The reverse ordering
             // would let them skip deltas, which is unsafe.
-            let last_instrument_seq = seq_counter
-                .lock()
-                .expect("seq mutex poisoned")
-                .last(instrument_id);
-            let orders = listener
-                .lock()
-                .await
-                .clone_coin_orders(&coin)
-                .unwrap_or_default();
+            let last_instrument_seq = seq_counter.lock().expect("seq mutex poisoned").last(instrument_id);
+            let orders = listener.lock().await.clone_coin_orders(&coin).unwrap_or_default();
 
-            let emit_start = std::time::Instant::now();
-            emitter
-                .emit_snapshot(instrument_id, anchor_seq, last_instrument_seq, qty_exponent, orders)
-                .await?;
+            let emit_start = Instant::now();
+            emitter.emit_snapshot(instrument_id, anchor_seq, last_instrument_seq, qty_exponent, orders).await?;
             let elapsed = emit_start.elapsed();
             if elapsed < slot_budget {
                 tokio::time::sleep(slot_budget - elapsed).await;
@@ -614,9 +640,7 @@ fn lookup_coin_for_instrument(
 /// Snapshot of the active instrument set as `(instrument_id, Coin, qty_exponent)`
 /// triples. The scheduler iterates this once per round; if the set changes
 /// mid-cycle we'll pick up the change on the next round.
-fn list_active_instruments(
-    registry: &crate::instruments::SharedRegistry,
-) -> Vec<(u32, crate::order_book::Coin, i8)> {
+fn list_active_instruments(registry: &crate::instruments::SharedRegistry) -> Vec<(u32, crate::order_book::Coin, i8)> {
     let state = registry.load();
     state
         .active
@@ -709,7 +733,9 @@ pub async fn run_dob_refdata_task(
                             // Frame full — flush and open a new one.
                             if !fb.is_empty() {
                                 let frame = fb.finalize();
+                                let start = Instant::now();
                                 socket.send(frame).await?;
+                                crate::metrics::observe_dob_socket_send("refdata", start.elapsed());
                             }
                             let now2 = now_ns();
                             fb = DobFrameBuilder::new(
@@ -727,7 +753,9 @@ pub async fn run_dob_refdata_task(
                 // Flush any partial final frame.
                 if !fb.is_empty() {
                     let frame = fb.finalize();
+                    let start = Instant::now();
                     socket.send(frame).await?;
+                    crate::metrics::observe_dob_socket_send("refdata", start.elapsed());
                 }
             }
 
@@ -757,7 +785,9 @@ pub async fn run_dob_refdata_task(
                 );
                 fb.commit_message();
                 let frame = fb.finalize();
+                let start = Instant::now();
                 socket.send(frame).await?;
+                crate::metrics::observe_dob_socket_send("refdata", start.elapsed());
             }
         }
     }
@@ -800,10 +830,7 @@ fn build_refdata_instrument_definition(
 
 #[inline]
 fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -880,9 +907,7 @@ mod refdata_tests {
 
         // The first app message type byte is at offset FRAME_HEADER_SIZE.
         // Accept either InstrumentDefinition (0x02) or ManifestSummary (0x07).
-        use crate::protocol::dob::constants::{
-            FRAME_HEADER_SIZE, MSG_TYPE_INSTRUMENT_DEF, MSG_TYPE_MANIFEST_SUMMARY,
-        };
+        use crate::protocol::dob::constants::{FRAME_HEADER_SIZE, MSG_TYPE_INSTRUMENT_DEF, MSG_TYPE_MANIFEST_SUMMARY};
         assert!(n >= FRAME_HEADER_SIZE + 1, "frame too short to contain a message type");
         let msg_type = buf[FRAME_HEADER_SIZE];
         assert!(
@@ -901,10 +926,15 @@ mod emitter_tests {
 
     fn sample_order_add(seq: u32) -> OrderAdd {
         OrderAdd {
-            instrument_id: 42, source_id: 1, side: 0, order_flags: 0,
-            per_instrument_seq: seq, order_id: seq as u64,
+            instrument_id: 42,
+            source_id: 1,
+            side: 0,
+            order_flags: 0,
+            per_instrument_seq: seq,
+            order_id: seq as u64,
             enter_timestamp_ns: 1_700_000_000_000_000_000,
-            price: 100, quantity: 1,
+            price: 100,
+            quantity: 1,
         }
     }
 
@@ -936,8 +966,7 @@ mod emitter_tests {
         emitter.flush().await.unwrap();
 
         let mut rxbuf = [0u8; 1500];
-        let (n, _) = tokio::time::timeout(Duration::from_secs(1), recv.recv_from(&mut rxbuf))
-            .await.unwrap().unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(1), recv.recv_from(&mut rxbuf)).await.unwrap().unwrap();
         assert_eq!(n, FRAME_HEADER_SIZE + ORDER_ADD_SIZE);
         assert_eq!(&rxbuf[0..2], &[0x44, 0x44], "DoB magic on wire");
         assert_eq!(rxbuf[FRAME_HEADER_SIZE], 0x10, "OrderAdd type");
@@ -963,9 +992,7 @@ mod snapshot_anchor_tests {
     use super::*;
     use crate::listeners::order_book::OrderBookListener;
     use crate::order_book::PerInstrumentSeqCounter;
-    use crate::protocol::dob::constants::{
-        DEFAULT_MTU, FRAME_HEADER_SIZE, MSG_TYPE_SNAPSHOT_BEGIN,
-    };
+    use crate::protocol::dob::constants::{DEFAULT_MTU, FRAME_HEADER_SIZE, MSG_TYPE_SNAPSHOT_BEGIN};
     use crate::test_fixtures::{build_one_coin_snapshot, build_registry_with_one_instrument};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -975,8 +1002,7 @@ mod snapshot_anchor_tests {
     async fn snapshot_anchor_matches_request_and_last_instrument_seq() {
         // 1. Bind a collector socket on a random loopback port. This stands
         //    in for the snapshot-port subscriber.
-        let collector =
-            UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let collector = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let collector_addr = match collector.local_addr().unwrap() {
             std::net::SocketAddr::V4(a) => a,
             _ => unreachable!(),
@@ -1030,10 +1056,7 @@ mod snapshot_anchor_tests {
         //    The channel buffers the request; the task picks it up on its
         //    first try_recv.
         let (req_tx, req_rx) = snapshot_request_channel(8);
-        req_tx
-            .send(DobSnapshotRequest::Priority { instrument_id: 0, anchor_seq: 42 })
-            .await
-            .unwrap();
+        req_tx.send(DobSnapshotRequest::Priority { instrument_id: 0, anchor_seq: 42 }).await.unwrap();
 
         // 7. Spawn the snapshot task. Its first iteration will see the
         //    already-buffered Priority request and preempt any round-robin
@@ -1069,10 +1092,7 @@ mod snapshot_anchor_tests {
             "expected at least one full SnapshotBegin in the datagram (got {n} bytes)",
         );
         assert_eq!(&buf[0..2], &[0x44, 0x44], "DoB magic on wire");
-        assert_eq!(
-            buf[FRAME_HEADER_SIZE], MSG_TYPE_SNAPSHOT_BEGIN,
-            "first message must be SnapshotBegin",
-        );
+        assert_eq!(buf[FRAME_HEADER_SIZE], MSG_TYPE_SNAPSHOT_BEGIN, "first message must be SnapshotBegin",);
 
         let body = &buf[FRAME_HEADER_SIZE..];
         let instrument_id = u32::from_le_bytes(body[4..8].try_into().unwrap());
@@ -1081,14 +1101,8 @@ mod snapshot_anchor_tests {
         let last_instrument_seq = u32::from_le_bytes(body[24..28].try_into().unwrap());
 
         assert_eq!(instrument_id, 0, "instrument_id from request");
-        assert_eq!(
-            anchor_seq, 42,
-            "anchor_seq must come from the priority request, not mktdata_seq.load()",
-        );
-        assert_eq!(
-            last_instrument_seq, 7,
-            "last_instrument_seq must equal seq_counter.last(0) at clone time",
-        );
+        assert_eq!(anchor_seq, 42, "anchor_seq must come from the priority request, not mktdata_seq.load()",);
+        assert_eq!(last_instrument_seq, 7, "last_instrument_seq must equal seq_counter.last(0) at clone time",);
 
         handle.abort();
     }
@@ -1174,11 +1188,8 @@ mod snapshot_qty_scaling_tests {
         // 3. Emit one snapshot triad.
         emitter
             .emit_snapshot(
-                /* instrument_id = */ 0,
-                /* anchor_seq = */ 0,
-                /* last_instrument_seq = */ 0,
-                /* qty_exponent = */ -3,
-                orders,
+                /* instrument_id = */ 0, /* anchor_seq = */ 0, /* last_instrument_seq = */ 0,
+                /* qty_exponent = */ -3, orders,
             )
             .await
             .unwrap();
@@ -1194,13 +1205,8 @@ mod snapshot_qty_scaling_tests {
         }
 
         // 5. Verify the SnapshotOrder.quantity was scaled to qty_exponent.
-        let qty = first_snapshot_order_quantity(&frames)
-            .expect("captured at least one SnapshotOrder frame");
-        assert_eq!(
-            qty, 1234,
-            "SnapshotOrder.quantity must equal 1234 for sz=1.234 at qty_exponent=-3 (got {})",
-            qty,
-        );
+        let qty = first_snapshot_order_quantity(&frames).expect("captured at least one SnapshotOrder frame");
+        assert_eq!(qty, 1234, "SnapshotOrder.quantity must equal 1234 for sz=1.234 at qty_exponent=-3 (got {})", qty,);
     }
 
     #[tokio::test]
@@ -1237,8 +1243,7 @@ mod snapshot_qty_scaling_tests {
             }
         }
 
-        let qty = first_snapshot_order_quantity(&frames)
-            .expect("captured at least one SnapshotOrder frame");
+        let qty = first_snapshot_order_quantity(&frames).expect("captured at least one SnapshotOrder frame");
         assert_eq!(qty, 2921);
     }
 }

@@ -50,16 +50,12 @@ use alloy::primitives::Address;
 use chrono::NaiveDateTime;
 use tokio::net::UdpSocket;
 
-use crate::instruments::{
-    InstrumentInfo, RegistryState, UniverseEntry, make_symbol, price_to_fixed, qty_to_fixed,
-};
-use crate::listeners::order_book::{L2SnapshotParams, OrderBookListener};
+use crate::instruments::{InstrumentInfo, RegistryState, UniverseEntry, make_symbol, price_to_fixed, qty_to_fixed};
 use crate::listeners::order_book::dob_tap::{DobApplyTap, SharedSeqCounter};
-use crate::multicast::dob::{
-    DobEmitter, DobMktdataConfig, SharedMktdataSeq, channel, run_dob_emitter,
-};
-use crate::order_book::{Coin, OrderBook, PerInstrumentSeqCounter, Px, Side, Snapshot, Sz};
+use crate::listeners::order_book::{L2SnapshotParams, OrderBookListener};
+use crate::multicast::dob::{DobEmitter, DobMktdataConfig, SharedMktdataSeq, channel, run_dob_emitter};
 use crate::order_book::multi_book::Snapshots;
+use crate::order_book::{Coin, OrderBook, PerInstrumentSeqCounter, Px, Side, Snapshot, Sz};
 use crate::protocol::dob::constants::DEFAULT_MTU;
 use crate::test_subscriber::ReferenceSubscriber;
 use crate::types::inner::InnerL4Order;
@@ -79,9 +75,7 @@ const TEST_COIN: &str = "BTC";
 fn dt_from_ms(block_time_ms: u64) -> NaiveDateTime {
     let secs = (block_time_ms / 1_000) as i64;
     let nsecs = ((block_time_ms % 1_000) * 1_000_000) as u32;
-    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsecs)
-        .expect("valid timestamp")
-        .naive_utc()
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsecs).expect("valid timestamp").naive_utc()
 }
 
 /// Build an `InnerL4Order` via the `parse_from_str` path so its `Px`/`Sz`
@@ -123,13 +117,7 @@ fn seeded_initial_snapshot() -> Snapshots<InnerL4Order> {
 
 /// Build a `(NodeDataOrderStatus, NodeDataOrderDiff)` pair representing
 /// "open + book diff: New" for an order that just rests on the book.
-fn add_event(
-    block_time_ms: u64,
-    side: Side,
-    oid: u64,
-    px: &str,
-    sz: &str,
-) -> (NodeDataOrderStatus, NodeDataOrderDiff) {
+fn add_event(block_time_ms: u64, side: Side, oid: u64, px: &str, sz: &str) -> (NodeDataOrderStatus, NodeDataOrderDiff) {
     let user = Address::new([0; 20]);
     let l4 = L4Order {
         user: Some(user),
@@ -148,12 +136,7 @@ fn add_event(
         tif: None,
         cloid: None,
     };
-    let status = NodeDataOrderStatus {
-        time: dt_from_ms(block_time_ms),
-        user,
-        status: "open".to_string(),
-        order: l4,
-    };
+    let status = NodeDataOrderStatus { time: dt_from_ms(block_time_ms), user, status: "open".to_string(), order: l4 };
     let diff = NodeDataOrderDiff::new_for_test(
         user,
         oid,
@@ -223,22 +206,10 @@ fn derive_tob_quote_prices(
     let levels = snapshot.truncate(1).export_inner_snapshot();
     let bids = &levels[0];
     let asks = &levels[1];
-    let bid_price = bids
-        .first()
-        .and_then(|level| price_to_fixed(level.px(), inst.price_exponent))
-        .unwrap_or(0);
-    let ask_price = asks
-        .first()
-        .and_then(|level| price_to_fixed(level.px(), inst.price_exponent))
-        .unwrap_or(0);
-    let bid_qty = bids
-        .first()
-        .and_then(|level| qty_to_fixed(level.sz(), inst.qty_exponent))
-        .unwrap_or(0);
-    let ask_qty = asks
-        .first()
-        .and_then(|level| qty_to_fixed(level.sz(), inst.qty_exponent))
-        .unwrap_or(0);
+    let bid_price = bids.first().and_then(|level| price_to_fixed(level.px(), inst.price_exponent)).unwrap_or(0);
+    let ask_price = asks.first().and_then(|level| price_to_fixed(level.px(), inst.price_exponent)).unwrap_or(0);
+    let bid_qty = bids.first().and_then(|level| qty_to_fixed(level.sz(), inst.qty_exponent)).unwrap_or(0);
+    let ask_qty = asks.first().and_then(|level| qty_to_fixed(level.sz(), inst.qty_exponent)).unwrap_or(0);
     Some((bid_price, bid_qty, ask_price, ask_qty))
 }
 
@@ -263,9 +234,7 @@ async fn drain_collector(sock: &UdpSocket, timeout: Duration) -> Vec<Vec<u8>> {
 /// after applying the wire scaling rule `wire = decimal * 10^-qty_exponent`.
 async fn run_tob_dob_parity_scenario(qty_exponent: i8) {
     // 1. Bind a UDP collector that the DoB emitter will multicast-loop into.
-    let dob_collector = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
+    let dob_collector = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let dob_addr = match dob_collector.local_addr().unwrap() {
         std::net::SocketAddr::V4(a) => a,
         _ => unreachable!(),
@@ -306,9 +275,7 @@ async fn run_tob_dob_parity_scenario(qty_exponent: i8) {
         /* source_id = */ 1,
         /* channel_id = */ 0,
         seq_counter.clone(),
-        Box::new(move |c: &Coin| {
-            if c.value() == TEST_COIN { Some((TEST_INSTRUMENT_ID, qty_exponent)) } else { None }
-        }),
+        Box::new(move |c: &Coin| if c.value() == TEST_COIN { Some((TEST_INSTRUMENT_ID, qty_exponent)) } else { None }),
     );
     listener.set_dob_tap(tap);
 
@@ -369,11 +336,7 @@ async fn run_tob_dob_parity_scenario(qty_exponent: i8) {
     listener
         .apply_test_batch(
             Batch::new_for_test(4, 1_700_000_004_000, vec![]),
-            Batch::new_for_test(
-                4,
-                1_700_000_004_000,
-                vec![execute_diff(101, "100", "5", "2")],
-            ),
+            Batch::new_for_test(4, 1_700_000_004_000, vec![execute_diff(101, "100", "5", "2")]),
         )
         .expect("partial-execute batch applies");
 
@@ -382,11 +345,7 @@ async fn run_tob_dob_parity_scenario(qty_exponent: i8) {
     listener
         .apply_test_batch(
             Batch::new_for_test(5, 1_700_000_005_000, vec![]),
-            Batch::new_for_test(
-                5,
-                1_700_000_005_000,
-                vec![execute_diff(201, "110", "3", "0")],
-            ),
+            Batch::new_for_test(5, 1_700_000_005_000, vec![execute_diff(201, "110", "3", "0")]),
         )
         .expect("full-execute batch applies");
 
@@ -440,10 +399,7 @@ async fn run_tob_dob_parity_scenario(qty_exponent: i8) {
     let _unused = tokio::time::timeout(Duration::from_millis(500), emitter_handle).await;
 
     let frames = drain_collector(&dob_collector, Duration::from_millis(500)).await;
-    assert!(
-        !frames.is_empty(),
-        "DoB collector got no frames — emitter pipeline did not fire",
-    );
+    assert!(!frames.is_empty(), "DoB collector got no frames — emitter pipeline did not fire",);
 
     // 8. Decode every frame into the reference subscriber and read its
     //    current best bid/ask.
@@ -451,10 +407,7 @@ async fn run_tob_dob_parity_scenario(qty_exponent: i8) {
     for frame in &frames {
         subscriber.apply_mktdata_frame(frame);
     }
-    let book = subscriber
-        .books
-        .get(&TEST_INSTRUMENT_ID)
-        .expect("subscriber rebuilt a book for the test instrument");
+    let book = subscriber.books.get(&TEST_INSTRUMENT_ID).expect("subscriber rebuilt a book for the test instrument");
     let dob_best_bid = book.best_bid().expect("subscriber has a best bid at end-state");
     let dob_best_ask = book.best_ask().expect("subscriber has a best ask at end-state");
 

@@ -9,8 +9,8 @@ pub(crate) mod multi_book;
 pub mod per_instrument_seq;
 pub(crate) mod types;
 
-pub(crate) use types::{Coin, InnerOrder, Oid, Px, Side, Sz, sz_to_fixed};
 pub use per_instrument_seq::PerInstrumentSeqCounter;
+pub(crate) use types::{Coin, InnerOrder, Oid, Px, Side, Sz, sz_to_fixed};
 
 #[derive(Clone, Default)]
 pub(crate) struct OrderBook<O> {
@@ -74,6 +74,26 @@ impl<O: InnerOrder> OrderBook<O> {
             self.oid_to_side_px.insert(order.oid(), (order.side(), order.limit_px()));
             add_order_to_book(resting_book, order);
         }
+    }
+
+    pub(crate) fn add_resting_order_from_diff(&mut self, order: O) {
+        let oid = order.oid();
+        self.cancel_order(oid.clone());
+        if !order.sz().is_positive() {
+            return;
+        }
+        self.oid_to_side_px.insert(oid.clone(), (order.side(), order.limit_px()));
+        let resting_book = match order.side() {
+            Side::Ask => &mut self.asks,
+            Side::Bid => &mut self.bids,
+        };
+        if !add_order_to_book(resting_book, order) {
+            log::warn!("raw-diff resting insert replaced duplicate oid {oid:?}");
+        }
+    }
+
+    pub(crate) fn contains_order(&self, oid: &Oid) -> bool {
+        self.oid_to_side_px.contains_key(oid)
     }
 
     pub(crate) fn cancel_order(&mut self, oid: Oid) -> bool {
@@ -152,10 +172,10 @@ impl<O: InnerOrder> OrderBook<O> {
     }
 }
 
-fn add_order_to_book<O: InnerOrder>(map: &mut BTreeMap<Px, LinkedList<Oid, O>>, order: O) {
+fn add_order_to_book<O: InnerOrder>(map: &mut BTreeMap<Px, LinkedList<Oid, O>>, order: O) -> bool {
     let oid = order.oid();
     let limit_px = order.limit_px();
-    map.entry(limit_px).or_insert_with(|| LinkedList::new()).push_back(oid, order);
+    map.entry(limit_px).or_insert_with(|| LinkedList::new()).push_back(oid, order)
 }
 
 fn match_order<O: InnerOrder>(maker_orders: &mut BTreeMap<Px, LinkedList<Oid, O>>, taker_order: &mut O) -> Vec<Oid> {
@@ -323,6 +343,34 @@ mod tests {
         asks[0].sz = 450;
 
         assert_same_book(Snapshot([bids.clone(), asks.clone()]), book.to_snapshot());
+    }
+
+    #[test]
+    fn raw_diff_insert_rests_crossed_order_without_matching() {
+        let mut book = OrderBook::new();
+        let bid = MinimalOrder::new(1, 10, 100, Side::Bid);
+        let crossed_ask = MinimalOrder::new(2, 5, 99, Side::Ask);
+
+        book.add_order(bid.clone());
+        book.add_resting_order_from_diff(crossed_ask.clone());
+
+        assert_same_book(Snapshot([vec![bid], vec![crossed_ask]]), book.to_snapshot());
+        assert!(book.contains_order(&Oid::new(1)));
+        assert!(book.contains_order(&Oid::new(2)));
+    }
+
+    #[test]
+    fn raw_diff_insert_replaces_existing_oid_without_stale_list_entry() {
+        let mut book = OrderBook::new();
+        let original = MinimalOrder::new(1, 10, 100, Side::Bid);
+        let replacement = MinimalOrder::new(1, 7, 101, Side::Bid);
+
+        book.add_resting_order_from_diff(original);
+        book.add_resting_order_from_diff(replacement.clone());
+
+        assert_same_book(Snapshot([vec![replacement], vec![]]), book.to_snapshot());
+        assert!(book.cancel_order(Oid::new(1)));
+        assert_same_book(Snapshot([vec![], vec![]]), book.to_snapshot());
     }
 
     fn assert_same_book(s1: Snapshot<MinimalOrder>, s2: Snapshot<MinimalOrder>) {
